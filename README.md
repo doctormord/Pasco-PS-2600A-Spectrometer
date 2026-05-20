@@ -55,6 +55,8 @@ The PASCO device ships with a vendor-specific driver that blocks direct WinUSB a
 Note: after this substitution, the official PASCO SPARKvue and Capstone software will no longer recognize
 the device. You can restore the original driver at any time through Device Manager by uninstalling the
 WinUSB driver and reinstalling the vendor driver.
+
+![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/Zadig_USB.png "Zadig USB")
  
 ### Python
  
