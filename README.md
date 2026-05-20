@@ -3,6 +3,8 @@
 A Python application for direct, low-level USB access to the PASCO PS-2600A spectrometer on Windows,
 bypassing the official PASCO software entirely. Provides a real-time spectral scope, time-lapse heatmap,
 auto-exposure, dark current correction, peak detection, and CSV/PNG export — all in a single file.
+
+![alt text]([https://github.com/doctormord/SEN6X_ESPHOME/blob/main/pictures/esp32_rendering.png](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Plot.png?raw=true) "SEN6X AQS")
  
 ---
  
