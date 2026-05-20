@@ -5,6 +5,7 @@ bypassing the official PASCO software entirely. Provides a real-time spectral sc
 auto-exposure, dark current correction, peak detection, and CSV/PNG export — all in a single file.
 
 ![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Plot.png "GUI PLOT")
+![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Waterfall.png "GUI Waterfall")
  
 ---
  
