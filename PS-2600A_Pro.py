@@ -9,10 +9,11 @@ import csv
 from datetime import datetime
 from collections import deque
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QGridLayout, QPushButton, QLabel, 
-                             QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox, QTabWidget)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRectF
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QGridLayout, QPushButton, QLabel,
+                             QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox,
+                             QTabWidget, QSizePolicy, QToolTip)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRectF, QTimer, QObject, QEvent
 from PyQt6.QtGui import QTransform
 import pyqtgraph as pg
 
@@ -59,8 +60,34 @@ WAVELENGTH_COEFFS = [130.755917, 0.262201464, 1.44855491e-05, -4.30320660e-09]
 ADC_SATURATION_THRESHOLD = 3800
 
 # --- 5. ALGORITHMS (EXPOSURE, DARK CURRENT & PEAKS) ---
-DEFAULT_DARK_BIAS_ADC = 60.5
-DEFAULT_DARK_RATE_ADC_PER_SEC = 45.0
+# Parametric dark model (fallback): I_dark = Bias + Rate * t
+# Values from cyclic characterization run DarkCurrent_20260521_115546
+DEFAULT_DARK_BIAS_ADC = 61.57
+DEFAULT_DARK_RATE_ADC_PER_SEC = 40.94
+
+# Optical Black (OB) dark model — preferred.
+# The first 64-byte transfer "header" is not metadata: bytes 4..63 carry
+# 30 masked CCD pixels (optical black) that never see light. Their mean is a
+# live, per-frame dark reference. Characterization confirmed they track the
+# real spectral dark region with R2 = 0.999943.
+# Corrected dark estimate = OB_CORRECTION_SLOPE * ob_mean + OB_CORRECTION_OFFSET
+OB_CORRECTION_SLOPE = 1.008180
+OB_CORRECTION_OFFSET = -0.6377
+OB_PIXEL_BYTE_START = 4          # bytes 0..3 are always zero (padding)
+OB_PIXEL_BYTE_END = 64           # 30 uint16 values -> bytes 4..63
+OB_PIXEL_COUNT = (OB_PIXEL_BYTE_END - OB_PIXEL_BYTE_START) // 2
+
+# Dark correction mode: "optical_black" (default) or "parametric"
+DARK_MODE_OPTICAL_BLACK = "optical_black"
+DARK_MODE_PARAMETRIC = "parametric"
+DEFAULT_DARK_MODE = DARK_MODE_OPTICAL_BLACK
+
+# Indirect temperature readout from the OB mean.
+# At long integration the OB mean is essentially a thermometer in ADC counts.
+# This is a relative reference point (the OB mean measured during the
+# characterization session), not an absolute temperature calibration.
+OB_TEMP_REFERENCE_ADC = 61.5     # OB mean at short exposure, characterization baseline
+
 AUTO_EXP_TARGET_ADC = 3400
 AUTO_EXP_DEADZONE_ADC = 100
 AUTO_EXP_MIN_RATIO = 0.2
@@ -89,7 +116,57 @@ POLL_INTERVAL_SEC = 0.002
 THREAD_PAUSE_SLEEP_SEC = 0.05
 # =========================================================================================
 
-# Calculate absolute wavelength array once
+# ============================================================
+# THEME STYLESHEETS
+# ============================================================
+LIGHT_STYLESHEET = ""   # Fusion default
+
+DARK_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+QLabel { color: #cdd6f4; }
+QPushButton {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+QPushButton:hover { background-color: #45475a; }
+QPushButton:checked { background-color: #a6e3a1; color: #1e1e2e; font-weight: bold; }
+QPushButton:disabled { background-color: #181825; color: #585b70; border-color: #313244; }
+QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 3px;
+    padding: 2px;
+}
+QSpinBox:disabled, QDoubleSpinBox:disabled { color: #585b70; }
+QComboBox QAbstractItemView {
+    background-color: #313244;
+    color: #cdd6f4;
+    selection-background-color: #45475a;
+}
+QTabWidget::pane { border: 1px solid #45475a; }
+QTabBar::tab {
+    background-color: #313244;
+    color: #a6adc8;
+    padding: 6px 16px;
+    border: 1px solid #45475a;
+}
+QTabBar::tab:selected { background-color: #1e1e2e; color: #cdd6f4; }
+QToolTip {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #89b4fa;
+    padding: 6px;
+    font-size: 12px;
+}
+QMessageBox { background-color: #1e1e2e; color: #cdd6f4; }
+"""
 wavelength_array = np.array([
     WAVELENGTH_COEFFS[0] + 
     WAVELENGTH_COEFFS[1] * i + 
@@ -103,25 +180,133 @@ wavelength_array = np.array([
 # HELPER: AUTO-GENERATE DUMMY REFERENCES
 # ============================================================
 def ensure_reference_library_exists():
+    # Regenerate if missing or built with old code (check for new column)
     if os.path.exists(REFERENCE_LIBRARY_FILENAME):
-        return
-        
-    print(f"Creating default reference library: {REFERENCE_LIBRARY_FILENAME}")
-    
-    hydrogen_spectrum = np.zeros(PIXEL_COUNT)
-    mercury_spectrum = np.zeros(PIXEL_COUNT)
-    
-    for i, wave in enumerate(wavelength_array):
-        for h_peak in [410.1, 434.0, 486.1, 656.3]:
-            if abs(wave - h_peak) < 5: hydrogen_spectrum[i] += 3000 * np.exp(-((wave - h_peak)**2)/2)
-        for hg_peak in [404.6, 435.8, 546.1, 577.0, 579.0]:
-            if abs(wave - hg_peak) < 5: mercury_spectrum[i] += 3000 * np.exp(-((wave - hg_peak)**2)/2)
-            
+        try:
+            with open(REFERENCE_LIBRARY_FILENAME, 'r') as f:
+                if "LED White Warm" in f.readline():
+                    return
+        except Exception:
+            pass
+
+    print(f"Generating reference library: {REFERENCE_LIBRARY_FILENAME}")
+
+    # Each entry: list of (center_nm, relative_intensity, fwhm_nm)
+    # Gas discharge lines use FWHM ~0.5 nm (narrower than sensor resolution).
+    # LED and phosphor bands use broad Gaussians matching typical FWHM.
+    # Intensities are relative (0–3990 ADC scale).
+    W = 0.5   # narrow line FWHM for discharge lamps
+
+    spectral_defs = {
+        "Hydrogen (H)": [
+            (410.2, 1500, W), (434.0, 2000, W), (486.1, 3000, W), (656.3, 3500, W)
+        ],
+        "Mercury (Hg)": [
+            (365.0, 800, W), (404.7, 1500, W), (407.8, 400, W),
+            (435.8, 3000, W), (546.1, 3500, W), (576.9, 2000, W), (579.1, 1800, W)
+        ],
+        "Sodium (Na)": [
+            (568.8, 200, W), (589.0, 3500, W), (589.6, 3000, W),
+            (615.4, 300, W), (616.1, 250, W)
+        ],
+        "Neon (Ne)": [
+            (585.2, 800, W), (594.5, 600, W), (597.6, 700, W), (607.4, 900, W),
+            (614.3, 500, W), (616.4, 600, W), (621.7, 800, W), (626.6, 700, W),
+            (630.5, 1200, W), (633.4, 900, W), (638.3, 1500, W), (640.2, 2000, W),
+            (650.6, 3000, W), (659.9, 1000, W), (667.8, 600, W), (671.7, 500, W),
+            (692.9, 1200, W), (703.2, 2500, W), (717.4, 600, W), (724.5, 500, W),
+            (743.9, 800, W)
+        ],
+        "Argon (Ar)": [
+            (696.5, 1200, W), (706.7, 1000, W), (714.7, 600, W), (727.3, 800, W),
+            (738.4, 2000, W), (750.4, 3000, W), (763.5, 3500, W), (772.4, 800, W),
+            (794.8, 600, W), (800.6, 500, W), (811.5, 2500, W), (826.5, 600, W),
+            (840.8, 1000, W), (842.5, 1200, W)
+        ],
+        "Helium (He)": [
+            (388.9, 500, W), (396.5, 300, W), (447.1, 1500, W), (471.3, 800, W),
+            (492.2, 1000, W), (501.6, 1200, W), (587.6, 3000, W),
+            (667.8, 1000, W), (706.5, 800, W), (728.1, 500, W)
+        ],
+        "Krypton (Kr)": [
+            (427.4, 500, W), (431.9, 600, W), (436.3, 700, W), (450.2, 400, W),
+            (461.5, 500, W), (473.9, 800, W), (476.2, 600, W), (482.5, 700, W),
+            (557.0, 600, W), (587.1, 800, W), (602.0, 500, W),
+            (760.2, 1200, W), (769.5, 1800, W), (785.5, 600, W),
+            (810.4, 900, W), (819.0, 1500, W), (829.8, 2000, W)
+        ],
+        "Xenon (Xe)": [
+            (450.1, 600, W), (462.4, 700, W), (467.1, 500, W),
+            (473.4, 800, W), (480.7, 600, W), (492.3, 500, W),
+            (823.2, 2000, W), (828.0, 1500, W), (834.7, 1800, W), (880.0, 1200, W)
+        ],
+        "Cadmium (Cd)": [
+            (346.6, 300, W), (361.1, 400, W), (467.8, 1500, W),
+            (480.0, 2000, W), (508.6, 1200, W), (643.8, 3000, W)
+        ],
+        "Neon-Argon Mix": [
+            # Ne dominant visible lines (sign tubes)
+            (614.3, 400, W), (621.7, 600, W), (638.3, 1200, W), (640.2, 1500, W),
+            (650.6, 2500, W), (692.9, 900, W), (703.2, 2000, W), (743.9, 600, W),
+            # Ar near-IR (fills in the red-NIR)
+            (696.5, 800, W), (706.7, 700, W), (738.4, 1200, W),
+            (750.4, 1800, W), (763.5, 2000, W), (811.5, 1500, W)
+        ],
+        "Fluorescent 2-band": [
+            # Background Hg discharge lines
+            (365.0, 400, W), (404.7, 600, W), (435.8, 1500, W),
+            (546.1, 1000, W), (576.9, 800, W),
+            # 2 phosphor bands: blue-violet ~452 nm, warm red ~612 nm
+            (452.0, 2000, 20.0), (612.0, 2500, 25.0)
+        ],
+        "Fluorescent 3-band": [
+            # Background Hg lines
+            (365.0, 300, W), (404.7, 500, W), (435.8, 1000, W),
+            (546.1, 800, W), (576.9, 600, W),
+            # BAM blue ~453 nm, LAP green ~542 nm, YOX red ~611 nm
+            (453.0, 2500, 15.0), (542.0, 2000, 18.0), (611.0, 3000, 20.0)
+        ],
+        "Fluorescent 4-band": [
+            # Background Hg lines
+            (365.0, 300, W), (404.7, 500, W), (435.8, 1000, W),
+            (546.1, 800, W), (576.9, 600, W),
+            # 4 phosphor bands: violet, blue, green, red
+            (405.0, 1200, 10.0), (453.0, 2000, 15.0),
+            (542.0, 1800, 18.0), (611.0, 2800, 20.0)
+        ],
+        # --- LEDs (single-color, broad Gaussian) ---
+        "LED Red":    [(638.0, 3500, 20.0)],
+        "LED Orange": [(617.0, 3500, 18.0)],
+        "LED Amber":  [(593.0, 3500, 15.0)],
+        "LED Yellow": [(578.0, 3500, 14.0)],
+        "LED Green":  [(520.0, 3500, 35.0)],
+        "LED Cyan":   [(500.0, 3500, 20.0)],
+        "LED Blue":   [(465.0, 3500, 25.0)],
+        "LED Violet": [(405.0, 3500, 15.0)],
+        # --- White LEDs: blue InGaN pump + broad phosphor ---
+        "LED White Warm":    [(455.0, 1400, 25.0), (570.0, 3200, 120.0)],
+        "LED White Neutral": [(450.0, 1200, 22.0), (545.0, 3000, 100.0)],
+        "LED White Cool":    [(445.0, 1100, 20.0), (530.0, 2800,  85.0)],
+    }
+
+    headers = ["Wavelength_nm"] + list(spectral_defs.keys())
+
     with open(REFERENCE_LIBRARY_FILENAME, 'w', newline='') as file:
         writer = csv.writer(file, delimiter=';')
-        writer.writerow(["Wavelength_nm", "Hydrogen (Balmer)", "Mercury (Hg)"])
-        for i in range(PIXEL_COUNT):
-            writer.writerow([round(wavelength_array[i], 2), round(hydrogen_spectrum[i], 1), round(mercury_spectrum[i], 1)])
+        writer.writerow(headers)
+
+        sigma_cache = {}   # pre-compute sigma per fwhm
+        for i, wave in enumerate(wavelength_array):
+            row = [round(float(wave), 2)]
+            for peaks in spectral_defs.values():
+                val = 0.0
+                for center, intensity, fwhm in peaks:
+                    if fwhm not in sigma_cache:
+                        sigma_cache[fwhm] = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+                    sigma = sigma_cache[fwhm]
+                    val += intensity * np.exp(-((wave - center) ** 2) / (2.0 * sigma ** 2))
+                row.append(round(min(val, 3990.0), 1))
+            writer.writerow(row)
 
 
 # ============================================================
@@ -238,19 +423,56 @@ def usb_drain_trailing_bytes():
 
 def free_usb_resources():
     global global_usb_handle, global_device_handle
-    if global_usb_handle: 
+    if global_usb_handle:
         winusb.WinUsb_Free(global_usb_handle)
         global_usb_handle = None
-    if global_device_handle: 
+    if global_device_handle:
         kernel32.CloseHandle(global_device_handle)
         global_device_handle = None
+
+
+# ============================================================
+# CONTEXT-SENSITIVE HELP (2-second delayed tooltip)
+# ============================================================
+class ContextHelp(QObject):
+    """Installs a 2-second delayed tooltip on any QWidget."""
+    def __init__(self, widget, text, delay_ms=2000):
+        super().__init__(widget)
+        self._widget = widget
+        self._text = text
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(delay_ms)
+        self._timer.timeout.connect(self._show)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t == QEvent.Type.Enter:
+            self._timer.start()
+        elif t in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress):
+            self._timer.stop()
+            QToolTip.hideText()
+        return False
+
+    def _show(self):
+        if self._widget.underMouse():
+            pos = self._widget.mapToGlobal(self._widget.rect().bottomLeft())
+            QToolTip.showText(pos, self._text, self._widget)
+
+
+def add_help(widget, text, delay_ms=2000):
+    """Attach a 2-second context tooltip to a widget. Returns the widget."""
+    ContextHelp(widget, text, delay_ms)
+    return widget
 
 
 # ============================================================
 # 🧵 BACKGROUND HARDWARE THREAD
 # ============================================================
 class SpectrometerHardwareThread(QThread):
-    signal_new_spectrum_data = pyqtSignal(np.ndarray)
+    # pixel array, optical-black mean (ADC), integration time (us) for this frame
+    signal_new_spectrum_data = pyqtSignal(np.ndarray, float, int)
     signal_auto_exposure_adjusted = pyqtSignal(float)
     signal_connection_lost = pyqtSignal()
 
@@ -304,7 +526,14 @@ class SpectrometerHardwareThread(QThread):
             if read_success and bytes_read.value >= BUFFER_SIZE_SPECTRUM_BYTES:
                 raw_data = bytes(buffer_bulk)
                 usb_drain_trailing_bytes()
-                
+
+                # --- Optical black: bytes 4..63 = 30 masked CCD pixels (uint16 LE) ---
+                # These never see light. Their mean is this frame's live dark reference,
+                # measured at the same die temperature as the spectral pixels.
+                ob_bytes = raw_data[OB_PIXEL_BYTE_START:OB_PIXEL_BYTE_END]
+                ob_pixels = np.array(struct.unpack(f"<{OB_PIXEL_COUNT}H", ob_bytes), dtype=float)
+                ob_mean = float(np.mean(ob_pixels))
+
                 payload_size = PIXEL_COUNT * BYTES_PER_PIXEL
                 spectrum_bytes = raw_data[PAYLOAD_HEADER_SIZE_BYTES : PAYLOAD_HEADER_SIZE_BYTES + payload_size]
                 unpack_format = f"<{PIXEL_COUNT}H"
@@ -330,7 +559,9 @@ class SpectrometerHardwareThread(QThread):
                         self.apply_hardware_exposure_time(self.current_integration_time_us)
                         self.signal_auto_exposure_adjusted.emit(self.current_integration_time_us / 1000.0)
 
-                self.signal_new_spectrum_data.emit(pixel_array)
+                self.signal_new_spectrum_data.emit(
+                    pixel_array, ob_mean, self.current_integration_time_us
+                )
             else:
                 self.signal_connection_lost.emit()
                 break
@@ -351,7 +582,7 @@ class DashboardWindow(QMainWindow):
 
         self.spectrum_history = deque(maxlen=1)
         self.current_averaged_pixels = np.zeros(PIXEL_COUNT)
-        
+
         # State Flags
         self.is_dark_correction_enabled = False
         self.is_despeckle_enabled = False 
@@ -359,6 +590,14 @@ class DashboardWindow(QMainWindow):
         self.is_peak_finding_enabled = False
         self.is_measure_mode_enabled = False
         self.hardware_thread = None
+
+        # Dark current / optical black state
+        self.dark_correction_mode = DEFAULT_DARK_MODE
+        self.latest_ob_mean = 0.0
+        self.latest_integration_us = START_INTEGRATION_TIME_US
+
+        # Theme
+        self.is_dark_mode = False
 
         self.heatmap_buffer = np.zeros((PIXEL_COUNT, HEATMAP_HISTORY_SIZE))
         self.reference_library = {}
@@ -402,7 +641,7 @@ class DashboardWindow(QMainWindow):
         connection_layout.addWidget(self.combo_devices)
 
         self.button_connect = QPushButton("Connect")
-        self.button_connect.setStyleSheet("background-color: lightgray; font-weight: bold;")
+        self.button_connect.setMinimumWidth(120)
         self.button_connect.clicked.connect(self.toggle_connection)
         connection_layout.addWidget(self.button_connect)
 
@@ -410,7 +649,14 @@ class DashboardWindow(QMainWindow):
         self.label_status.setStyleSheet("font-weight: bold; padding: 0px 15px;")
         connection_layout.addWidget(self.label_status)
         connection_layout.addStretch()
-        
+
+        self.button_theme = QPushButton("Dark Mode")
+        self.button_theme.setCheckable(True)
+        self.button_theme.setMinimumHeight(35)
+        self.button_theme.setMinimumWidth(120)
+        self.button_theme.clicked.connect(self.toggle_theme)
+        connection_layout.addWidget(self.button_theme)
+
         self.button_exit = QPushButton("🚪 EXIT")
         self.button_exit.setStyleSheet("background-color: #ff4c4c; color: white; font-weight: bold; padding: 5px 15px;")
         self.button_exit.clicked.connect(self.close)
@@ -499,6 +745,20 @@ class DashboardWindow(QMainWindow):
         colormap = pg.colormap.get('inferno')
         self.image_item.setLookupTable(colormap.getLookupTable())
         self.heatmap_canvas.addItem(self.image_item)
+
+        # Crosshair cursor for the heatmap — white so it's visible on inferno colormap
+        self.heatmap_cursor_vline = pg.InfiniteLine(angle=90, movable=False,
+                                                    pen=pg.mkPen('w', style=Qt.PenStyle.DashLine, width=1))
+        self.heatmap_cursor_hline = pg.InfiniteLine(angle=0, movable=False,
+                                                    pen=pg.mkPen('w', style=Qt.PenStyle.DashLine, width=1))
+        self.heatmap_canvas.addItem(self.heatmap_cursor_vline, ignoreBounds=True)
+        self.heatmap_canvas.addItem(self.heatmap_cursor_hline, ignoreBounds=True)
+
+        self.heatmap_mouse_proxy = pg.SignalProxy(
+            self.heatmap_canvas.scene().sigMouseMoved,
+            rateLimit=60, slot=self.handle_heatmap_mouse_movement
+        )
+
         self.tabs.addTab(self.heatmap_canvas, "🌊 Time-Lapse Heatmap")
 
         # --- CONTROL PANEL ---
@@ -597,34 +857,145 @@ class DashboardWindow(QMainWindow):
         self.button_dark_correct.clicked.connect(self.toggle_dark_correction)
         control_grid.addWidget(self.button_dark_correct, 2, 0)
 
-        control_grid.addWidget(QLabel("Bias (ADC):"), 2, 1, alignment=Qt.AlignmentFlag.AlignRight)
+        control_grid.addWidget(QLabel("Dark Mode:"), 2, 1, alignment=Qt.AlignmentFlag.AlignRight)
+        self.combo_dark_mode = QComboBox()
+        self.combo_dark_mode.addItem("Optical Black (live)", DARK_MODE_OPTICAL_BLACK)
+        self.combo_dark_mode.addItem("Parametric (Bias+Rate)", DARK_MODE_PARAMETRIC)
+        self.combo_dark_mode.currentIndexChanged.connect(self.apply_dark_mode)
+        control_grid.addWidget(self.combo_dark_mode, 2, 2)
+
+        control_grid.addWidget(QLabel("Bias (ADC):"), 2, 3, alignment=Qt.AlignmentFlag.AlignRight)
         self.spinbox_dark_bias = QDoubleSpinBox()
         self.spinbox_dark_bias.setRange(0.0, 1000.0)
         self.spinbox_dark_bias.setValue(DEFAULT_DARK_BIAS_ADC)
-        control_grid.addWidget(self.spinbox_dark_bias, 2, 2)
+        control_grid.addWidget(self.spinbox_dark_bias, 2, 4)
 
-        control_grid.addWidget(QLabel("Rate (ADC/s):"), 2, 3, alignment=Qt.AlignmentFlag.AlignRight)
+        control_grid.addWidget(QLabel("Rate (ADC/s):"), 2, 5, alignment=Qt.AlignmentFlag.AlignRight)
         self.spinbox_dark_rate = QDoubleSpinBox()
         self.spinbox_dark_rate.setRange(0.0, 1000.0)
         self.spinbox_dark_rate.setValue(DEFAULT_DARK_RATE_ADC_PER_SEC)
-        control_grid.addWidget(self.spinbox_dark_rate, 2, 4)
+        control_grid.addWidget(self.spinbox_dark_rate, 2, 6)
 
         self.button_despeckle = QPushButton("Hot-Pixel Filter: OFF")
         self.button_despeckle.setCheckable(True)
         self.button_despeckle.clicked.connect(self.toggle_despeckle_filter)
-        control_grid.addWidget(self.button_despeckle, 2, 5)
+        control_grid.addWidget(self.button_despeckle, 2, 7)
 
-        control_grid.addWidget(QLabel("Filter Width:"), 2, 6, alignment=Qt.AlignmentFlag.AlignRight)
+        control_grid.addWidget(QLabel("Filter Width:"), 2, 8, alignment=Qt.AlignmentFlag.AlignRight)
         self.spinbox_despeckle_width = QSpinBox()
         self.spinbox_despeckle_width.setRange(3, 15)
         self.spinbox_despeckle_width.setSingleStep(2) 
         self.spinbox_despeckle_width.setValue(5)      
-        control_grid.addWidget(self.spinbox_despeckle_width, 2, 7)
+        control_grid.addWidget(self.spinbox_despeckle_width, 2, 9)
 
-        for btn in [self.button_pause, self.button_save_csv, self.button_save_png, 
+        # ROW 3 — Optical black live readout (dark level + relative temperature proxy)
+        self.label_ob_readout = QLabel("Dark Level: ---- ADC   |   Integration: ----- ms   |   Sensor temp (relative): baseline (cold)")
+        self.label_ob_readout.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #1F6F1F; "
+            "padding: 4px 10px; border: 1px solid #B0C0B0; border-radius: 4px;"
+        )
+        self.label_ob_readout.setFixedHeight(32)
+        self.label_ob_readout.setMinimumWidth(700)
+        self.label_ob_readout.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.label_ob_readout.setToolTip(
+            "Mean of the 30 masked optical-black CCD pixels for the most recent frame.\n"
+            "This is the live dark reference used for Optical Black correction.\n"
+            "At long exposures it also acts as a relative die-temperature indicator."
+        )
+        control_grid.addWidget(self.label_ob_readout, 3, 0, 1, 10)
+
+        # Apply initial dark mode state to the widgets
+        self.apply_dark_mode()
+
+        for btn in [self.button_pause, self.button_save_csv, self.button_save_png,
                     self.button_auto_exposure, self.button_dark_correct, self.button_auto_y_axis,
-                    self.button_despeckle, self.button_show_peaks, self.button_measure_mode]:
+                    self.button_despeckle, self.button_show_peaks, self.button_measure_mode,
+                    self.button_theme]:
             btn.setMinimumHeight(35)
+
+        # --- CONTEXT-SENSITIVE HELP (appears after 2 seconds of hovering) ---
+        add_help(self.button_scan,
+                 "Scan the USB bus for connected PASCO PS-2600A spectrometers.\n"
+                 "The device must have the WinUSB driver installed via Zadig.")
+        add_help(self.combo_devices,
+                 "List of detected spectrometers. If empty, click Scan USB.\n"
+                 "The device must not be open in any other application.")
+        add_help(self.button_connect,
+                 "Connect to the selected spectrometer and start live acquisition.\n"
+                 "Click again to disconnect.")
+        add_help(self.button_theme,
+                 "Switch between Light and Dark interface themes.")
+        add_help(self.button_pause,
+                 "Pause or resume live acquisition.\n"
+                 "The last acquired frame stays visible while paused.")
+        add_help(self.button_save_csv,
+                 "Export the current averaged spectrum to a timestamped CSV file.\n"
+                 "Includes OB mean, integration time and correction mode as metadata.\n"
+                 "If the Heatmap tab is active, the full frame history is exported instead.")
+        add_help(self.button_save_png,
+                 "Save a high-resolution screenshot of the currently active plot tab.")
+        add_help(self.spinbox_averaging,
+                 "Number of consecutive frames to average before display.\n"
+                 "Higher values reduce noise but slow the response to changing signals.\n"
+                 "Range: 1 (no averaging) to 100 frames.")
+        add_help(self.spinbox_exposure,
+                 "Integration time in milliseconds.\n"
+                 "Longer integration collects more photons but also more dark charge.\n"
+                 "Range: 1 ms to 2500 ms. Above 2500 ms the sensor enters a non-linear regime.")
+        add_help(self.button_auto_exposure,
+                 "Automatically adjusts integration time to keep the strongest peak\n"
+                 "near the target ADC level (default: 3400 counts).\n"
+                 "Includes saturation protection with an emergency drop-back.")
+        add_help(self.combo_reference,
+                 "Overlay a reference spectrum from the library as a dashed green line.\n"
+                 "Includes gas discharge lamps, fluorescent tubes, and LED colors.\n"
+                 "Delete reference_spectra.csv and restart to regenerate the full library.")
+        add_help(self.spinbox_x_min,
+                 "Left edge of the visible wavelength range on the x-axis (nm).")
+        add_help(self.spinbox_x_max,
+                 "Right edge of the visible wavelength range on the x-axis (nm).")
+        add_help(self.button_auto_y_axis,
+                 "When ON: the Y-axis scales automatically to the tallest visible peak.\n"
+                 "When OFF: the Y Max spinbox sets a fixed upper limit.")
+        add_help(self.spinbox_y_max,
+                 "Manual upper limit of the Y-axis in ADC counts.\n"
+                 "Only active when Auto Y is OFF.")
+        add_help(self.button_show_peaks,
+                 "Find and label the three dominant spectral peaks in the visible range.\n"
+                 "Uses Non-Maximum Suppression with a configurable minimum distance.")
+        add_help(self.button_measure_mode,
+                 "Place two draggable vertical cursors on the spectrum.\n"
+                 "The info bar shows delta-wavelength (dx) and delta-intensity (dy) between them.")
+        add_help(self.button_dark_correct,
+                 "Enable dark current subtraction from the live spectrum.\n"
+                 "Use Optical Black mode for automatic per-frame correction,\n"
+                 "or Parametric mode for the static Bias + Rate x time model.")
+        add_help(self.combo_dark_mode,
+                 "Optical Black (recommended): uses the 30 masked sensor pixels in the\n"
+                 "transfer header as a live, per-frame dark reference. Automatically\n"
+                 "compensates for temperature drift without any model parameters.\n\n"
+                 "Parametric: subtracts I_dark = Bias + Rate x t. Accurate within\n"
+                 "the validated 0–2500 ms linear regime but cannot track temperature drift.")
+        add_help(self.spinbox_dark_bias,
+                 "Constant dark current offset at zero integration time (ADC counts).\n"
+                 "Only used in Parametric correction mode.\n"
+                 "Measure with the sensor covered using the Dark Current Characterization script.")
+        add_help(self.spinbox_dark_rate,
+                 "Thermal dark current accumulation rate (ADC counts per second).\n"
+                 "Only used in Parametric correction mode.\n"
+                 "Measure with the sensor covered using the Dark Current Characterization script.")
+        add_help(self.button_despeckle,
+                 "Apply a sliding median filter to suppress hot pixels and cosmic ray spikes.\n"
+                 "Does not affect genuine narrow spectral lines wider than the kernel.")
+        add_help(self.spinbox_despeckle_width,
+                 "Kernel width for the median despeckle filter (pixels, must be odd).\n"
+                 "Wider kernels suppress more aggressive spikes but slightly blur narrow peaks.\n"
+                 "Recommended: 3–7 for most uses.")
+        add_help(self.label_ob_readout,
+                 "Live readout of the 30 masked optical black CCD pixels in the transfer header.\n"
+                 "These pixels never see light and provide an instantaneous dark reference.\n"
+                 "The temperature indicator shows the thermal component relative to\n"
+                 "the cold-start baseline measured during characterization.")
 
 
     # --- CONNECTION MANAGER LOGIC ---
@@ -658,7 +1029,7 @@ class DashboardWindow(QMainWindow):
             self.hardware_thread.start()
             
             self.button_connect.setText("Disconnect")
-            self.button_connect.setStyleSheet("background-color: lightcoral; font-weight: bold;")
+            self._style_connect_button(connected=True)
             self.label_status.setText("🟢 Connected")
             self.combo_devices.setEnabled(False)
             self.button_scan.setEnabled(False)
@@ -675,7 +1046,7 @@ class DashboardWindow(QMainWindow):
             
         free_usb_resources()
         self.button_connect.setText("Connect")
-        self.button_connect.setStyleSheet("background-color: lightgray; font-weight: bold;")
+        self._style_connect_button(connected=False)
         self.label_status.setText("🔴 Disconnected")
         self.combo_devices.setEnabled(True)
         self.button_scan.setEnabled(True)
@@ -700,6 +1071,33 @@ class DashboardWindow(QMainWindow):
             self.cursor_vline.setPos(snapped_x)
             self.cursor_hline.setPos(snapped_y)
             self.label_cursor_info.setText(f"🔍 Pixel: {closest_index}  |  Wavelength: {snapped_x:.1f} nm  |  Intensity: {snapped_y:.1f} ADC")
+
+    def handle_heatmap_mouse_movement(self, event):
+        position = event[0]
+        if not self.heatmap_canvas.sceneBoundingRect().contains(position):
+            return
+
+        mapped_point = self.heatmap_canvas.getPlotItem().vb.mapSceneToView(position)
+        x_hover = mapped_point.x()
+        y_hover = mapped_point.y()
+
+        # Snap wavelength to nearest pixel column
+        closest_index = (np.abs(wavelength_array - x_hover)).argmin()
+        snapped_x = wavelength_array[closest_index]
+
+        # Snap frame index to nearest row in the heatmap buffer
+        # heatmap_buffer column 0 is the newest frame, increasing index = older
+        frame_index = int(np.clip(round(y_hover), 0, HEATMAP_HISTORY_SIZE - 1))
+
+        # Intensity at that column and frame
+        intensity = self.heatmap_buffer[closest_index, frame_index]
+
+        self.heatmap_cursor_vline.setPos(snapped_x)
+        self.heatmap_cursor_hline.setPos(frame_index)
+        self.label_cursor_info.setText(
+            f"🔍 Pixel: {closest_index}  |  Wavelength: {snapped_x:.1f} nm  |  "
+            f"Frame: {frame_index}  |  Intensity: {intensity:.1f} ADC"
+        )
 
     def toggle_measurement_pause(self, is_checked):
         if self.hardware_thread: self.hardware_thread.is_measurement_paused = is_checked
@@ -745,6 +1143,117 @@ class DashboardWindow(QMainWindow):
         self.is_dark_correction_enabled = is_checked
         self.button_dark_correct.setText("Dark Correct: ON" if is_checked else "Dark Correct: OFF")
         self.button_dark_correct.setStyleSheet("background-color: lightgreen;" if is_checked else "")
+
+    def apply_dark_mode(self, *args):
+        self.dark_correction_mode = self.combo_dark_mode.currentData()
+        is_parametric = (self.dark_correction_mode == DARK_MODE_PARAMETRIC)
+        self.spinbox_dark_bias.setEnabled(is_parametric)
+        self.spinbox_dark_rate.setEnabled(is_parametric)
+
+    def _style_connect_button(self, connected=None):
+        """Apply theme-aware styling to the Connect/Disconnect button.
+        If connected is None, re-applies using the current connection state."""
+        if connected is None:
+            connected = (self.hardware_thread is not None
+                         and self.hardware_thread.isRunning())
+        if self.is_dark_mode:
+            if connected:
+                # salmon-red for disconnect action in dark theme
+                style = ("background-color: #f38ba8; color: #1e1e2e; "
+                         "font-weight: bold; border-radius: 4px;")
+            else:
+                # subtle neutral for connect action
+                style = ("background-color: #45475a; color: #cdd6f4; "
+                         "font-weight: bold; border-radius: 4px;")
+        else:
+            if connected:
+                style = "background-color: lightcoral; font-weight: bold;"
+            else:
+                style = "background-color: lightgray; font-weight: bold;"
+        self.button_connect.setStyleSheet(style)
+
+    def toggle_theme(self, is_checked):
+        self.is_dark_mode = is_checked
+        self.apply_theme()
+
+    def apply_theme(self):
+        app = QApplication.instance()
+        if self.is_dark_mode:
+            app.setStyleSheet(DARK_STYLESHEET)
+            self.button_theme.setText("Light Mode")
+            # Adjust pyqtgraph plot backgrounds
+            self.plot_canvas.setBackground('#1e1e2e')
+            self.plot_canvas.getAxis('bottom').setPen(pg.mkPen('#cdd6f4'))
+            self.plot_canvas.getAxis('left').setPen(pg.mkPen('#cdd6f4'))
+            self.plot_canvas.getAxis('bottom').setTextPen(pg.mkPen('#cdd6f4'))
+            self.plot_canvas.getAxis('left').setTextPen(pg.mkPen('#cdd6f4'))
+            self.spectrum_curve.setPen(pg.mkPen('#89b4fa', width=2))
+            self.reference_curve.setPen(pg.mkPen('#a6e3a1', width=2,
+                                                  style=Qt.PenStyle.DashLine))
+            self.heatmap_canvas.setBackground('#1e1e2e')
+            self.heatmap_canvas.getAxis('bottom').setPen(pg.mkPen('#cdd6f4'))
+            self.heatmap_canvas.getAxis('left').setPen(pg.mkPen('#cdd6f4'))
+            self.heatmap_canvas.getAxis('bottom').setTextPen(pg.mkPen('#cdd6f4'))
+            self.heatmap_canvas.getAxis('left').setTextPen(pg.mkPen('#cdd6f4'))
+            self.label_ob_readout.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #a6e3a1; "
+                "padding: 4px 10px; border: 1px solid #3a7a3a; border-radius: 4px; "
+                "background-color: #1e1e2e;"
+            )
+            self.label_peaks_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #f38ba8;")
+            self.label_measure_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #cba6f7;")
+            self.label_cursor_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #89b4fa;")
+        else:
+            app.setStyleSheet(LIGHT_STYLESHEET)
+            self.button_theme.setText("Dark Mode")
+            self.plot_canvas.setBackground('w')
+            self.plot_canvas.getAxis('bottom').setPen(pg.mkPen('k'))
+            self.plot_canvas.getAxis('left').setPen(pg.mkPen('k'))
+            self.plot_canvas.getAxis('bottom').setTextPen(pg.mkPen('k'))
+            self.plot_canvas.getAxis('left').setTextPen(pg.mkPen('k'))
+            self.spectrum_curve.setPen(pg.mkPen('b', width=2))
+            self.reference_curve.setPen(pg.mkPen('g', width=2,
+                                                  style=Qt.PenStyle.DashLine))
+            self.heatmap_canvas.setBackground('w')
+            self.heatmap_canvas.getAxis('bottom').setPen(pg.mkPen('k'))
+            self.heatmap_canvas.getAxis('left').setPen(pg.mkPen('k'))
+            self.heatmap_canvas.getAxis('bottom').setTextPen(pg.mkPen('k'))
+            self.heatmap_canvas.getAxis('left').setTextPen(pg.mkPen('k'))
+            self.label_ob_readout.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #1F6F1F; "
+                "padding: 4px 10px; border: 1px solid #B0C0B0; border-radius: 4px;"
+            )
+            self.label_peaks_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #D72800;")
+            self.label_measure_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #8A2BE2;")
+            self.label_cursor_info.setStyleSheet("font-size: 16px; font-weight: bold; color: #0078D7;")
+
+        # Restyle the connect button — its inline style must match the theme
+        self._style_connect_button()
+
+    def update_ob_readout(self):
+        ob = self.latest_ob_mean
+        if ob <= 0.0:
+            self.label_ob_readout.setText(
+                "Dark Level: ---- ADC   |   Integration: ----- ms   |   Sensor temp (relative): --"
+            )
+            return
+
+        integration_ms = self.latest_integration_us / 1000.0
+        thermal_part = ob - (DEFAULT_DARK_RATE_ADC_PER_SEC * integration_ms / 1000.0)
+        delta = thermal_part - OB_TEMP_REFERENCE_ADC
+
+        if delta < 1.0:
+            temp_hint = "baseline (cold)    "   # trailing spaces hold layout width
+        elif delta < 4.0:
+            temp_hint = f"{delta:+5.1f} ADC (slightly warm)"
+        else:
+            temp_hint = f"{delta:+5.1f} ADC (warm)         "
+
+        self.label_ob_readout.setText(
+            f"Dark Level: {ob:6.2f} ADC   |   "
+            f"Integration: {integration_ms:7.1f} ms   |   "
+            f"Sensor temp (relative): {temp_hint}"
+        )
 
     def toggle_auto_y_axis(self, is_checked):
         self.is_auto_y_axis_enabled = is_checked
@@ -825,6 +1334,10 @@ class DashboardWindow(QMainWindow):
                         row_data = [frame_idx] + [round(val, 2) for val in self.heatmap_buffer[:, frame_idx]]
                         writer.writerow(row_data)
                 else:
+                    writer.writerow(["# Optical Black mean (ADC)", round(self.latest_ob_mean, 3)])
+                    writer.writerow(["# Integration time (ms)", round(self.latest_integration_us / 1000.0, 1)])
+                    writer.writerow(["# Dark correction", "ON" if self.is_dark_correction_enabled else "OFF"])
+                    writer.writerow(["# Dark mode", self.dark_correction_mode])
                     writer.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
                     for idx, (wave, pixel) in enumerate(zip(wavelength_array, self.current_averaged_pixels)):
                         writer.writerow([idx, round(wave, 2), round(pixel, 2)])
@@ -848,17 +1361,32 @@ class DashboardWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save PNG: {e}")
 
     # --- CORE DRAWING ROUTINE ---
-    def process_new_spectrum(self, raw_pixels):
+    def process_new_spectrum(self, raw_pixels, ob_mean, integration_us):
         self.spectrum_history.append(raw_pixels)
         self.current_averaged_pixels = np.mean(self.spectrum_history, axis=0)
 
+        # Store the latest frame metadata and refresh the live OB readout
+        self.latest_ob_mean = ob_mean
+        self.latest_integration_us = integration_us
+        self.update_ob_readout()
+
         # 1. Apply Dark Correction
-        if self.is_dark_correction_enabled and self.hardware_thread:
-            current_bias = self.spinbox_dark_bias.value()
-            current_rate = self.spinbox_dark_rate.value()
-            integration_seconds = self.hardware_thread.current_integration_time_us / 1_000_000.0
-            total_calculated_noise = current_bias + (current_rate * integration_seconds)
-            self.current_averaged_pixels = np.maximum(0, self.current_averaged_pixels - total_calculated_noise)
+        if self.is_dark_correction_enabled:
+            if self.dark_correction_mode == DARK_MODE_OPTICAL_BLACK:
+                # Live, per-frame dark reference from the masked OB pixels.
+                # Inherently temperature-compensated and integration-time aware,
+                # since the OB pixels share the die with the spectral pixels.
+                dark_estimate = OB_CORRECTION_SLOPE * ob_mean + OB_CORRECTION_OFFSET
+            else:
+                # Parametric fallback: I_dark = Bias + Rate * t
+                current_bias = self.spinbox_dark_bias.value()
+                current_rate = self.spinbox_dark_rate.value()
+                integration_seconds = integration_us / 1_000_000.0
+                dark_estimate = current_bias + (current_rate * integration_seconds)
+
+            self.current_averaged_pixels = np.maximum(
+                0, self.current_averaged_pixels - dark_estimate
+            )
 
         # 2. Apply Despeckle Filter
         if self.is_despeckle_enabled:
