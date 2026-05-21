@@ -95,7 +95,7 @@ REFERENCE_LIBRARY_FILENAME = "reference_spectra.csv"
 # --- 7. GUI PARAMETERS ---
 WINDOW_WIDTH = 1200
 WINDOW_HEIGHT = 850
-DEFAULT_X_MIN_NM = 320
+DEFAULT_X_MIN_NM = 380
 DEFAULT_X_MAX_NM = 1050
 DEFAULT_Y_MAX_ADC = 4000
 Y_AXIS_BOTTOM_MARGIN_ADC = -20  
@@ -574,6 +574,8 @@ class DashboardWindow(QMainWindow):
         # Theme
         self.is_dark_mode = False
 
+       # --- FIX: CREATE A PERFECTLY LINEAR WAVELENGTH AXIS FOR THE HEATMAP ---
+        self.heatmap_linear_waves = np.linspace(wavelength_array[0], wavelength_array[-1], PIXEL_COUNT)                                                                                                       
         self.heatmap_buffer = np.zeros((PIXEL_COUNT, HEATMAP_HISTORY_SIZE))
         self.reference_library = {}
         
@@ -732,8 +734,8 @@ class DashboardWindow(QMainWindow):
         self.image_item = pg.ImageItem()
         
         transform = QTransform()
-        transform.translate(wavelength_array[0], 0)
-        x_scale = (wavelength_array[-1] - wavelength_array[0]) / PIXEL_COUNT
+        transform.translate(self.heatmap_linear_waves[0], 0)
+        x_scale = (self.heatmap_linear_waves[-1] - self.heatmap_linear_waves[0]) / PIXEL_COUNT
         transform.scale(x_scale, 1.0)
         self.image_item.setTransform(transform)
         
@@ -1011,16 +1013,19 @@ class DashboardWindow(QMainWindow):
         x_hover = mapped_point.x()
         y_hover = mapped_point.y()
 
-        closest_index = (np.abs(wavelength_array - x_hover)).argmin()
-        snapped_x = wavelength_array[closest_index]
+        closest_linear_idx = (np.abs(self.heatmap_linear_waves - x_hover)).argmin()
+        snapped_x = self.heatmap_linear_waves[closest_linear_idx]
+        
+        # Calculate approximate hardware pixel for info readout
+        hw_pixel = (np.abs(wavelength_array - snapped_x)).argmin()
 
         frame_index = int(np.clip(round(y_hover), 0, HEATMAP_HISTORY_SIZE - 1))
-        intensity = self.heatmap_buffer[closest_index, frame_index]
-
+        intensity = self.heatmap_buffer[closest_linear_idx, frame_index]
+ 
         self.heatmap_cursor_vline.setPos(snapped_x)
         self.heatmap_cursor_hline.setPos(frame_index)
         self.label_cursor_info.setText(
-            f"🔍 Pixel: {closest_index}  |  Wavelength: {snapped_x:.1f} nm  |  "
+             f"🔍 Pixel: ~{hw_pixel}  |  Wavelength: {snapped_x:.1f} nm  |  "
             f"Frame: {frame_index}  |  Intensity: {intensity:.1f} ADC"
         )
 
@@ -1247,7 +1252,7 @@ class DashboardWindow(QMainWindow):
                 writer = csv.writer(file, delimiter=';')
                 
                 if is_heatmap_active:
-                    header = ["Time_Frame"] + [f"{w:.2f}" for w in wavelength_array]
+                    header = ["Time_Frame"] + [f"{w:.2f}" for w in self.heatmap_linear_waves]
                     writer.writerow(header)
                     for frame_idx in range(HEATMAP_HISTORY_SIZE):
                         row_data = [frame_idx] + [round(val, 2) for val in self.heatmap_buffer[:, frame_idx]]
@@ -1333,8 +1338,9 @@ class DashboardWindow(QMainWindow):
         self.spectrum_curve.setData(wavelength_array, self.current_averaged_pixels)
         
         # 5. Update Heatmap (Waterfall Plot)
+        linear_spectrum = np.interp(self.heatmap_linear_waves, wavelength_array, self.current_averaged_pixels)                                                                     
         self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
-        self.heatmap_buffer[:, 0] = self.current_averaged_pixels
+        self.heatmap_buffer[:, 0] = linear_spectrum
         
         safe_heatmap_max = max(10.0, ideal_heatmap_max) 
         self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, safe_heatmap_max))
