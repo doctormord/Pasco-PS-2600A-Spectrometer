@@ -12,31 +12,27 @@ import matplotlib.pyplot as plt
 # CONFIGURATION
 # ============================================================
 
-# Integration times to test, in microseconds.
 TEST_INTEGRATION_TIMES_US = [
     10, 50, 100, 250, 500,
     1_000, 2_000, 5_000,
     10_000, 50_000, 100_000, 500_000,
-    1_000_000, 1_200_000,1_400_000, 1_600_000, 1_800_000,
-    2_000_000, 2_200_000, 2_300_00, 2_400_000, 2_500_000, 2_600_000, 2_800_000,
+    1_000_000, 1_200_000, 1_400_000, 1_600_000, 1_800_000,
+    2_000_000, 2_200_000, 2_400_000, 2_500_000, 2_600_000, 2_800_000,
     3_000_000,
 ]
 
-# Number of full cycles to run. Each cycle measures one frame at every
-# integration time step. This spreads thermal drift evenly across all steps.
-# N=20 cycles takes the same total time as before but the data is much cleaner.
 NUM_CYCLES = 10
-
-# If True, the order of integration times is shuffled independently for each
-# cycle. This further decorrelates any residual drift pattern from the time
-# axis. If False, the order is fixed and identical every cycle (still far
-# better than the blocked design, and easier to follow in the terminal output).
 RANDOMIZE_ORDER_PER_CYCLE = True
 
-# Only data points at or below this limit are used for the linear regression.
-# Above this threshold the device firmware compresses the ADC output and the
-# linear dark current model no longer holds.
+# Only data points at or below this limit are used for the parametric
+# linear regression. Above this the firmware compresses ADC output.
 LINEAR_RANGE_CEILING_US = 2_500_000
+
+# Optical black pixels live in header bytes 4-63 (words 2-31, 30 pixels).
+# Words 0 and 1 (bytes 0-3) are always zero and are skipped.
+OB_BYTE_START = 4
+OB_BYTE_END   = 64
+OB_PIXEL_COUNT = (OB_BYTE_END - OB_BYTE_START) // 2   # = 30
 
 # ============================================================
 # WAVELENGTH CALIBRATION
@@ -45,11 +41,10 @@ LINEAR_RANGE_CEILING_US = 2_500_000
 c0, c1, c2, c3 = 130.755917, 0.262201464, 1.44855491e-05, -4.30320660e-09
 wavelengths = np.array([c0 + c1*i + c2*(i**2) + c3*(i**3) for i in range(3648)])
 
-PIXEL_150 = int(np.abs(wavelengths - 150).argmin())
-PIXEL_250 = int(np.abs(wavelengths - 250).argmin())
 PIXEL_300 = int(np.abs(wavelengths - 300).argmin())
 
-print(f"Pixel index for 150 nm: {PIXEL_150} | 250 nm: {PIXEL_250} | 300 nm: {PIXEL_300}")
+print(f"Spectral dark region: pixels 0 to {PIXEL_300}  (up to ~300 nm)")
+print(f"Optical black pixels: {OB_PIXEL_COUNT} pixels from header bytes {OB_BYTE_START}-{OB_BYTE_END}")
 
 # ============================================================
 # WINUSB SETUP
@@ -107,7 +102,6 @@ hdev = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x02 | 0x10
 
 device_path = None
 index = 0
-
 while True:
     iface = SP_DEVICE_INTERFACE_DATA()
     iface.cbSize = ctypes.sizeof(iface)
@@ -126,14 +120,15 @@ while True:
     index += 1
 
 if not device_path:
-    raise RuntimeError("PASCO PS-2600A not found. Check USB connection and WinUSB driver.")
+    raise RuntimeError("PASCO PS-2600A not found.")
 
 handle = kernel32.CreateFileW(device_path, 0x80000000 | 0x40000000, 1 | 2, None, 3, 0x40000000, None)
 usb_handle = ctypes.c_void_p()
 winusb.WinUsb_Initialize(handle, ctypes.byref(usb_handle))
+print("Device connected.")
 
 # ============================================================
-# LOW-LEVEL USB HELPERS
+# USB HELPERS
 # ============================================================
 
 def ctrl_out(req, value=0, index=0):
@@ -156,7 +151,13 @@ def drain_pipe():
 def set_integration_time(microseconds):
     ctrl_out(2, value=microseconds & 0xFFFF, index=(microseconds >> 16) & 0xFFFF)
 
-def read_spectrum(timeout_us):
+def read_full_frame(timeout_us):
+    """
+    Returns (pixel_array, ob_mean) where:
+      pixel_array : np.array of 3648 uint16 spectral values
+      ob_mean     : float, mean of the 30 optical black pixels from the header
+    Returns (None, None) on timeout.
+    """
     ctrl_out(9)
     max_polls = int((timeout_us / 1000.0 + 1000) / 2)
     for _ in range(max_polls):
@@ -164,69 +165,49 @@ def read_spectrum(timeout_us):
             break
         time.sleep(0.002)
     else:
-        return None
+        return None, None
+
     buf  = (ctypes.c_ubyte * 7360)()
     read = wintypes.ULONG()
     winusb.WinUsb_ReadPipe(usb_handle, 0x82, buf, 7360, ctypes.byref(read), None)
     raw = bytes(buf)
     drain_pipe()
-    return np.array(struct.unpack("<3648H", raw[64:64 + 7296]))
+
+    # Optical black pixels from header
+    ob_pixels = np.array(struct.unpack(
+        f"<{OB_PIXEL_COUNT}H",
+        raw[OB_BYTE_START:OB_BYTE_END]
+    ), dtype=float)
+    ob_mean = float(np.mean(ob_pixels))
+
+    # Spectral pixels
+    pixels = np.array(struct.unpack("<3648H", raw[64:64 + 7296]), dtype=float)
+
+    return pixels, ob_mean
 
 # ============================================================
-# CYCLIC MEASUREMENT ROUTINE
+# CYCLIC MEASUREMENT
 # ============================================================
-#
-# Design rationale:
-#
-# The blocked design (all N frames at time T1, then all N at T2, ...) confounds
-# thermal drift with integration time. Short exposures are measured cold, long
-# exposures are measured warm. The fitted slope then reflects both the true
-# photon/dark-charge physics and the temperature rise of the sensor, making
-# the extracted Rate parameter unreliable.
-#
-# The cyclic design measures one frame at every integration time in sequence,
-# then repeats. Each time step collects its N samples distributed across the
-# full duration of the session, so every step is exposed to the same range of
-# thermal states. Thermal drift averages out symmetrically across all steps
-# rather than accumulating on the long-exposure end.
-#
-# Optional per-cycle randomization of the step order decorrelates any residual
-# monotonic drift that survives the cycling, at the cost of slightly more
-# integration-time switching overhead.
-#
-# The per-cycle mean for each step is also saved separately, which lets you
-# inspect the thermal convergence curve: if the sensor is still warming up
-# through cycle 5 and stable by cycle 8, you can optionally discard the early
-# cycles from the final fit.
 
 def run_characterization():
-    n_steps = len(TEST_INTEGRATION_TIMES_US)
-
-    # accumulator[i] holds the list of p_avg values collected across all cycles
-    # for integration time TEST_INTEGRATION_TIMES_US[i]
-    accumulator = {us: [] for us in TEST_INTEGRATION_TIMES_US}
-
-    # per_cycle_means[cycle_index][us] = mean p_avg for that step in that cycle
+    accumulator = {us: {"spec": [], "ob": []} for us in TEST_INTEGRATION_TIMES_US}
     per_cycle_means = []
 
     print()
     print("=" * 65)
     print(f" DARK CURRENT CHARACTERIZATION  --  cyclic design")
-    print(f" {NUM_CYCLES} cycles x {n_steps} integration time steps")
-    print(f" Randomize order per cycle: {RANDOMIZE_ORDER_PER_CYCLE}")
+    print(f" {NUM_CYCLES} cycles x {len(TEST_INTEGRATION_TIMES_US)} steps")
+    print(f" Comparing spectral dark region vs optical black pixels")
     print("=" * 65)
     print()
     print("Cover the spectrometer input completely before proceeding.")
     print("Press Enter to start, or Ctrl+C to abort.")
     input()
 
-    # Warm-up: run the sensor for one full pass at mid-range exposure before
-    # recording anything. This burns off the steepest part of the cold-start
-    # thermal transient so the first recorded cycle is not an outlier.
     print("Warm-up pass (discarded) ...")
     for us in TEST_INTEGRATION_TIMES_US:
         set_integration_time(us)
-        read_spectrum(us)
+        read_full_frame(us)
     print("Warm-up complete. Starting recorded cycles.\n")
 
     for cycle_idx in range(NUM_CYCLES):
@@ -239,181 +220,245 @@ def run_characterization():
 
         for us in order:
             set_integration_time(us)
-            # Discard one frame after switching integration time. The device
-            # may have buffered a partial acquisition at the previous setting.
-            read_spectrum(us)
+            read_full_frame(us)   # discard first frame after parameter change
 
-            data = read_spectrum(us)
-            if data is None:
-                print(f"  WARNING: timeout at {us} us in cycle {cycle_idx + 1}, skipping.")
+            pixels, ob_mean = read_full_frame(us)
+            if pixels is None:
+                print(f"  WARNING: timeout at {us} us, skipping.")
                 continue
 
-            p_avg = float(np.mean(data[0:PIXEL_300]))
-            accumulator[us].append(p_avg)
-            cycle_means[us] = p_avg
+            spec_dark = float(np.mean(pixels[0:PIXEL_300]))
+
+            accumulator[us]["spec"].append(spec_dark)
+            accumulator[us]["ob"].append(ob_mean)
+            cycle_means[us] = {"spec": spec_dark, "ob": ob_mean}
 
         per_cycle_means.append(cycle_means)
 
-        # Print a one-line summary for this cycle using a few representative steps
         summary_steps = [10, 100_000, 1_000_000, 2_500_000]
-        summary_str   = "  "
+        parts = []
         for s in summary_steps:
             if s in cycle_means and s in TEST_INTEGRATION_TIMES_US:
-                summary_str += f"{s // 1000:>5} ms: {cycle_means[s]:>6.1f}   "
-        print(summary_str)
+                cm = cycle_means[s]
+                parts.append(f"{s // 1000 if s >= 1000 else s}{'ms' if s >= 1000 else 'us'}: "
+                              f"spec={cm['spec']:.1f} ob={cm['ob']:.1f}")
+        print("  " + "   ".join(parts))
 
-    print()
-    print("All cycles complete.")
+    print("\nAll cycles complete.")
 
-    # Build the aggregated result table (mean and std across cycles)
     results = []
     for us in TEST_INTEGRATION_TIMES_US:
-        samples = accumulator[us]
-        if not samples:
+        spec_samples = accumulator[us]["spec"]
+        ob_samples   = accumulator[us]["ob"]
+        if not spec_samples:
             continue
         results.append({
-            "us":     us,
-            "ms":     us / 1000.0,
-            "p_avg":  float(np.mean(samples)),
-            "p_std":  float(np.std(samples)),
-            "n":      len(samples),
+            "us":       us,
+            "ms":       us / 1000.0,
+            "spec_mean": float(np.mean(spec_samples)),
+            "spec_std":  float(np.std(spec_samples)),
+            "ob_mean":   float(np.mean(ob_samples)),
+            "ob_std":    float(np.std(ob_samples)),
+            "n":         len(spec_samples),
         })
-        
-        results.sort(key=lambda r: r["us"])
 
+    results.sort(key=lambda r: r["us"])
     return results, per_cycle_means
 
 # ============================================================
-# LINEAR FIT
+# PARAMETRIC FIT (legacy model, now used for comparison only)
 # ============================================================
 
-def fit_dark_model(results):
-    """
-    Fit  ADC(t) = Bias + Rate * t_seconds  using least squares.
-    Only points within the confirmed linear range are included.
-    Returns (bias, rate_per_second, r_squared).
-    """
+def fit_parametric_model(results):
     linear = [r for r in results if r["us"] <= LINEAR_RANGE_CEILING_US]
+    t_sec  = np.array([r["us"] / 1_000_000.0 for r in linear])
+    adc    = np.array([r["spec_mean"]          for r in linear])
+    coeffs = np.polyfit(t_sec, adc, 1)
+    rate, bias = float(coeffs[0]), float(coeffs[1])
+    pred   = np.polyval(coeffs, t_sec)
+    ss_res = float(np.sum((adc - pred)          ** 2))
+    ss_tot = float(np.sum((adc - np.mean(adc))  ** 2))
+    r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return bias, rate, r2
 
-    t_sec = np.array([r["us"] / 1_000_000.0 for r in linear])
-    adc   = np.array([r["p_avg"]             for r in linear])
+# ============================================================
+# OPTICAL BLACK CORRELATION FIT
+# ============================================================
 
-    coeffs       = np.polyfit(t_sec, adc, 1)
-    rate         = float(coeffs[0])
-    bias         = float(coeffs[1])
-
-    predicted    = np.polyval(coeffs, t_sec)
-    ss_res       = float(np.sum((adc - predicted)     ** 2))
-    ss_tot       = float(np.sum((adc - np.mean(adc))  ** 2))
-    r_squared    = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-    return bias, rate, r_squared
+def fit_ob_correlation(results):
+    """
+    Fit:  spec_dark = slope * ob_mean + offset
+    If slope ~ 1.0 and offset ~ 0.0, the optical black pixels are a perfect
+    proxy and can be used directly for per-frame dark subtraction.
+    Returns (slope, offset, r_squared).
+    """
+    ob   = np.array([r["ob_mean"]   for r in results])
+    spec = np.array([r["spec_mean"] for r in results])
+    coeffs = np.polyfit(ob, spec, 1)
+    slope, offset = float(coeffs[0]), float(coeffs[1])
+    pred   = np.polyval(coeffs, ob)
+    ss_res = float(np.sum((spec - pred)          ** 2))
+    ss_tot = float(np.sum((spec - np.mean(spec)) ** 2))
+    r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return slope, offset, r2
 
 # ============================================================
 # OUTPUT
 # ============================================================
 
 def save_csv(results, per_cycle_means, timestamp):
-    # Main results
-    filename_main = f"DarkCurrent_{timestamp}_aggregated.csv"
-    with open(filename_main, "w", newline="") as f:
+    filename = f"DarkCurrent_{timestamp}_aggregated.csv"
+    with open(filename, "w", newline="") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow([
             "Integration_us", "Integration_ms",
-            "ADC_AVG_mean", "ADC_AVG_std", "N_cycles"
+            "SpecDark_mean", "SpecDark_std",
+            "OpticalBlack_mean", "OpticalBlack_std",
+            "OB_vs_Spec_delta", "N_cycles"
         ])
         for r in results:
             writer.writerow([
                 r["us"], round(r["ms"], 4),
-                round(r["p_avg"], 3), round(r["p_std"], 3), r["n"],
+                round(r["spec_mean"], 3), round(r["spec_std"], 3),
+                round(r["ob_mean"],   3), round(r["ob_std"],   3),
+                round(r["spec_mean"] - r["ob_mean"], 3),
+                r["n"],
             ])
-    print(f"Aggregated data saved to : {filename_main}")
+    print(f"Aggregated data saved to : {filename}")
 
-    # Per-cycle time series — useful for inspecting thermal convergence
-    filename_cycles = f"DarkCurrent_{timestamp}_per_cycle.csv"
+    filename_cyc = f"DarkCurrent_{timestamp}_per_cycle.csv"
     sorted_times = sorted(TEST_INTEGRATION_TIMES_US)
-    with open(filename_cycles, "w", newline="") as f:
+    with open(filename_cyc, "w", newline="") as f:
         writer = csv.writer(f, delimiter=";")
-        header = ["Cycle"] + [f"{us}_us" for us in sorted_times]
-        writer.writerow(header)
+        writer.writerow(
+            ["Cycle"] +
+            [f"spec_{us}us" for us in sorted_times] +
+            [f"ob_{us}us"   for us in sorted_times]
+        )
         for idx, cm in enumerate(per_cycle_means):
-            row = [idx + 1] + [round(cm.get(us, float("nan")), 3) for us in sorted_times]
-            writer.writerow(row)
-    print(f"Per-cycle data saved to  : {filename_cycles}")
+            spec_row = [round(cm[us]["spec"], 3) if us in cm else float("nan") for us in sorted_times]
+            ob_row   = [round(cm[us]["ob"],   3) if us in cm else float("nan") for us in sorted_times]
+            writer.writerow([idx + 1] + spec_row + ob_row)
+    print(f"Per-cycle data saved to  : {filename_cyc}")
 
-def save_plots(results, per_cycle_means, bias, rate, timestamp):
-    ms_x    = [r["ms"]    for r in results]
-    adc_avg = [r["p_avg"] for r in results]
-    adc_std = [r["p_std"] for r in results]
 
-    linear_results = [r for r in results if r["us"] <= LINEAR_RANGE_CEILING_US]
-    fit_t          = np.array([r["us"] / 1_000_000.0 for r in linear_results])
-    fit_adc        = bias + rate * fit_t
-    fit_ms         = [r["ms"] for r in linear_results]
+def save_plots(results, per_cycle_means, bias, rate, slope, offset, ob_r2, timestamp):
+    ms_x      = [r["ms"]       for r in results]
+    spec_avg  = [r["spec_mean"] for r in results]
+    spec_std  = [r["spec_std"]  for r in results]
+    ob_avg    = [r["ob_mean"]   for r in results]
+    ob_std    = [r["ob_std"]    for r in results]
 
-    fig, axes = plt.subplots(3, 1, figsize=(13, 15))
+    linear_r  = [r for r in results if r["us"] <= LINEAR_RANGE_CEILING_US]
+    fit_ms    = [r["ms"] for r in linear_r]
+    fit_adc   = [bias + rate * r["us"] / 1_000_000.0 for r in linear_r]
 
-    # --- Plot 1: Full range, log x-axis, with error bars ---
+    fig, axes = plt.subplots(4, 1, figsize=(13, 20))
+
+    # --- Plot 1: Spectral dark vs OB pixel mean over integration time ---
     ax = axes[0]
-    ax.errorbar(ms_x, adc_avg, yerr=adc_std, fmt="o", markersize=5,
-                capsize=4, label="mean +/- 1 std across cycles")
-    ax.plot(fit_ms, fit_adc, linestyle="-", color="red", linewidth=2,
-            label=f"Linear fit (up to {LINEAR_RANGE_CEILING_US // 1000} ms)  "
-                  f"Bias={bias:.2f}  Rate={rate:.2f} ADC/s")
+    ax.errorbar(ms_x, spec_avg, yerr=spec_std, fmt="o", markersize=5,
+                capsize=3, color="steelblue", label="Spectral dark mean (0 to 300 nm)")
+    ax.errorbar(ms_x, ob_avg, yerr=ob_std, fmt="s", markersize=5,
+                capsize=3, color="darkorange", label=f"Optical black pixel mean ({OB_PIXEL_COUNT} pixels)")
+    ax.plot(fit_ms, fit_adc, linestyle="-", color="red", linewidth=1.5,
+            label=f"Parametric fit: Bias={bias:.2f}  Rate={rate:.2f} ADC/s")
     ax.axvline(x=LINEAR_RANGE_CEILING_US / 1000.0, color="red", linestyle=":",
-               alpha=0.6, label=f"Linearity ceiling: {LINEAR_RANGE_CEILING_US // 1000} ms")
+               alpha=0.5, label=f"Linearity ceiling: {LINEAR_RANGE_CEILING_US // 1000} ms")
     ax.set_xscale("log")
-    ax.set_title("Full Range: Dark Current vs Integration Time (log x-axis, cyclic measurement)")
+    ax.set_title("Dark Current: Spectral region vs Optical Black pixels (log x-axis)")
     ax.set_xlabel("Integration time (ms, logarithmic)")
-    ax.set_ylabel("Intensity (ADC counts)")
-    ax.grid(True, which="both", linestyle="-", alpha=0.35)
+    ax.set_ylabel("ADC counts")
+    ax.grid(True, which="both", linestyle="-", alpha=0.3)
     ax.legend(fontsize=9)
 
-    # --- Plot 2: Linear zoom, non-linearity region ---
+    # --- Plot 2: Delta between spectral dark and OB mean ---
     ax = axes[1]
-    zoom = [r for r in results if r["ms"] >= 1000]
-    zoom_ms  = [r["ms"]    for r in zoom]
-    zoom_adc = [r["p_avg"] for r in zoom]
-    zoom_std = [r["p_std"] for r in zoom]
-    ax.errorbar(zoom_ms, zoom_adc, yerr=zoom_std, fmt="o", markersize=5,
-                capsize=4, color="steelblue")
-    zoom_fit = [(r["ms"], bias + rate * r["us"] / 1_000_000.0)
-                for r in zoom if r["us"] <= LINEAR_RANGE_CEILING_US]
-    if zoom_fit:
-        zf_ms, zf_adc = zip(*zoom_fit)
-        ax.plot(zf_ms, zf_adc, linestyle="-", color="red", linewidth=2,
-                label="Linear fit (extrapolated)")
-    ax.axvline(x=LINEAR_RANGE_CEILING_US / 1000.0, color="red", linestyle=":",
-               alpha=0.6, label=f"Linearity ceiling")
-    ax.set_title("Detail View: Non-linearity onset (1000 ms to 4000 ms)")
-    ax.set_xlabel("Integration time (ms)")
-    ax.set_ylabel("Intensity (ADC counts)")
-    ax.grid(True)
+    deltas = [r["spec_mean"] - r["ob_mean"] for r in results]
+    ax.plot(ms_x, deltas, marker="o", markersize=5, color="purple")
+    ax.axhline(y=np.mean(deltas), color="red", linestyle="--",
+               label=f"Mean delta: {np.mean(deltas):.3f} ADC")
+    ax.axhline(y=0, color="black", linestyle="-", alpha=0.3)
+    ax.set_xscale("log")
+    ax.set_title("Offset between Spectral dark mean and Optical Black mean\n"
+                 "(flat line near zero = OB pixels are a perfect proxy)")
+    ax.set_xlabel("Integration time (ms, logarithmic)")
+    ax.set_ylabel("Spectral dark - OB mean (ADC)")
+    ax.grid(True, which="both", linestyle="-", alpha=0.3)
     ax.legend(fontsize=9)
 
-    # --- Plot 3: Thermal convergence — per-cycle means at a few reference times ---
+    # --- Plot 3: OB vs Spectral correlation scatter ---
     ax = axes[2]
+    ob_all   = np.array(ob_avg)
+    spec_all = np.array(spec_avg)
+    fit_line = slope * ob_all + offset
+    ax.scatter(ob_all, spec_all, color="steelblue", s=30, zorder=3, label="Data points")
+    ax.plot(ob_all, fit_line, color="red", linewidth=2,
+            label=f"Fit: spec = {slope:.4f} * OB + {offset:.3f}   R²={ob_r2:.6f}")
+    ax.plot([ob_all.min(), ob_all.max()],
+            [ob_all.min(), ob_all.max()],
+            color="gray", linestyle="--", alpha=0.5, label="Ideal 1:1 line")
+    ax.set_title("Optical Black vs Spectral Dark Correlation\n"
+                 "(slope=1.0 and offset=0.0 means OB is a perfect drop-in replacement)")
+    ax.set_xlabel("Optical black pixel mean (ADC)")
+    ax.set_ylabel("Spectral dark region mean (ADC)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    # --- Plot 4: Thermal convergence ---
+    ax = axes[3]
     probe_times = [t for t in [10, 100_000, 1_000_000, 2_500_000]
                    if t in TEST_INTEGRATION_TIMES_US]
     cycle_indices = list(range(1, len(per_cycle_means) + 1))
-
     for us in probe_times:
-        series = [cm.get(us, float("nan")) for cm in per_cycle_means]
-        ax.plot(cycle_indices, series, marker="o", markersize=4,
-                label=f"{us // 1000} ms" if us >= 1000 else f"{us} us")
-
-    ax.set_title("Thermal Convergence: Per-Cycle Mean per Integration Time\n"
-                 "(flat lines = sensor has reached thermal equilibrium)")
+        series = [cm[us]["spec"] if us in cm else float("nan") for cm in per_cycle_means]
+        label  = f"{us // 1000} ms" if us >= 1000 else f"{us} us"
+        ax.plot(cycle_indices, series, marker="o", markersize=4, label=label)
+    ax.set_title("Thermal Convergence: Spectral dark per cycle\n"
+                 "(flat = sensor at equilibrium)")
     ax.set_xlabel("Cycle index")
-    ax.set_ylabel("ADC counts (avg 0 to 300 nm region)")
+    ax.set_ylabel("ADC counts")
     ax.grid(True)
     ax.legend(fontsize=9)
 
     plt.tight_layout()
-    png_filename = f"DarkCurrent_{timestamp}.png"
-    plt.savefig(png_filename, dpi=150)
+    png = f"DarkCurrent_{timestamp}.png"
+    plt.savefig(png, dpi=150)
     plt.close()
-    print(f"Plot saved to            : {png_filename}")
+    print(f"Plot saved to            : {png}")
+
+
+def determine_correction_strategy(slope, offset, ob_r2, mean_delta):
+    """
+    Based on the OB correlation fit, recommend the best correction strategy
+    for the dashboard.
+    """
+    print()
+    print("  Correction strategy recommendation:")
+    print()
+
+    if ob_r2 < 0.98:
+        print("  R-squared below 0.98 — OB pixels do not reliably track the")
+        print("  spectral dark region. Use the parametric model (Bias + Rate * t).")
+        return "parametric"
+
+    if abs(slope - 1.0) > 0.05:
+        print(f"  Slope = {slope:.4f} (not close to 1.0) — OB pixels track the")
+        print(f"  spectral region but with a gain difference. Apply:")
+        print(f"    corrected = raw - ({slope:.4f} * ob_mean + {offset:.3f})")
+        return "ob_scaled"
+
+    if abs(offset) > 2.0:
+        print(f"  Slope ~ 1.0 but offset = {offset:.3f} ADC — subtract OB mean")
+        print(f"  plus a fixed offset:")
+        print(f"    corrected = raw - (ob_mean + {offset:.3f})")
+        return "ob_with_offset"
+
+    print(f"  Slope = {slope:.4f}, offset = {offset:.3f}, R² = {ob_r2:.6f}")
+    print(f"  OB pixels are a perfect proxy. Use direct subtraction:")
+    print(f"    corrected = raw - ob_mean")
+    print(f"  No Bias, no Rate, no integration time needed.")
+    return "ob_direct"
 
 # ============================================================
 # ENTRY POINT
@@ -426,42 +471,51 @@ try:
     results, per_cycle_means = run_characterization()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    bias, rate, r2 = fit_dark_model(results)
+    bias, rate, param_r2   = fit_parametric_model(results)
+    slope, offset, ob_r2   = fit_ob_correlation(results)
+    mean_delta             = float(np.mean([r["spec_mean"] - r["ob_mean"] for r in results]))
 
     save_csv(results, per_cycle_means, timestamp)
-    save_plots(results, per_cycle_means, bias, rate, timestamp)
+    save_plots(results, per_cycle_means, bias, rate, slope, offset, ob_r2, timestamp)
 
     print()
     print("=" * 65)
-    print(" DARK CURRENT MODEL FIT RESULTS")
+    print(" DARK CURRENT CHARACTERIZATION RESULTS")
     print("=" * 65)
     print()
-    n_linear = sum(1 for r in results if r["us"] <= LINEAR_RANGE_CEILING_US)
-    print(f"  Measurement design       : cyclic  (randomized={RANDOMIZE_ORDER_PER_CYCLE})")
     print(f"  Cycles completed         : {len(per_cycle_means)}")
-    print(f"  Data points in fit       : {n_linear}  (up to {LINEAR_RANGE_CEILING_US // 1000} ms)")
-    print(f"  R-squared                : {r2:.6f}")
+    print(f"  Integration steps        : {len(results)}")
     print()
-    print("  Model:  ADC_dark(t) = Bias + Rate * t_seconds")
+    print("  --- Parametric model (Bias + Rate * t) ---")
+    print(f"  Bias                     : {bias:.2f} ADC")
+    print(f"  Rate                     : {rate:.2f} ADC/s")
+    print(f"  R-squared                : {param_r2:.6f}")
     print()
-    print(f"  Bias  (ADC offset at t=0) : {bias:.2f} ADC counts")
-    print(f"  Rate  (thermal slope)     : {rate:.2f} ADC counts / second")
+    print("  --- Optical black pixel model ---")
+    print(f"  OB pixel count           : {OB_PIXEL_COUNT}")
+    print(f"  Correlation slope        : {slope:.6f}  (ideal: 1.0)")
+    print(f"  Correlation offset       : {offset:.4f} ADC  (ideal: 0.0)")
+    print(f"  R-squared                : {ob_r2:.6f}  (ideal: 1.0)")
+    print(f"  Mean delta (spec - OB)   : {mean_delta:.4f} ADC")
     print()
-    print("  Copy these values into the dashboard configuration block:")
+
+    strategy = determine_correction_strategy(slope, offset, ob_r2, mean_delta)
+
+    print()
+    print("  --- Dashboard config values (parametric fallback) ---")
     print()
     print(f"    DEFAULT_DARK_BIAS_ADC          = {bias:.2f}")
     print(f"    DEFAULT_DARK_RATE_ADC_PER_SEC  = {rate:.2f}")
     print()
-    print("  Check the thermal convergence plot (plot 3) to verify the")
-    print("  sensor had reached equilibrium before the majority of cycles.")
-    print("  If the early cycles show a clear upward drift, re-run with a")
-    print("  longer warm-up or discard the first few cycles manually from")
-    print("  the per_cycle CSV before refitting.")
+    print("  --- Dashboard config values (optical black) ---")
+    print()
+    print(f"    OB_CORRECTION_SLOPE   = {slope:.6f}")
+    print(f"    OB_CORRECTION_OFFSET  = {offset:.4f}")
     print()
     print("=" * 65)
 
 except KeyboardInterrupt:
-    print("\nMeasurement run aborted by user.")
+    print("\nAborted by user.")
 
 finally:
     print("Releasing USB handles...")
