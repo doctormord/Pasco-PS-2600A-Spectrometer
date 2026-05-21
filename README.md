@@ -51,8 +51,8 @@ The software was built entirely from scratch through empirical USB traffic analy
 - Wavelength axis in nanometers
 - ADC intensity axis
 - Auto-scaling Y axis
-- Real-time cursor hover readout
-- Draggable measurement cursors
+- Real-time crosshair cursor with live wavelength and intensity readout
+- Draggable measurement cursors (A / B)
 - Delta wavelength (`dx`) measurement
 - Delta intensity (`dy`) measurement
 
@@ -63,6 +63,7 @@ The software was built entirely from scratch through empirical USB traffic analy
 - Inferno colormap rendering
 - Real-time temporal evolution analysis
 - Optimized GPU-accelerated pyqtgraph rendering
+- Full crosshair cursor readout: wavelength, frame index, and intensity at cursor position
 
 ---
 
@@ -70,7 +71,37 @@ The software was built entirely from scratch through empirical USB traffic analy
 
 ### Dark Current Correction
 
-Real-time software-side subtraction using an empirical thermal dark current model:
+The software supports two independent correction modes. The active mode is selectable in the GUI at runtime.
+
+#### Mode 1 — Optical Black (default, recommended)
+
+The PS-2600A transfer header contains 30 physically masked CCD pixels (optical black pixels) that are never exposed to light. These pixels accumulate dark charge under identical conditions as the spectral pixels — same silicon die, same temperature, same integration time — and are read out in every single frame as part of the standard USB transfer at no additional cost.
+
+Their mean value provides a live, per-frame dark reference:
+
+```math
+I_{corrected} = \max(0,\ I_{raw} - (slope \cdot \overline{OB} + offset))
+```
+
+Where `slope` and `offset` are calibrated from a characterization run. For the reference unit:
+
+```
+OB_CORRECTION_SLOPE  = 1.008180
+OB_CORRECTION_OFFSET = -0.6377
+```
+
+This approach automatically compensates for:
+
+- Temperature-driven dark current drift during a session
+- Warm-up transients after cold start
+- Ambient temperature differences between sessions
+- Long-term sensor aging
+
+No integration time assumption is required. The correction is physically exact regardless of exposure duration or sensor temperature, because the reference is derived from the same physical frame.
+
+#### Mode 2 — Parametric (fallback)
+
+Classical two-parameter linear thermal model:
 
 ```math
 I_{dark} = Bias + Rate \cdot Time
@@ -78,21 +109,33 @@ I_{dark} = Bias + Rate \cdot Time
 
 Where:
 
-- `Bias` = static sensor offset
-- `Rate` = thermal accumulation rate
-- `Time` = integration time
+- `Bias` = static sensor offset at zero integration time
+- `Rate` = thermal dark charge accumulation rate in ADC counts per second
+- `Time` = current integration time in seconds
 
-Features:
+Values from the cyclic characterization run (DarkCurrent_20260521):
 
-- Adjustable dark current bias
-- Adjustable thermal rate
-- Exposure-aware correction
-- Scientifically linear correction model
+```
+DEFAULT_DARK_BIAS_ADC         = 61.57
+DEFAULT_DARK_RATE_ADC_PER_SEC = 40.94
+```
+
+This mode is provided as a fallback and for comparison. It produces accurate results within the validated linear regime but cannot compensate for temperature drift during a session.
+
+#### Live Dark Level Display
+
+A dedicated status field below the control panel displays for every acquired frame:
+
+- Current optical black mean in ADC counts
+- Active integration time
+- Relative sensor temperature hint derived from the thermal component of the OB mean
+
+This field provides a continuous indirect readout of sensor die temperature without any external thermometer.
 
 ### Hot Pixel / Despeckle Filter
 
 - Median-kernel hot-pixel suppression
-- Adjustable kernel width
+- Adjustable kernel width (3–15 pixels, odd values only)
 - Real-time filtering
 - Removes sensor artifacts and cosmic spike noise
 
@@ -104,14 +147,14 @@ Features:
 
 - Real-time dominant spectral peak detection
 - Non-Maximum Suppression (NMS)
-- Minimum distance enforcement
+- Minimum distance enforcement (pixels)
 - Top 3 peak extraction
-- Automatic peak labeling
+- Automatic peak labeling with wavelength and intensity
 
 ### Spectral Reference Library
 
 - CSV-based editable reference library
-- Overlay support for comparison
+- Overlay support for direct comparison against live data
 - Hydrogen Balmer series included
 - Mercury discharge lines included
 - User-expandable reference database
@@ -122,8 +165,8 @@ Features:
 
 ### CSV Export
 
-- Single-frame spectrum export
-- Full heatmap history export
+- Single-frame spectrum export with embedded metadata (OB mean, integration time, correction mode)
+- Full heatmap history export (frame × wavelength matrix)
 - Timestamped filenames
 - Wavelength + ADC export
 
@@ -262,8 +305,6 @@ sys
 csv
 datetime
 collections
-threading
-queue
 ```
 
 ---
@@ -286,13 +327,7 @@ pip install pyqt6 pyqtgraph numpy
 Launch the application:
 
 ```bash
-python spectrometer.py
-```
-
-or:
-
-```bash
-python usb_test_pro.py
+python PS-2600A_Pro.py
 ```
 
 ---
@@ -510,7 +545,7 @@ Used for:
 | `0x01` | OUT | Device initialization |
 | `0x02` | OUT | Set integration time |
 | `0x09` | OUT | Trigger acquisition |
-| `0x83` (`131`) | IN | Legacy status polling |
+| `0x83` (`131`) | IN | Legacy status polling (unused in final loop) |
 
 ---
 
@@ -582,8 +617,25 @@ Structure:
 
 | Bytes | Purpose |
 |---|---|
-| `0–63` | Header / metadata |
-| `64–7359` | Spectral ADC payload |
+| `0–3` | Padding (always zero) |
+| `4–63` | 30 optical black pixels (uint16 LE) |
+| `64–7359` | Spectral ADC payload (3648 × uint16 LE) |
+
+---
+
+## Optical Black Header Pixels
+
+The first 64 bytes of every transfer were initially assumed to be device metadata. Systematic warm-up analysis revealed that bytes 4–63 carry 30 physically masked CCD pixels that track dark current identically to the spectral region.
+
+Correlation analysis across 10 measurement cycles at 24 integration times confirmed:
+
+```
+Correlation slope  : 1.008180  (ideal: 1.0)
+Correlation offset : -0.6377 ADC
+R-squared          : 0.999943
+```
+
+These pixels are now used as the primary per-frame dark reference in Optical Black correction mode.
 
 ---
 
@@ -613,13 +665,7 @@ ADC range:
 
 # Legacy Polling Discovery
 
-During early experimentation, request:
-
-```text
-0x83
-```
-
-was used for polling.
+During early experimentation, request `0x83` was used for polling.
 
 A non-zero return value appeared to indicate acquisition readiness.
 
@@ -633,52 +679,23 @@ The polling mechanism was therefore removed from the final acquisition loop.
 
 ---
 
-# The Scientifically Valid 2.5 Second Limit
+# The 2.5 Second Integration Limit
 
-One of the most important discoveries during characterization of the PASCO PS-2600A was the existence of a hard linearity boundary at approximately:
+Empirical characterization of the sensor established a hard integration time ceiling at:
 
 ```text
 2500 ms
 ```
 
-During dark-current analysis with a fully shielded optical path, the sensor initially followed an extremely clean linear accumulation model:
+During dark-current analysis with a fully shielded optical path, the parametric dark model `I_dark = Bias + Rate * t` fitted the measured data with R² = 0.9958 across the full characterization range.
 
-```math
-I_{dark} = Bias + Rate \cdot Time
-```
+Beyond approximately 2.5 seconds, onboard firmware signal limiting behavior has been observed in some operating conditions. To ensure the spectral dynamic range remains fully available for actual signal peaks and to stay within the validated parametric model regime, the ceiling is retained.
 
-Up to approximately 2.5 seconds, the sensor response remained highly linear and predictable.
-
-However, beyond this threshold, empirical measurements revealed:
-
-- non-linear ADC compression
-- signal flattening
-- reduced accumulation slope
-- apparent onboard clamping behavior
-
-This strongly suggests that the firmware internally activates dynamic signal limiting to prevent ADC overflow during extremely long integrations.
-
----
-
-## Why This Matters
-
-The software’s dark current correction assumes strict linearity.
-
-If integrations beyond 2.5 seconds were permitted:
-
-- the correction model would overestimate thermal noise
-- legitimate spectral peaks would be pushed negative
-- measurements would lose scientific validity
-
-For this reason:
+Note that this limit is relevant primarily when using Parametric dark correction mode. In Optical Black mode, the correction is derived from the frame itself and does not depend on any integration time assumption, so model accuracy above 2.5 seconds is not a factor. The ceiling remains in place as a conservative operating boundary regardless of correction mode.
 
 ```python
-MAX_INTEGRATION_TIME_US = 2500000
+MAX_INTEGRATION_TIME_US = 2_500_000
 ```
-
-is deliberately hardcoded as a strict operational ceiling.
-
-The software intentionally confines operation to the spectrometer’s empirically validated linear regime.
 
 ---
 
@@ -690,21 +707,42 @@ All major parameters are centralized in the configuration section of the source 
 
 | Constant | Default | Description |
 |---|---|---|
-| `START_INTEGRATION_TIME_US` | `20000` | Initial exposure time |
-| `MIN_INTEGRATION_TIME_US` | `1000` | Minimum integration time |
-| `MAX_INTEGRATION_TIME_US` | `2500000` | Maximum scientifically valid integration time |
-| `AUTO_EXP_TARGET_ADC` | `3400` | Auto-exposure target |
+| `START_INTEGRATION_TIME_US` | `20000` | Initial exposure time (µs) |
+| `MIN_INTEGRATION_TIME_US` | `1000` | Minimum integration time (µs) |
+| `MAX_INTEGRATION_TIME_US` | `2500000` | Maximum integration time (µs) |
+| `AUTO_EXP_TARGET_ADC` | `3400` | Auto-exposure ADC target |
 | `AUTO_EXP_DEADZONE_ADC` | `100` | Auto-exposure deadzone |
 | `AUTO_EXP_MIN_RATIO` | `0.2` | Minimum adjustment ratio |
 | `AUTO_EXP_MAX_RATIO` | `5.0` | Maximum adjustment ratio |
 | `AUTO_EXP_EMERGENCY_DROP_RATIO` | `0.2` | Saturation emergency reduction |
-| `DEFAULT_DARK_BIAS_ADC` | `60.5` | Constant dark offset |
-| `DEFAULT_DARK_RATE_ADC_PER_SEC` | `45.0` | Thermal dark accumulation |
-| `ADC_SATURATION_THRESHOLD` | `3800` | Saturation threshold |
-| `PEAK_MIN_DISTANCE_PIXELS` | `100` | Peak separation |
+| `DEFAULT_DARK_BIAS_ADC` | `61.57` | Parametric model: bias offset |
+| `DEFAULT_DARK_RATE_ADC_PER_SEC` | `40.94` | Parametric model: thermal rate |
+| `OB_CORRECTION_SLOPE` | `1.008180` | Optical black calibration slope |
+| `OB_CORRECTION_OFFSET` | `-0.6377` | Optical black calibration offset |
+| `OB_PIXEL_COUNT` | `30` | Masked header pixels used as dark reference |
+| `DEFAULT_DARK_MODE` | `optical_black` | Active correction mode at startup |
+| `ADC_SATURATION_THRESHOLD` | `3800` | Saturation detection threshold |
+| `PEAK_MIN_DISTANCE_PIXELS` | `100` | Minimum distance between detected peaks |
 | `MIN_PEAK_HEIGHT_ADC` | `15.0` | Minimum peak intensity |
-| `HEATMAP_HISTORY_SIZE` | `100` | Waterfall buffer size |
-| `WAVELENGTH_COEFFS` | see above | Calibration polynomial |
+| `HEATMAP_HISTORY_SIZE` | `100` | Waterfall frame buffer depth |
+| `WAVELENGTH_COEFFS` | see above | Cubic calibration polynomial |
+
+---
+
+# Dark Current Characterization Script
+
+A standalone characterization script (`PS-2600A_Dark_Current_Characterization.py`) is included for measuring and validating the dark current parameters of a specific unit.
+
+The script uses a cyclic measurement design to decouple thermal self-heating from integration time effects: instead of measuring all repetitions at one time step before advancing, one frame is acquired at each integration step per cycle, and the full cycle is repeated N times. Thermal drift is therefore distributed equally across all time steps rather than accumulating on the long-exposure end.
+
+The script outputs:
+
+- Fitted parametric model parameters (Bias, Rate, R²) for the Parametric correction mode
+- Optical black correlation analysis (slope, offset, R²) confirming OB pixel validity
+- A recommendation for which correction mode is appropriate based on the characterization data
+- Per-cycle thermal convergence data to assess whether measurements were taken at thermal equilibrium
+
+Run the characterization with the sensor input fully sealed (lens cap or equivalent) at the ambient temperature of normal operation. A full run at the default settings takes approximately 15 minutes.
 
 ---
 
@@ -716,11 +754,14 @@ All exports are timestamped and saved in the working directory.
 
 | Filename Pattern | Content |
 |---|---|
-| `spectrum_data_YYYYMMDD_HHMMSS.csv` | Current spectrum |
-| `heatmap_data_YYYYMMDD_HHMMSS.csv` | Full waterfall history |
-| `spectrum_plot_YYYYMMDD_HHMMSS.png` | Scope screenshot |
-| `heatmap_plot_YYYYMMDD_HHMMSS.png` | Heatmap screenshot |
+| `spectrum_data_YYYYMMDD_HHMMSS.csv` | Current averaged spectrum with OB and correction metadata |
+| `heatmap_data_YYYYMMDD_HHMMSS.csv` | Full waterfall history (frame × wavelength matrix) |
+| `spectrum_plot_YYYYMMDD_HHMMSS.png` | Scope tab screenshot |
+| `heatmap_plot_YYYYMMDD_HHMMSS.png` | Heatmap tab screenshot |
 | `reference_spectra.csv` | Reference spectrum library |
+| `DarkCurrent_YYYYMMDD_HHMMSS.png` | Characterization plots |
+| `DarkCurrent_YYYYMMDD_HHMMSS_aggregated.csv` | Aggregated characterization data |
+| `DarkCurrent_YYYYMMDD_HHMMSS_per_cycle.csv` | Per-cycle characterization data |
 
 ---
 
@@ -731,13 +772,15 @@ This project demonstrates that the PASCO PS-2600A can be fully operated through 
 The implementation includes:
 
 - complete reverse-engineered USB protocol support
-- direct WinUSB communication
-- real-time spectroscopy
-- scientific dark-current correction
-- dynamic visualization
-- spectral analysis tooling
-- CSV/PNG export infrastructure
-- hardware-level synchronization handling
+- direct WinUSB communication via ctypes
+- real-time spectroscopy with live streaming
+- dual-mode dark current correction: per-frame optical black and parametric fallback
+- live sensor die temperature readout via optical black mean
+- dynamic visualization in scope and waterfall modes with full cursor readout in both
+- spectral peak analysis with NMS
+- spectral reference library with live overlay
+- CSV and PNG export infrastructure
+- hardware-level synchronization via drain packet sequencing
 
 All functionality operates entirely in user-space Python with no proprietary SDK dependencies.
 
@@ -750,5 +793,3 @@ This project is intended for educational, scientific, and reverse-engineering re
 The PASCO PS-2600A hardware and associated trademarks belong to PASCO Scientific.
 
 This repository is an independent community reverse-engineering effort and is not affiliated with PASCO Scientific.
-
-````
