@@ -262,4 +262,19 @@ file. No values are hardcoded elsewhere.
 | `WAVELENGTH_COEFFS` | see above | Cubic polynomial calibration coefficients |
  
 ---
+
+## File Output
+
+All exports are saved to the working directory with a timestamp in the filename.
+
+| Filename pattern              | Content                                              |
+|-------------------------------|------------------------------------------------------|
+| `spectrum_data_YYYYMMDD_HHMMSS.csv` | Single averaged spectrum, pixel / wavelength / ADC |
+| `heatmap_data_YYYYMMDD_HHMMSS.csv`  | Full heatmap buffer, frame x wavelength matrix     |
+| `spectrum_plot_YYYYMMDD_HHMMSS.png` | Screenshot of scope view                          |
+| `heatmap_plot_YYYYMMDD_HHMMSS.png`  | Screenshot of heatmap view                        |
+| `reference_spectra.csv`             | Reference library, created on first launch        |
+
+---
+
  
