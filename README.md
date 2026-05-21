@@ -1,4 +1,3 @@
-````markdown
 # PASCO PS-2600A – Native WinUSB Spectrometer Dashboard
 
 A high-performance, real-time spectroscopy software suite for the PASCO PS-2600A spectrometer, providing direct low-level USB communication through the native Windows WinUSB stack — completely bypassing the official PASCO software ecosystem.
