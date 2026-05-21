@@ -1,280 +1,755 @@
+````markdown
 # PASCO PS-2600A – Native WinUSB Spectrometer Dashboard
- 
-A Python application for direct, low-level USB access to the PASCO PS-2600A spectrometer on Windows,
-bypassing the official PASCO software entirely. Provides a real-time spectral scope, time-lapse heatmap,
-auto-exposure, dark current correction, peak detection, and CSV/PNG export — all in a single file.
 
-![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Plot.png "GUI PLOT")
-![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Waterfall.png "GUI Waterfall")
- 
+A high-performance, real-time spectroscopy software suite for the PASCO PS-2600A spectrometer, providing direct low-level USB communication through the native Windows WinUSB stack — completely bypassing the official PASCO software ecosystem.
+
+This project bridges the gap between raw hardware access and professional-grade laboratory analysis by combining reverse-engineered USB protocol control, high-speed real-time visualization, dark current modeling, spectral analysis, and export tooling into a single standalone Python application.
+
+The software was built entirely from scratch through empirical USB traffic analysis and protocol reconstruction using Wireshark and USBPcap, as no public SDK documentation exists for raw USB transfers on the device.
+
 ---
- 
-## Features
- 
-**Acquisition**
-- Real-time live spectrum streaming at the maximum rate the hardware allows
+
+# Screenshots
+
+![GUI Plot](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Plot.png "GUI Plot")
+
+![GUI Waterfall](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Waterfall.png "GUI Waterfall")
+
+![Zadig Driver Setup](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/Zadig_USB.png "Zadig Driver Setup")
+
+---
+
+# Key Features
+
+---
+
+## Multi-Threaded Architecture
+
+- Dedicated acquisition thread fully isolated from the GUI thread
+- Maintains a responsive interface even during very long integration times
+- Stable operation up to the scientifically validated 2.5-second integration limit
+- Continuous USB streaming without GUI blocking
+
+---
+
+## Acquisition Features
+
+- Real-time live spectrum streaming at the maximum hardware-supported rate
 - Adjustable integration time from 1 ms to 2500 ms
-- Automatic exposure control with configurable target ADC level and adjustment ratio limits
+- Automatic exposure control
+- Configurable ADC target levels
+- Exposure adjustment ratio clamping
+- Emergency saturation protection
 - Frame averaging (1–100 frames) for noise reduction
-**Display**
-- Scope mode: live spectral curve with wavelength axis (nm) and ADC intensity axis
-- Time-lapse heatmap (waterfall plot): 100-frame rolling history using an inferno colormap
-- Auto-scaling Y axis based on visible data range
-- Mouse cursor with live readout of wavelength and intensity at hover position
-- Draggable measurement cursors (Measure Mode) with delta-wavelength and delta-intensity readout
-**Processing**
-- Dark current correction using a configurable bias offset and thermal rate model (ADC/s)
-- Hot-pixel / despeckle filter using a configurable-width median kernel
-- Peak detection returning the top 3 dominant spectral peaks with minimum distance enforcement
-**Reference & Export**
-- Overlay of reference spectra from a user-editable CSV library (hydrogen, mercury included by default)
-- CSV export of current spectrum or full heatmap buffer
-- PNG screenshot export of the active plot
-**Hardware Layer**
-- Pure Python ctypes interface to WinUSB — no libusb, no pyusb, no third-party USB wrapper
-- Correct FILE_FLAG_OVERLAPPED handle creation as required by WinUsb_Initialize
-- Full protocol implementation reverse-engineered from USB capture (see Protocol section below)
----
- 
-## Requirements
- 
-### Operating System
- 
-Windows 10 or Windows 11 (64-bit). The WinUSB driver stack (`winusb.dll`, `setupapi.dll`) is built into Windows
-and does not require separate installation.
- 
-### Driver
- 
-The PASCO device ships with a vendor-specific driver that blocks direct WinUSB access. You must replace it:
- 
-1. Download [Zadig](https://zadig.akeo.ie/) and run it as Administrator.
-2. Go to **Options** and enable **List All Devices**.
-3. Select **Spectrometer** (VID `0945`, PID `0002`) from the dropdown.
-4. Set the target driver to **WinUSB** and click **Replace Driver** (or **Install Driver**).
-5. Confirm that the left-hand field now shows **WinUSB** as the active driver.
-Note: after this substitution, the official PASCO SPARKvue and Capstone software will no longer recognize
-the device. You can restore the original driver at any time through Device Manager by uninstalling the
-WinUSB driver and reinstalling the vendor driver.
 
-![alt text](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/Zadig_USB.png "Zadig USB")
- 
-### Python
- 
-Python 3.10 or newer (64-bit build required — the ctypes pointer size check in the device enumeration
-path assumes a 64-bit address space).
- 
-### Python Packages
- 
-Install all dependencies with:
- 
+---
+
+## Visualization Modes
+
+### Scope Mode
+
+- High-speed live spectral waveform rendering
+- Wavelength axis in nanometers
+- ADC intensity axis
+- Auto-scaling Y axis
+- Real-time cursor hover readout
+- Draggable measurement cursors
+- Delta wavelength (`dx`) measurement
+- Delta intensity (`dy`) measurement
+
+### Time-Lapse Heatmap (Waterfall Plot)
+
+- Rolling spectral history visualization
+- 100-frame history buffer
+- Inferno colormap rendering
+- Real-time temporal evolution analysis
+- Optimized GPU-accelerated pyqtgraph rendering
+
+---
+
+## Signal Processing
+
+### Dark Current Correction
+
+Real-time software-side subtraction using an empirical thermal dark current model:
+
+```math
+I_{dark} = Bias + Rate \cdot Time
 ```
+
+Where:
+
+- `Bias` = static sensor offset
+- `Rate` = thermal accumulation rate
+- `Time` = integration time
+
+Features:
+
+- Adjustable dark current bias
+- Adjustable thermal rate
+- Exposure-aware correction
+- Scientifically linear correction model
+
+### Hot Pixel / Despeckle Filter
+
+- Median-kernel hot-pixel suppression
+- Adjustable kernel width
+- Real-time filtering
+- Removes sensor artifacts and cosmic spike noise
+
+---
+
+## Analysis Tools
+
+### Peak Finder
+
+- Real-time dominant spectral peak detection
+- Non-Maximum Suppression (NMS)
+- Minimum distance enforcement
+- Top 3 peak extraction
+- Automatic peak labeling
+
+### Spectral Reference Library
+
+- CSV-based editable reference library
+- Overlay support for comparison
+- Hydrogen Balmer series included
+- Mercury discharge lines included
+- User-expandable reference database
+
+---
+
+## Export Features
+
+### CSV Export
+
+- Single-frame spectrum export
+- Full heatmap history export
+- Timestamped filenames
+- Wavelength + ADC export
+
+### PNG Export
+
+- Scope screenshot export
+- Heatmap screenshot export
+- High-resolution snapshots
+
+---
+
+## Hardware Layer
+
+- Pure Python ctypes interface to WinUSB
+- No `pyusb`
+- No `libusb`
+- No third-party USB abstraction layer
+- Direct WinUSB API access
+- Full reverse-engineered protocol implementation
+- Native overlapped I/O support
+
+---
+
+# Requirements
+
+---
+
+## Operating System
+
+- Windows 10 (64-bit)
+- Windows 11 (64-bit)
+
+The required WinUSB components (`winusb.dll`, `setupapi.dll`) are already included in Windows.
+
+---
+
+## Python Version
+
+- Python 3.10 or newer
+- 64-bit Python required
+
+Python 3.13 is fully supported and recommended.
+
+---
+
+# Driver Installation (CRITICAL)
+
+The official PASCO vendor driver blocks direct low-level USB access.
+
+The device MUST be reassigned to the WinUSB driver using Zadig.
+
+---
+
+## Installing WinUSB via Zadig
+
+1. Download Zadig:
+   https://zadig.akeo.ie/
+
+2. Launch Zadig as Administrator
+
+3. Open:
+
+```text
+Options → List All Devices
+```
+
+4. Select:
+
+```text
+Spectrometer (VID 0945, PID 0002)
+```
+
+5. Choose target driver:
+
+```text
+WinUSB
+```
+
+6. Click:
+
+```text
+Replace Driver
+```
+
+or
+
+```text
+Install Driver
+```
+
+7. Confirm WinUSB is now shown as the active driver.
+
+---
+
+## Important Note
+
+After replacing the driver:
+
+- PASCO SPARKvue will no longer recognize the device
+- PASCO Capstone will no longer recognize the device
+
+The original driver can be restored at any time through Device Manager.
+
+---
+
+# Python Dependencies
+
+Install all required packages:
+
+```bash
 pip install pyqt6 pyqtgraph numpy
 ```
- 
+
+---
+
+## External Packages
+
 | Package | Purpose |
 |---|---|
 | `pyqt6` | Main GUI framework |
-| `pyqtgraph` | High-performance real-time plotting and heatmap rendering |
-| `numpy` | Spectrum array operations, averaging, peak detection, median filter |
- 
-The following packages are used but are part of the Python standard library and require no installation:
-`ctypes`, `struct`, `time`, `os`, `sys`, `csv`, `datetime`, `collections`.
- 
+| `pyqtgraph` | High-speed plotting and heatmap rendering |
+| `numpy` | Numerical processing and filtering |
+
 ---
- 
-## Installation and Launch
- 
+
+## Standard Library Modules Used
+
+No installation required:
+
+```text
+ctypes
+struct
+time
+os
+sys
+csv
+datetime
+collections
+threading
+queue
 ```
-git clone https://github.com/yourname/pasco-ps2600a-dashboard
-cd pasco-ps2600a-dashboard
+
+---
+
+# Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/doctormord/Pasco-PS-2600A-Spectrometer
+cd Pasco-PS-2600A-Spectrometer
+```
+
+Install dependencies:
+
+```bash
 pip install pyqt6 pyqtgraph numpy
+```
+
+Launch the application:
+
+```bash
 python spectrometer.py
 ```
- 
-Connect the spectrometer via USB before or after launching. Use the **Scan USB** button to enumerate
-available devices, select the entry matching your device, and click **Connect**.
- 
+
+or:
+
+```bash
+python usb_test_pro.py
+```
+
 ---
- 
-## Wavelength Calibration
- 
-The pixel-to-wavelength mapping uses a cubic polynomial calibration embedded in the configuration block
-at the top of the file:
- 
+
+# First Launch
+
+On first launch:
+
+- `reference_spectra.csv` is generated automatically
+- Default hydrogen and mercury spectra are included
+- Connect the spectrometer before or after launch
+- Use the **Scan USB** button to enumerate devices
+- Select the PASCO spectrometer entry
+- Click **Connect**
+
+---
+
+# Wavelength Calibration
+
+The pixel-to-wavelength conversion uses a cubic calibration polynomial:
+
 ```python
-WAVELENGTH_COEFFS = [130.755917, 0.262201464, 1.44855491e-05, -4.30320660e-09]
+WAVELENGTH_COEFFS = [
+    130.755917,
+    0.262201464,
+    1.44855491e-05,
+    -4.30320660e-09
+]
 ```
- 
-The wavelength for pixel index `i` is computed as:
- 
+
+The wavelength mapping is:
+
+```math
+\lambda(i) = C_0 + C_1 i + C_2 i^2 + C_3 i^3
 ```
-lambda(i) = C0 + C1*i + C2*i^2 + C3*i^3
-```
- 
-This yields approximately 130 nm at pixel 0 and 1085 nm at pixel 3647. If your unit produces different
-results against known spectral lines, update these four coefficients accordingly. The calibration array
-is computed once at startup and reused for all subsequent operations.
- 
+
+Where:
+
+- `i` = pixel index
+- `λ(i)` = wavelength in nanometers
+
+Approximate range:
+
+- Pixel 0 → ~130 nm
+- Pixel 3647 → ~1085 nm
+
+The calibration table is computed once during startup and reused throughout runtime.
+
 ---
- 
-## Reference Library
- 
-On first launch, a file named `reference_spectra.csv` is created automatically in the working directory.
-It contains two synthetic reference spectra: hydrogen Balmer series and mercury discharge lines.
- 
-To add your own reference spectrum, append a column to the CSV. The format is semicolon-delimited with
-a header row. The first column must be `Wavelength_nm`, followed by one column per reference source.
-Each row corresponds to one pixel in order from pixel 0 to pixel 3647. The new entry will appear in the
-**Library** dropdown at the next launch.
- 
+
+# Reference Spectrum Library
+
+A file named:
+
+```text
+reference_spectra.csv
+```
+
+is automatically generated in the working directory.
+
 ---
- 
-## USB Protocol — Reverse Engineering Notes
- 
-This section documents how the device communication protocol was determined. The official PASCO SDK is
-not publicly documented at the USB transfer level, so the protocol was recovered entirely from live
-USB traffic analysis.
- 
-### Tools Used
- 
-- **Wireshark** with **USBPcap** for live USB traffic capture on Windows
-- Python `ctypes` for direct WinUSB access without any abstraction layer
-### Device Identification
- 
-The spectrometer enumerates as VID `0x0945`, PID `0x0002`. It exposes a WinUSB-compatible interface
-registered under the GUID `{DEE824EF-729B-4A0E-9C14-B7117D33A817}`, which is the standard Microsoft
-OS descriptor GUID for WinUSB devices. The device also appeared under a secondary GUID
-`{9a9a65ee-a425-482d-ae44-80da1a1210c6}` in early captures; the DEE824EF GUID proved more reliable
-for enumeration.
- 
-### Initial Access Problem
- 
-Opening the device with `CreateFileW` returned error code 5 (`ERROR_ACCESS_DENIED`) even under
-an Administrator account. Two things were required to resolve this:
- 
-First, the vendor driver had to be replaced with WinUSB via Zadig, as described above.
- 
-Second — and this is the non-obvious part — `CreateFileW` must be called with `FILE_FLAG_OVERLAPPED`
-(`0x40000000`) in the `dwFlagsAndAttributes` parameter. Passing zero here causes `WinUsb_Initialize`
-to fail or the subsequent handle to be rejected. This flag is documented as required by WinUSB but is
-easy to miss. The flag was already defined as a constant in the original code but was mistakenly passed
-as `0` in the actual call.
- 
-### Transfer Topology
- 
-All communication goes through two mechanisms:
- 
-- **Control transfers** on endpoint `0x00` (the default control pipe): used for command dispatch and
-  legacy status polling.
-- **Bulk IN transfers** on endpoint `0x82`: used for all data coming back from the device — both the
-  main spectral payload and inter-frame synchronization packets.
-### Command Set
- 
-The following vendor-class control transfers were identified:
- 
-| Request Code | Direction | wValue | wIndex | Purpose |
-|---|---|---|---|---|
-| `0x01` | OUT | 0 | 0 | Device init / soft reset |
-| `0x02` | OUT | low 16 bits of time_us | high 16 bits of time_us | Set integration time in microseconds |
-| `0x09` | OUT | 0 | 0 | Arm and trigger one acquisition |
-| `0x83` (131) | IN | — | — | Poll acquisition status (legacy) |
- 
-Request `0x02` passes a 32-bit microsecond value split across `wValue` (low word) and `wIndex`
-(high word). For integration times below 65535 µs this is equivalent to just setting `wValue`.
- 
-### The Actual Acquisition Cycle
- 
-Early attempts used the status polling byte from request `0x83` as the primary ready signal,
-looping until the returned byte went non-zero before issuing a bulk read. This produced alternating
-valid and all-zero frames — every second acquisition was empty.
- 
-The root cause was identified by capturing a full working session from the PASCO software in Wireshark
-and examining the exact packet sequence around each 7387-byte bulk transfer.
- 
-The correct sequence per frame, as observed in the capture, is:
- 
+
+## CSV Format
+
+- Semicolon-delimited
+- First column:
+
+```text
+Wavelength_nm
 ```
-1.  BULK IN  0x82  28 bytes    drain packet — consume leftover bytes from previous cycle
-2.  CTRL OUT 0x00  REQ=0x09    trigger new acquisition
-3.  BULK IN  0x82  7360 bytes  main spectral payload
-4.  BULK IN  0x82  28 bytes    trailing drain packet
-5.  CTRL OUT 0x00  REQ=0x02    set integration time for next cycle
+
+- Additional columns represent reference spectra
+
+Example:
+
+```csv
+Wavelength_nm;Hydrogen;Mercury
+130.0;0;0
+130.3;0;0
+...
 ```
- 
-The device uses the bulk pipe itself as the synchronization mechanism. The 28-byte drain reads
-are not status packets in any meaningful sense — they serve as flow-control acknowledgements that
-tell the device firmware the host is ready for the next transfer. Skipping either drain read desynchronizes
-the pipeline and causes the device to buffer the next frame's data behind a stale transfer, which
-then reads as zeros.
- 
-The status polling via `0x83` is not used in the final implementation. It was present in early
-PASCO captures in a different context and does not belong in the per-frame acquisition loop.
- 
-### Payload Structure
- 
-Each 7360-byte bulk transfer has the following layout:
- 
+
+Each row corresponds to one spectrometer pixel.
+
+New spectra appear automatically in the GUI library selector after restart.
+
+---
+
+# USB Protocol Architecture & Reverse Engineering
+
+The PASCO PS-2600A communicates through a vendor-specific USB protocol wrapped inside the Windows WinUSB stack.
+
+No official low-level protocol documentation exists.
+
+The complete communication protocol was reconstructed entirely from live USB traffic captures.
+
+---
+
+# Reverse Engineering Process
+
+The protocol was reverse-engineered using:
+
+- Wireshark
+- USBPcap
+- Differential USB traffic analysis
+- Timestamp correlation
+- Iterative packet replay testing
+
+Traffic between the official PASCO software and the hardware was captured and filtered for:
+
+```text
+URB_CONTROL
+URB_BULK
 ```
-Bytes 0–63      : Header (64 bytes) — device metadata, first 4 bytes are zero
-Bytes 64–7359   : Spectral data (7296 bytes = 3648 pixels * 2 bytes/pixel)
+
+This allowed reconstruction of the internal acquisition state machine.
+
+---
+
+# Initial Access Problem
+
+Early attempts to initialize the device consistently failed:
+
+```text
+ERROR_ACCESS_DENIED
 ```
- 
-The spectral data is packed as 3648 unsigned 16-bit little-endian integers. Each value is a raw ADC
-count in the range 0–4095 (12-bit ADC). The 28-byte drain packets carry a small amount of pixel data
-as well (visible in the Wireshark hex dump) but their content is discarded.
- 
-### Integration Time Encoding for Large Values
- 
-For integration times above 65535 µs the value must be split:
- 
+
+when calling:
+
+```text
+CreateFileW
+```
+
+even under Administrator privileges.
+
+The issue was ultimately traced to a critical WinUSB requirement:
+
+```text
+FILE_FLAG_OVERLAPPED
+```
+
+must be passed during device handle creation.
+
+Without this flag:
+
+- `WinUsb_Initialize()` fails
+- handles are rejected
+- asynchronous USB access breaks
+
+This requirement is documented by Microsoft but easy to overlook.
+
+---
+
+# Device Identification
+
+The spectrometer enumerates as:
+
+| Parameter | Value |
+|---|---|
+| VID | `0x0945` |
+| PID | `0x0002` |
+
+Observed WinUSB interface GUID:
+
+```text
+{DEE824EF-729B-4A0E-9C14-B7117D33A817}
+```
+
+Secondary GUID observed during early captures:
+
+```text
+{9a9a65ee-a425-482d-ae44-80da1a1210c6}
+```
+
+---
+
+# Transfer Topology
+
+Communication uses:
+
+---
+
+## Control Transfers (`Endpoint 0x00`)
+
+Used for:
+
+- Device initialization
+- Exposure control
+- Triggering
+- Legacy status polling
+
+Transfer types:
+
+```text
+0x40 → Vendor OUT
+0xC0 → Vendor IN
+```
+
+---
+
+## Bulk Transfers (`Endpoint 0x82`)
+
+Used for:
+
+- Spectral payload transfer
+- Synchronization packets
+- Inter-frame drain packets
+
+---
+
+# Command Set
+
+| Request Code | Direction | Purpose |
+|---|---|---|
+| `0x01` | OUT | Device initialization |
+| `0x02` | OUT | Set integration time |
+| `0x09` | OUT | Trigger acquisition |
+| `0x83` (`131`) | IN | Legacy status polling |
+
+---
+
+# Integration Time Encoding
+
+Integration time is transmitted in microseconds as a 32-bit integer.
+
+Because USB setup packets only provide 16-bit `wValue` and `wIndex` fields,
+the value must be split:
+
 ```python
 low_word  = microseconds & 0xFFFF
 high_word = (microseconds >> 16) & 0xFFFF
-usb_control_transfer_out(CMD_SET_EXPOSURE, value=low_word, index=high_word)
 ```
- 
-This was inferred from the `wValue`/`wIndex` field sizes in the SETUP packet and confirmed by
-testing: passing only `wValue` with a large time resulted in incorrect (truncated) exposure durations.
- 
+
+Transfer:
+
+```python
+usb_control_transfer_out(
+    CMD_SET_EXPOSURE,
+    value=low_word,
+    index=high_word
+)
+```
+
 ---
- 
-## Configuration Reference
- 
-All hardware and software parameters are collected in the configuration block at the top of the source
-file. No values are hardcoded elsewhere.
- 
+
+# Actual Acquisition Cycle
+
+The final validated acquisition sequence is:
+
+```text
+1. BULK IN  0x82  28 bytes    drain previous cycle
+2. CTRL OUT 0x00  REQ=0x09    trigger acquisition
+3. BULK IN  0x82  7360 bytes  spectral payload
+4. BULK IN  0x82  28 bytes    trailing drain packet
+5. CTRL OUT 0x00  REQ=0x02    set next exposure
+```
+
+---
+
+# The 28-Byte Drain Packet Problem
+
+One of the most critical discoveries during reverse engineering was that the device uses small 28-byte bulk transfers as synchronization acknowledgements.
+
+These packets MUST be drained every cycle.
+
+Skipping them causes:
+
+- pipeline desynchronization
+- stale frame buffering
+- alternating zero frames
+- ghosting artifacts
+- dropped acquisitions
+
+This issue was invisible until full USB captures were analyzed frame-by-frame.
+
+---
+
+# Payload Structure
+
+Main payload size:
+
+```text
+7360 bytes
+```
+
+Structure:
+
+| Bytes | Purpose |
+|---|---|
+| `0–63` | Header / metadata |
+| `64–7359` | Spectral ADC payload |
+
+---
+
+## Spectral Data
+
+The spectral payload contains:
+
+```text
+3648 unsigned 16-bit little-endian integers
+```
+
+Format:
+
+```python
+<H
+```
+
+ADC range:
+
+```text
+0–4095
+```
+
+(12-bit ADC)
+
+---
+
+# Legacy Polling Discovery
+
+During early experimentation, request:
+
+```text
+0x83
+```
+
+was used for polling.
+
+A non-zero return value appeared to indicate acquisition readiness.
+
+However, later investigation revealed that the final acquisition synchronization is actually driven by the bulk pipe itself, not by status polling.
+
+The polling mechanism was therefore removed from the final acquisition loop.
+
+---
+
+# Constraints & Sensor Linearity
+
+---
+
+# The Scientifically Valid 2.5 Second Limit
+
+One of the most important discoveries during characterization of the PASCO PS-2600A was the existence of a hard linearity boundary at approximately:
+
+```text
+2500 ms
+```
+
+During dark-current analysis with a fully shielded optical path, the sensor initially followed an extremely clean linear accumulation model:
+
+```math
+I_{dark} = Bias + Rate \cdot Time
+```
+
+Up to approximately 2.5 seconds, the sensor response remained highly linear and predictable.
+
+However, beyond this threshold, empirical measurements revealed:
+
+- non-linear ADC compression
+- signal flattening
+- reduced accumulation slope
+- apparent onboard clamping behavior
+
+This strongly suggests that the firmware internally activates dynamic signal limiting to prevent ADC overflow during extremely long integrations.
+
+---
+
+## Why This Matters
+
+The software’s dark current correction assumes strict linearity.
+
+If integrations beyond 2.5 seconds were permitted:
+
+- the correction model would overestimate thermal noise
+- legitimate spectral peaks would be pushed negative
+- measurements would lose scientific validity
+
+For this reason:
+
+```python
+MAX_INTEGRATION_TIME_US = 2500000
+```
+
+is deliberately hardcoded as a strict operational ceiling.
+
+The software intentionally confines operation to the spectrometer’s empirically validated linear regime.
+
+---
+
+# Configuration Reference
+
+All major parameters are centralized in the configuration section of the source file.
+
+---
+
 | Constant | Default | Description |
 |---|---|---|
-| `START_INTEGRATION_TIME_US` | 20000 | Initial exposure time in microseconds |
-| `MIN_INTEGRATION_TIME_US` | 1000 | Minimum allowed exposure time |
-| `MAX_INTEGRATION_TIME_US` | 2500000 | Maximum allowed exposure time |
-| `AUTO_EXP_TARGET_ADC` | 3400 | Target peak ADC value for auto-exposure |
-| `AUTO_EXP_DEADZONE_ADC` | 100 | Auto-exposure does not adjust within this band |
-| `AUTO_EXP_MIN_RATIO` | 0.2 | Minimum per-frame adjustment factor |
-| `AUTO_EXP_MAX_RATIO` | 5.0 | Maximum per-frame adjustment factor |
-| `AUTO_EXP_EMERGENCY_DROP_RATIO` | 0.2 | Immediate reduction factor on saturation |
-| `DEFAULT_DARK_BIAS_ADC` | 60.5 | Constant dark current offset |
-| `DEFAULT_DARK_RATE_ADC_PER_SEC` | 45.0 | Thermal dark current rate |
-| `ADC_SATURATION_THRESHOLD` | 3800 | ADC value considered saturated |
-| `PEAK_MIN_DISTANCE_PIXELS` | 100 | Minimum pixel separation between detected peaks |
-| `MIN_PEAK_HEIGHT_ADC` | 15.0 | Minimum ADC value for peak detection |
-| `HEATMAP_HISTORY_SIZE` | 100 | Number of frames stored in the waterfall buffer |
-| `WAVELENGTH_COEFFS` | see above | Cubic polynomial calibration coefficients |
- 
----
-
-## File Output
-
-All exports are saved to the working directory with a timestamp in the filename.
-
-| Filename pattern              | Content                                              |
-|-------------------------------|------------------------------------------------------|
-| `spectrum_data_YYYYMMDD_HHMMSS.csv` | Single averaged spectrum, pixel / wavelength / ADC |
-| `heatmap_data_YYYYMMDD_HHMMSS.csv`  | Full heatmap buffer, frame x wavelength matrix     |
-| `spectrum_plot_YYYYMMDD_HHMMSS.png` | Screenshot of scope view                          |
-| `heatmap_plot_YYYYMMDD_HHMMSS.png`  | Screenshot of heatmap view                        |
-| `reference_spectra.csv`             | Reference library, created on first launch        |
+| `START_INTEGRATION_TIME_US` | `20000` | Initial exposure time |
+| `MIN_INTEGRATION_TIME_US` | `1000` | Minimum integration time |
+| `MAX_INTEGRATION_TIME_US` | `2500000` | Maximum scientifically valid integration time |
+| `AUTO_EXP_TARGET_ADC` | `3400` | Auto-exposure target |
+| `AUTO_EXP_DEADZONE_ADC` | `100` | Auto-exposure deadzone |
+| `AUTO_EXP_MIN_RATIO` | `0.2` | Minimum adjustment ratio |
+| `AUTO_EXP_MAX_RATIO` | `5.0` | Maximum adjustment ratio |
+| `AUTO_EXP_EMERGENCY_DROP_RATIO` | `0.2` | Saturation emergency reduction |
+| `DEFAULT_DARK_BIAS_ADC` | `60.5` | Constant dark offset |
+| `DEFAULT_DARK_RATE_ADC_PER_SEC` | `45.0` | Thermal dark accumulation |
+| `ADC_SATURATION_THRESHOLD` | `3800` | Saturation threshold |
+| `PEAK_MIN_DISTANCE_PIXELS` | `100` | Peak separation |
+| `MIN_PEAK_HEIGHT_ADC` | `15.0` | Minimum peak intensity |
+| `HEATMAP_HISTORY_SIZE` | `100` | Waterfall buffer size |
+| `WAVELENGTH_COEFFS` | see above | Calibration polynomial |
 
 ---
 
- 
+# File Output
+
+All exports are timestamped and saved in the working directory.
+
+---
+
+| Filename Pattern | Content |
+|---|---|
+| `spectrum_data_YYYYMMDD_HHMMSS.csv` | Current spectrum |
+| `heatmap_data_YYYYMMDD_HHMMSS.csv` | Full waterfall history |
+| `spectrum_plot_YYYYMMDD_HHMMSS.png` | Scope screenshot |
+| `heatmap_plot_YYYYMMDD_HHMMSS.png` | Heatmap screenshot |
+| `reference_spectra.csv` | Reference spectrum library |
+
+---
+
+# Technical Summary
+
+This project demonstrates that the PASCO PS-2600A can be fully operated through native WinUSB access without relying on proprietary vendor software.
+
+The implementation includes:
+
+- complete reverse-engineered USB protocol support
+- direct WinUSB communication
+- real-time spectroscopy
+- scientific dark-current correction
+- dynamic visualization
+- spectral analysis tooling
+- CSV/PNG export infrastructure
+- hardware-level synchronization handling
+
+All functionality operates entirely in user-space Python with no proprietary SDK dependencies.
+
+---
+
+# License
+
+This project is intended for educational, scientific, and reverse-engineering research purposes.
+
+The PASCO PS-2600A hardware and associated trademarks belong to PASCO Scientific.
+
+This repository is an independent community reverse-engineering effort and is not affiliated with PASCO Scientific.
+
+````
