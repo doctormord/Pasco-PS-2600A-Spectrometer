@@ -527,9 +527,17 @@ Main payload size: 7360 bytes.
 
 | Bytes | Purpose |
 |---|---|
-| `0–3` | Padding (always zero) |
-| `4–63` | 30 optical black pixels (uint16 LE) |
+| `0–31` | Dummy Outputs |
+| `32–57` | 13 Optical Black Pixels (uint16 LE) |
+| `58–63` | 3 Pixels margin |
 | `64–7359` | Spectral ADC payload (3648 × uint16 LE) |
+
+Bytes 0–63 contain non-imaging CCD outputs:
+- leading dummy outputs
+- optical black (light shielded) pixels
+- transition elements
+
+Bytes 64–7359 contain the 3648 active spectral pixels. The 28 Bytes drain transfer are the last 14 dummy outputs.
 
 ## Optical Black Header Pixels
 
