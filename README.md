@@ -10,12 +10,12 @@ The software was built entirely from scratch through empirical USB traffic analy
 
 # Screenshots
 
-![GUI Plot Light Mode](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_LightMode.png "GUI Plot Light Mode")
-![GUI Plot Dark Mode](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_LightMode.png "GUI Plot Dark Mode")
+![GUI Plot Light Mode](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/next/images/GUI_LightMode.png "GUI Plot Light Mode")
+![GUI Plot Dark Mode](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/next/images/GUI_LightMode.png "GUI Plot Dark Mode")
 
-![GUI Waterfall](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/GUI_Waterfall.png "GUI Waterfall")
+![GUI Waterfall](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/next/images/GUI_Waterfall.png "GUI Waterfall")
 
-![Zadig Driver Setup](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/blob/main/images/Zadig_USB.png "Zadig Driver Setup")
+![Zadig Driver Setup](https://github.com/doctormord/Pasco-PS-2600A-Spectrometer/next/main/images/Zadig_USB.png "Zadig Driver Setup")
 
 ---
 
