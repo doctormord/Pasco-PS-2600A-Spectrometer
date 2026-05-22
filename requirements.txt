@@ -1,0 +1,9 @@
+# Runtime dependencies for the PASCO PS-2600A Spectrum Analyzer GUI.
+PyQt6>=6.5
+pyqtgraph>=0.13
+numpy>=1.24
+scipy>=1.10
+
+# Optional — only used to render the CIE 1931 chromaticity fill.
+# The CIE tab works without it (falls back to a pure-numpy polygon test).
+matplotlib>=3.7
