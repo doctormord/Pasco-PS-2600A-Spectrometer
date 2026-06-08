@@ -1,11 +1,15 @@
-# PASCO PS-2600A spectrometer — udev rule for direct user-space USB access.
-#
-# Install:
-#     sudo cp udev/99-pasco-ps2600a.rules /etc/udev/rules.d/
-#     sudo udevadm control --reload-rules
-#     sudo udevadm trigger
-#
-# After this, the device is readable/writable by anyone in the "plugdev"
-# group, no sudo needed. On Raspberry Pi OS / Debian / Ubuntu the default
-# user is already in plugdev.
-SUBSYSTEM=="usb", ATTR{idVendor}=="0945", ATTR{idProduct}=="0002", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+# /etc/udev/rules.d/99-pasco-ps2600a.rules
+# Non-root USB access for the Multi-Device Spectrum Analyzer.
+# Install:  sudo cp udev/99-pasco-ps2600a.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload-rules && sudo udevadm trigger
+#           (then unplug + replug the device)
+
+# PASCO PS-2600A
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0945", ATTRS{idProduct}=="0002", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Ocean Optics / Ocean Insight HDX-UV-VIS
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2457", ATTRS{idProduct}=="2003", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# ASEQ Instruments / Lasertack LR-2T (HID)
+SUBSYSTEM=="usb",    ATTRS{idVendor}=="e220", ATTRS{idProduct}=="0100", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="e220", ATTRS{idProduct}=="0100", MODE="0660", GROUP="plugdev", TAG+="uaccess"
