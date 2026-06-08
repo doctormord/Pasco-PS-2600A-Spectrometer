@@ -1,0 +1,11 @@
+# PASCO PS-2600A spectrometer — udev rule for direct user-space USB access.
+#
+# Install:
+#     sudo cp udev/99-pasco-ps2600a.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload-rules
+#     sudo udevadm trigger
+#
+# After this, the device is readable/writable by anyone in the "plugdev"
+# group, no sudo needed. On Raspberry Pi OS / Debian / Ubuntu the default
+# user is already in plugdev.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0945", ATTR{idProduct}=="0002", MODE="0660", GROUP="plugdev", TAG+="uaccess"
