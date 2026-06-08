@@ -20,7 +20,7 @@ automatically updated as the user tweaks settings.
 import sys
 from PyQt6.QtWidgets import QApplication
 
-from spectrometer_core import free_usb_resources
+from _device_pasco import free_usb_resources
 from gui_dashboard import DashboardWindow
 
 

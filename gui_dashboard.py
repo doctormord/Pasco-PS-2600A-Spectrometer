@@ -30,14 +30,15 @@ from datetime import datetime
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG
+from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtGui import (
     QTransform, QColor, QFont, QPen, QBrush, QGuiApplication,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox,
-    QTabWidget, QFrame, QScrollArea, QToolTip,
+    QTabWidget, QFrame, QScrollArea, QToolTip, QFileDialog,
 )
 import pyqtgraph as pg
 
@@ -50,27 +51,88 @@ from gui_theme import (
     make_hsep, make_vsep,
 )
 from gui_cie_tab import CIETab
+from gui_filter_tab import FilterTab
 from app_config import Config
 
-import spectrometer_core as core
-from spectrometer_core import (
-    wavelength_array, PIXEL_COUNT, START_INTEGRATION_TIME_US,
-    MIN_INTEGRATION_TIME_US, MAX_INTEGRATION_TIME_US,
-    Y_AXIS_BOTTOM_MARGIN_ADC, ADC_SATURATION_THRESHOLD,
-    HEATMAP_HISTORY_SIZE, REFERENCE_LIBRARY_FILENAME,
-    DEFAULT_DARK_BIAS_ADC, DEFAULT_DARK_RATE_ADC_PER_SEC,
-    OB_CORRECTION_SLOPE, OB_CORRECTION_OFFSET, OB_TEMP_REFERENCE_ADC,
-    DARK_MODE_OPTICAL_BLACK, DARK_MODE_PARAMETRIC,
-    SpectrometerHardwareThread, scan_usb_devices,
-    connect_usb_device, free_usb_resources, ensure_reference_library_exists,
-    add_help,
+from _device_pasco import (
+    PASCO_WAVELENGTH_ARRAY       as _default_wavelength_array,
+    PASCO_PIXEL_COUNT            as _default_pixel_count,
+    PASCO_SPECTRAL_RESPONSE_GAIN as _default_response_gain,
 )
+from calibration_utils import build_response_gain as _build_response_gain
+# PASCO-specific constants — imported from the driver, not from core
+from _device_pasco import (
+    PASCO_WAVELENGTH_ARRAY       as wavelength_array,
+    PASCO_PIXEL_COUNT            as PIXEL_COUNT,
+    PASCO_START_INTEGRATION_US   as START_INTEGRATION_TIME_US,
+    PASCO_MIN_INTEGRATION_US     as MIN_INTEGRATION_TIME_US,
+    PASCO_MAX_INTEGRATION_US     as MAX_INTEGRATION_TIME_US,
+    PASCO_ADC_SATURATION         as ADC_SATURATION_THRESHOLD,
+    PASCO_SPECTRAL_RESPONSE_GAIN as SPECTRAL_RESPONSE_GAIN,
+    PASCO_OB_CORRECTION_SLOPE    as OB_CORRECTION_SLOPE,
+    PASCO_OB_CORRECTION_OFFSET   as OB_CORRECTION_OFFSET,
+    PASCO_OB_TEMP_REFERENCE_ADC  as OB_TEMP_REFERENCE_ADC,
+    PASCO_DARK_BIAS_ADC          as DEFAULT_DARK_BIAS_ADC,
+    PASCO_DARK_RATE_ADC_PER_SEC  as DEFAULT_DARK_RATE_ADC_PER_SEC,
+)
+from spectrometer_core import (
+    Y_AXIS_BOTTOM_MARGIN_ADC,
+    HEATMAP_HISTORY_SIZE, REFERENCE_LIBRARY_FILENAME,
+    DARK_MODE_OPTICAL_BLACK, DARK_MODE_PARAMETRIC,
+    ensure_reference_library_exists, add_help,
+)
+import device_manager as dm
+from fusion import SpectrumFusion, DEFAULTS as FUSION_DEFAULTS
+import processing
 
 
 # Shorthand
 def T():
     """Return the *current* palette (alias rebinds during theme switch)."""
     return theme.Theme
+
+
+# Number of fading "afterglow" trail curves for the scope persistence overlay.
+SCOPE_PERSIST_TRAILS = 6
+
+
+def _load_two_column_csv(path: str):
+    """Tolerant 2-column (wavelength, intensity) CSV loader for the scope CSV
+    background overlay. Accepts ';' ',' tab or whitespace delimiters, optional
+    header/comment (#) lines, and 3-column Pixel;λ;ADC dumps (uses the last two
+    columns). Mirrors the web client's parseTwoColCsv. Returns (xs, ys) as
+    ascending-sorted float ndarrays."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = [ln.strip() for ln in fh
+                 if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        raise ValueError("empty file")
+    sample = lines[0]
+    if ";" in sample:
+        delim = ";"
+    elif "\t" in sample:
+        delim = "\t"
+    elif "," in sample:
+        delim = ","
+    else:
+        delim = None                       # split on any run of whitespace
+    start = 1 if any(ch.isalpha() for ch in sample) else 0
+    xs, ys = [], []
+    for ln in lines[start:]:
+        parts = ln.split() if delim is None else ln.split(delim)
+        if len(parts) < 2:
+            continue
+        try:
+            w = float(parts[-2]); v = float(parts[-1])
+        except ValueError:
+            continue
+        xs.append(w); ys.append(v)
+    if not xs:
+        raise ValueError("no numeric rows found")
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    order = np.argsort(x)                   # np.interp needs ascending x
+    return x[order], y[order]
 
 
 class DashboardWindow(QMainWindow):
@@ -80,15 +142,41 @@ class DashboardWindow(QMainWindow):
         self.resize(1480, 900)
 
         # ── runtime state ──
+        # --- DYNAMIC ARRAYS ---
+        self.active_wavelengths   = _default_wavelength_array
+        self.active_pixel_count   = _default_pixel_count
+        self.active_response_gain = _default_response_gain
+        
         self.spectrum_history = deque(maxlen=Config.get("frames_to_average", 1))
-        self.current_averaged_pixels = np.zeros(PIXEL_COUNT)
+        self.current_averaged_pixels = np.zeros(self.active_pixel_count)
         self.hardware_thread = None
+
+        # Spectrum fusion stage (long + short → adaptive temporal stream).
+        # Sits between the driver's frame callback and process_new_spectrum.
+        self._fusion = SpectrumFusion(emit_callback=self._fused_emit)
+        self._apply_fusion_config()
 
         self.is_dark_correction_enabled = Config.get("dark_correction", False)
         self.is_despeckle_enabled       = Config.get("hot_pixel_filter", False)
+        self.is_spatial_smoothing_enabled = Config.get("spatial_smoothing", False)
+        self.is_response_comp_enabled   = Config.get("spectral_response_compensation", False)
         self.is_auto_y_axis_enabled     = Config.get("auto_y", True)
         self.is_peak_finding_enabled    = Config.get("show_peaks", False)
         self.is_measure_mode_enabled    = Config.get("measure_mode", False)
+
+        # Scope overlay cluster — ephemeral display state (not persisted), mirrors
+        # the web client: CSV background, freeze snapshot, difference, peak-hold
+        # envelope, persistence/afterglow. All overlays draw on the scope plot and
+        # share its ADC y-axis.
+        self.persist_n         = SCOPE_PERSIST_TRAILS
+        self.overlay_diff      = False
+        self.overlay_peak_hold = False
+        self.overlay_persist   = False
+        self.freeze_xy         = None    # (wavelengths, intensities) snapshot
+        self.csvbg_xy          = None    # (wavelengths, intensities) from a file
+        self.peak_hold_env     = None    # per-pixel running max (np.ndarray)
+        self.persist_ring      = []      # recent live frames, newest first
+        self.prev_live         = None    # previous displayed frame
 
         self.dark_correction_mode = Config.get("dark_mode", DARK_MODE_OPTICAL_BLACK)
         self.latest_ob_mean = 0.0
@@ -99,12 +187,15 @@ class DashboardWindow(QMainWindow):
         self._last_frame_time = None
 
         # CIE tab needs an interpolated 380-780nm slice
-        self._cie_mask = (wavelength_array >= 380) & (wavelength_array <= 780)
+        self._cie_mask = (self.active_wavelengths >= 380) & (self.active_wavelengths <= 780)
 
         # Heatmap setup
         self.heatmap_linear_waves = np.linspace(
-            wavelength_array[0], wavelength_array[-1], PIXEL_COUNT)
-        self.heatmap_buffer = np.zeros((PIXEL_COUNT, HEATMAP_HISTORY_SIZE))
+            self.active_wavelengths[0], self.active_wavelengths[-1], self.active_pixel_count)
+        self.heatmap_buffer = np.zeros((self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+
+        # Initialise device registry (discovers available backends)
+        dm.init_registry()
 
         # Reference library
         self.reference_library: dict[str, np.ndarray] = {}
@@ -142,7 +233,7 @@ class DashboardWindow(QMainWindow):
                         continue
             for name in headers[1:]:
                 self.reference_library[name] = np.interp(
-                    wavelength_array, csv_waves, csv_columns[name],
+                    self.active_wavelengths, csv_waves, csv_columns[name],
                     left=0.0, right=0.0)
         except Exception as e:
             print(f"[ref-lib] error: {e}")
@@ -242,6 +333,16 @@ class DashboardWindow(QMainWindow):
         self.conn_dot = ConnDot()
         h.addWidget(self.conn_dot)
 
+        # Backend (device type) selector — populated from device_manager.REGISTRY
+        self.combo_backend = QComboBox()
+        self.combo_backend.setObjectName("deviceSelect")
+        self.combo_backend.setMinimumWidth(180)
+        self.combo_backend.setMinimumHeight(32)
+        for name in dm.list_backends():
+            self.combo_backend.addItem(name)
+        self.combo_backend.currentTextChanged.connect(self._on_backend_changed)
+        h.addWidget(self.combo_backend)
+
         self.combo_devices = QComboBox()
         self.combo_devices.setObjectName("deviceSelect")
         self.combo_devices.setMinimumWidth(280)
@@ -330,7 +431,10 @@ class DashboardWindow(QMainWindow):
         self._style_plot(self.plot_canvas, "Wavelength", "nm", "Intensity", "ADC")
         self.plot_canvas.setXRange(
             Config.get("x_min_nm", 380), Config.get("x_max_nm", 1050), padding=0)
-        self.plot_canvas.setYRange(Y_AXIS_BOTTOM_MARGIN_ADC, 100, padding=0)
+        self.plot_canvas.setYRange(
+            Y_AXIS_BOTTOM_MARGIN_ADC,
+            Config.get("y_max_adc", 4000),
+            padding=0)
 
         # Gradient fill UNDER the curve
         self.spectrum_fill = WavelengthFillItem()
@@ -345,6 +449,34 @@ class DashboardWindow(QMainWindow):
         self.reference_curve = self.plot_canvas.plot(
             pen=pg.mkPen(QColor(T().WARN), width=1.5, style=Qt.PenStyle.DashLine))
         self.reference_curve.setVisible(False)
+
+        # ── Overlay cluster curves (CSV bg / freeze / diff / peak-hold /
+        # persistence). All start hidden; driven per frame in _redraw_overlays().
+        # Persistence trails sit BEHIND the live curve (negative Z), the rest on
+        # top like the reference overlay.
+        self.persist_curves = []
+        _ac = QColor(T().ACCENT)
+        for k in range(self.persist_n):
+            a = int(150 * (1 - k / self.persist_n))      # fading alpha 150 → ~25
+            c = pg.PlotCurveItem(
+                pen=pg.mkPen(QColor(_ac.red(), _ac.green(), _ac.blue(), a), width=1))
+            c.setZValue(-10 - k)
+            c.setVisible(False)
+            self.plot_canvas.addItem(c)
+            self.persist_curves.append(c)
+
+        self.csvbg_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor("#38bdf8"), width=1.5, style=Qt.PenStyle.DashLine))
+        self.csvbg_curve.setVisible(False)
+        self.freeze_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor("#9aa0a6"), width=1.5))
+        self.freeze_curve.setVisible(False)
+        self.diff_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor("#e879f9"), width=1.5))
+        self.diff_curve.setVisible(False)
+        self.env_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor("#facc15"), width=1))
+        self.env_curve.setVisible(False)
 
         # Peaks
         self.scatter_peaks = pg.ScatterPlotItem(
@@ -383,7 +515,14 @@ class DashboardWindow(QMainWindow):
             self.plot_canvas.scene().sigMouseMoved,
             rateLimit=60, slot=self.handle_mouse_movement)
 
-        self.tabs.addTab(self.plot_canvas, "Scope")
+        # Wrap the scope plot with an overlay toolbar above it.
+        scope_tab = QWidget()
+        scope_v = QVBoxLayout(scope_tab)
+        scope_v.setContentsMargins(0, 0, 0, 0)
+        scope_v.setSpacing(0)
+        scope_v.addWidget(self._build_scope_overlay_bar())
+        scope_v.addWidget(self.plot_canvas, 1)
+        self.tabs.addTab(scope_tab, "Scope")
 
         # ── Heatmap ──
         self.heatmap_canvas = pg.PlotWidget()
@@ -393,13 +532,9 @@ class DashboardWindow(QMainWindow):
         self.heatmap_canvas.setYRange(0, HEATMAP_HISTORY_SIZE, padding=0)
 
         self.image_item = pg.ImageItem()
-        transform = QTransform()
-        transform.translate(self.heatmap_linear_waves[0], 0)
-        x_scale = (self.heatmap_linear_waves[-1] - self.heatmap_linear_waves[0]) / PIXEL_COUNT
-        transform.scale(x_scale, 1.0)
-        self.image_item.setTransform(transform)
         self.image_item.setLookupTable(pg.colormap.get("inferno").getLookupTable())
         self.heatmap_canvas.addItem(self.image_item)
+        self._rebuild_image_transform()
 
         hm_pen = pg.mkPen(QColor(T().ACCENT), style=Qt.PenStyle.DashLine, width=1)
         self.heatmap_cursor_vline = pg.InfiniteLine(angle=90, movable=False, pen=hm_pen)
@@ -414,6 +549,14 @@ class DashboardWindow(QMainWindow):
         # ── Color tab ──
         self.cie_tab = CIETab()
         self.tabs.addTab(self.cie_tab, "Color · CCT / CRI")
+
+        # ── Filter characterization tab ──
+        self.filter_tab = FilterTab()
+        self.tabs.addTab(self.filter_tab, "Filter")
+
+        # Let both export tabs stamp reports with the live acquisition parameters.
+        self.cie_tab.report_meta_provider = self.report_meta
+        self.filter_tab.report_meta_provider = self.report_meta
 
         ol.addWidget(self.tabs, 1)
         return outer
@@ -430,6 +573,67 @@ class DashboardWindow(QMainWindow):
             ax.enableAutoSIPrefix(False)
         plot.setLabel("bottom", xlabel, units=x_units, color=T().FG3, **{"font-size":"10px"})
         plot.setLabel("left",   ylabel, units=y_units, color=T().FG3, **{"font-size":"10px"})
+
+    def _build_scope_overlay_bar(self) -> QWidget:
+        """Toolbar above the scope plot: freeze / diff / peak-hold / persist and
+        a CSV background loader. Mirrors the web client's scope overlay bar."""
+        w = QWidget(); w.setObjectName("scopeOverlayBar")
+        h = QHBoxLayout(w)
+        h.setContentsMargins(10, 6, 10, 6); h.setSpacing(8)
+
+        self.btn_freeze = QPushButton("❄  Freeze")
+        self.btn_freeze.setCheckable(True)
+        self.btn_freeze.clicked.connect(self.toggle_freeze)
+        self.btn_freeze.setToolTip(
+            "Freeze the current trace as a grey snapshot (absolute ADC). "
+            "Click again to clear.")
+
+        self.btn_diff = QPushButton("Δ  Diff")
+        self.btn_diff.setCheckable(True)
+        self.btn_diff.clicked.connect(self.toggle_diff)
+        self.btn_diff.setToolTip(
+            "Show live − frozen snapshot (magenta, signed ADC). "
+            "Freeze a reference first.")
+
+        self.btn_peak_hold = QPushButton("⎍  Peak-hold")
+        self.btn_peak_hold.setCheckable(True)
+        self.btn_peak_hold.clicked.connect(self.toggle_peak_hold)
+        self.btn_peak_hold.setToolTip(
+            "Peak-hold envelope (yellow): per-pixel running maximum, like an "
+            "equalizer peak meter. Toggle to re-arm.")
+
+        self.btn_persist = QPushButton("≈  Persist")
+        self.btn_persist.setCheckable(True)
+        self.btn_persist.clicked.connect(self.toggle_persist)
+        self.btn_persist.setToolTip(
+            "Persistence / afterglow: fading echoes of the last few frames, "
+            "oscilloscope-style.")
+
+        self.btn_csvbg = QPushButton("CSV bg…")
+        self.btn_csvbg.setObjectName("ghostBtn")
+        self.btn_csvbg.clicked.connect(self.load_csv_background)
+        self.btn_csvbg.setToolTip(
+            "Load a 2-column (wavelength, intensity) CSV as a cyan background "
+            "reference, normalised to the current Y max.")
+
+        self.btn_csvbg_clear = QPushButton("✕")
+        self.btn_csvbg_clear.setObjectName("ghostBtn")
+        self.btn_csvbg_clear.setFixedWidth(34)
+        self.btn_csvbg_clear.clicked.connect(self.clear_csv_background)
+        self.btn_csvbg_clear.setToolTip("Clear the CSV background reference")
+        self.btn_csvbg_clear.setVisible(False)
+
+        self.lbl_csvbg = QLabel(""); self.lbl_csvbg.setObjectName("readoutLbl")
+
+        for b in (self.btn_freeze, self.btn_diff, self.btn_peak_hold, self.btn_persist):
+            h.addWidget(b)
+        h.addWidget(make_vsep())
+        h.addWidget(self.btn_csvbg)
+        h.addWidget(self.btn_csvbg_clear)
+        h.addWidget(self.lbl_csvbg)
+        h.addStretch(1)
+        self._sync_overlay_buttons()
+        return w
 
     # ──────────────── SIDEBAR ────────────────
     def _build_sidebar(self) -> QWidget:
@@ -455,9 +659,9 @@ class DashboardWindow(QMainWindow):
         hl = QVBoxLayout(hero)
         hl.setContentsMargins(14, 14, 14, 14); hl.setSpacing(10)
 
-        self.button_pause = QPushButton("■  PAUSE")
-        self.button_pause.setObjectName("goBtn")
-        self.button_pause.setCheckable(True)
+        self.button_pause = QPushButton("▶  START")
+        self.button_pause.setObjectName("goBtnPaused")
+        self.button_pause.setEnabled(False)          # disabled until connected
         self.button_pause.clicked.connect(self.toggle_measurement_pause)
         hl.addWidget(self.button_pause)
 
@@ -477,9 +681,10 @@ class DashboardWindow(QMainWindow):
         self.spinbox_averaging.valueChanged.connect(self.update_averaging_frames)
 
         self.spinbox_exposure = QDoubleSpinBox()
-        self.spinbox_exposure.setRange(MIN_INTEGRATION_TIME_US / 1000.0,
-                                       MAX_INTEGRATION_TIME_US / 1000.0)
-        self.spinbox_exposure.setDecimals(1)
+        # Wide default range; the connected device's real bounds are applied in
+        # connect_device() from backend.min_integration_us / max_integration_us.
+        self.spinbox_exposure.setRange(0.1, 10000.0)
+        self.spinbox_exposure.setDecimals(2)
         self.spinbox_exposure.setValue(Config.get("exposure_ms",
                                                   START_INTEGRATION_TIME_US / 1000.0))
         self.spinbox_exposure.setKeyboardTracking(False)
@@ -487,25 +692,88 @@ class DashboardWindow(QMainWindow):
         self.spinbox_exposure.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.spinbox_exposure.valueChanged.connect(self.apply_manual_exposure)
 
+        self.button_exposure_reset = QPushButton("20 ms")
+        self.button_exposure_reset.setObjectName("goBtn")
+        self.button_exposure_reset.setFixedHeight(28)
+        self.button_exposure_reset.setMinimumWidth(60)
+        self.button_exposure_reset.setMaximumWidth(76)
+        self.button_exposure_reset.setStyleSheet(
+            "min-height: 24px; font-size: 11px; letter-spacing: 0px; "
+            "padding: 0 8px; border-radius: 5px;"
+        )
+        self.button_exposure_reset.setToolTip("Reset integration time to 20 ms")
+        self.button_exposure_reset.clicked.connect(
+            lambda: self.spinbox_exposure.setValue(20.0)
+        )
+
         self.button_auto_exposure = ToggleSwitch(Config.get("auto_exposure", False))
         self.button_auto_exposure.toggled.connect(self.toggle_auto_exposure)
+
+        # Fast Preview (dual-rate) controls
+        self.button_fast_preview = ToggleSwitch(Config.get("fast_preview_enabled", False))
+        self.button_fast_preview.toggled.connect(self.toggle_fast_preview)
+
+        self.spinbox_fp_short_pct = self._spin_int(
+            Config.get("fast_preview_short_pct", 10), 1, 50)
+        self.spinbox_fp_short_pct.setSuffix(" %")
+        self.spinbox_fp_short_pct.valueChanged.connect(
+            lambda v: (Config.set("fast_preview_short_pct", v),
+                       setattr(self.hardware_thread, "fast_preview_short_pct", v)
+                       if self.hardware_thread else None))
+
+        # ── Spectrum fusion controls ────────────────────────────────────
+        self.button_fusion = ToggleSwitch(Config.get("fusion_enabled", False))
+        self.button_fusion.toggled.connect(self._on_fusion_toggle)
+
+        self.spinbox_fusion_smoothing = self._spin_int(
+            int(round(Config.get("fusion_smoothing", 0.85) * 100)), 0, 99)
+        self.spinbox_fusion_smoothing.setSuffix(" %")
+        self.spinbox_fusion_smoothing.valueChanged.connect(
+            lambda v: self._set_fusion("fusion_smoothing", v / 100.0))
+
+        self.spinbox_fusion_sigma = QDoubleSpinBox()
+        self.spinbox_fusion_sigma.setRange(0.5, 20.0)
+        self.spinbox_fusion_sigma.setSingleStep(0.5)
+        self.spinbox_fusion_sigma.setDecimals(1)
+        self.spinbox_fusion_sigma.setValue(Config.get("fusion_change_sigma", 4.0))
+        self.spinbox_fusion_sigma.setFixedWidth(96)
+        self.spinbox_fusion_sigma.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.spinbox_fusion_sigma.setSuffix(" σ")
+        self.spinbox_fusion_sigma.valueChanged.connect(
+            lambda v: self._set_fusion("fusion_change_sigma", float(v)))
+
+        self.spinbox_fusion_rate = self._spin_int(
+            int(Config.get("fusion_emit_hz", 0.0)), 0, 120)
+        self.spinbox_fusion_rate.setSuffix(" Hz")
+        self.spinbox_fusion_rate.setSpecialValueText("Auto")
+        self.spinbox_fusion_rate.valueChanged.connect(
+            lambda v: self._set_fusion("fusion_emit_hz", float(v)))
 
         self.combo_reference = QComboBox()
         self.combo_reference.addItem("None")
         for key in self.reference_library.keys():
             self.combo_reference.addItem(key)
         self.combo_reference.setFixedWidth(170)
+        self.combo_reference.currentTextChanged.connect(self.apply_reference_overlay)
         target = Config.get("reference_library", "None")
         idx = self.combo_reference.findText(target)
         if idx >= 0:
             self.combo_reference.setCurrentIndex(idx)
-        self.combo_reference.currentTextChanged.connect(self.apply_reference_overlay)
 
         v.addLayout(self._section("Acquisition · 04", [
-            ("Exposure",          "ms", self.spinbox_exposure),
-            ("Auto exposure",     None, self.button_auto_exposure),
-            ("Frames to average", None, self.spinbox_averaging),
+            ("Exposure",          "ms", [self.button_exposure_reset, self.spinbox_exposure]),
+            ("Auto exposure",       None, self.button_auto_exposure),
+            ("Frames to average",   None, self.spinbox_averaging),
+            ("Fast preview",        None, self.button_fast_preview),
+            ("Short frame",         "%",  self.spinbox_fp_short_pct),
             ("Reference library", None, self.combo_reference),
+        ]))
+
+        v.addLayout(self._section("Smoothing · 05", [
+            ("Enable smoothing",   None, self.button_fusion),
+            ("Smoothing",       "%",  self.spinbox_fusion_smoothing),
+            ("Peak sensitivity", None, self.spinbox_fusion_sigma),
+            ("Output rate",     None, self.spinbox_fusion_rate),
         ]))
 
         # ─── Display ───
@@ -524,10 +792,22 @@ class DashboardWindow(QMainWindow):
         self.spinbox_y_max.setKeyboardTracking(False)
         self.spinbox_y_max.valueChanged.connect(self.apply_manual_y_axis)
 
+        self.button_y_snap = QPushButton("▲")
+        self.button_y_snap.setObjectName("goBtn")
+        self.button_y_snap.setFixedHeight(28)
+        self.button_y_snap.setFixedWidth(32)
+        self.button_y_snap.setStyleSheet(
+            "min-height: 24px; max-height: 28px; font-size: 11px; "
+            "letter-spacing: 0px; padding: 0 4px; border-radius: 5px;"
+        )
+        self.button_y_snap.setToolTip(
+            "Snap Y max to the current frame peak\n(also disables Auto-scale Y)")
+        self.button_y_snap.clicked.connect(self._snap_y_to_peak)
+
         v.addLayout(self._section("Display · 03", [
             ("Wavelength range", "nm", [self.spinbox_x_min, self.spinbox_x_max]),
             ("Auto-scale Y",     None, self.button_auto_y_axis),
-            ("Y max",            "ADC", self.spinbox_y_max),
+            ("Y max",            "ADC", [self.button_y_snap, self.spinbox_y_max]),
         ]))
 
         # ─── Processing ───
@@ -569,13 +849,27 @@ class DashboardWindow(QMainWindow):
         self.spinbox_despeckle_width.valueChanged.connect(
             lambda v: Config.set("smoothing_width", v))
 
-        v.addLayout(self._section("Processing · 05", [
-            ("Dark correction",  None,  self.button_dark_correct),
-            ("Dark mode",        None,  self.combo_dark_mode),
-            ("Bias offset",      "ADC", self.spinbox_dark_bias),
-            ("Rate",           "ADC/s", self.spinbox_dark_rate),
-            ("Hot-pixel filter", None,  self.button_despeckle),
-            ("Smoothing width",  "px",  self.spinbox_despeckle_width),
+        self.button_spatial_smooth = ToggleSwitch(self.is_spatial_smoothing_enabled)
+        self.button_spatial_smooth.toggled.connect(self.toggle_spatial_smoothing)
+
+        self.spinbox_spatial_width = self._spin_int(
+            Config.get("spatial_smoothing_width", 5), 3, 51, 2, 72)
+        self.spinbox_spatial_width.valueChanged.connect(
+            lambda v: Config.set("spatial_smoothing_width", v))
+
+        self.button_response_comp = ToggleSwitch(self.is_response_comp_enabled)
+        self.button_response_comp.toggled.connect(self.toggle_response_compensation)
+
+        v.addLayout(self._section("Processing · 06", [
+            ("Dark correction",       None,  self.button_dark_correct),
+            ("Dark mode",             None,  self.combo_dark_mode),
+            ("Bias offset",          "ADC",  self.spinbox_dark_bias),
+            ("Rate",               "ADC/s",  self.spinbox_dark_rate),
+            ("Hot-pixel filter",      None,  self.button_despeckle),
+            ("Smoothing width",       "px",  self.spinbox_despeckle_width),
+            ("Spatial smoothing",     None,  self.button_spatial_smooth),
+            ("Spatial width",         "px",  self.spinbox_spatial_width),
+            ("Response compensation", None,  self.button_response_comp),
         ]))
 
         # ─── Peak detection ───
@@ -633,7 +927,7 @@ class DashboardWindow(QMainWindow):
         self.apply_dark_mode()
         return outer
 
-    def _spin_int(self, value, lo, hi, step, width=96) -> QSpinBox:
+    def _spin_int(self, value, lo, hi, step=1, width=96) -> QSpinBox:
         sb = QSpinBox()
         sb.setRange(lo, hi); sb.setSingleStep(step); sb.setValue(value)
         sb.setFixedWidth(width); sb.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -714,12 +1008,60 @@ class DashboardWindow(QMainWindow):
         add_help(self.button_copy_clip, "Copy the current spectrum as TSV to the clipboard.")
         add_help(self.spinbox_averaging, "Number of consecutive frames to average. 1–100.")
         add_help(self.spinbox_exposure, "Integration time in ms (1 – 2500 ms linear regime).")
+        add_help(self.button_exposure_reset,
+                 "Reset integration time to 20 ms.\n"
+                 "Useful after auto-exposure has driven the value to maximum.")
         add_help(self.button_auto_exposure, "Automatically adjust exposure to keep the strongest peak near target.")
+        add_help(self.button_fast_preview,
+                 "Fast Preview: shortens the exposure to the 'Short frame %' of the\n"
+                 "main integration time, reads frames as fast as the device allows,\n"
+                 "and scales the signal back up to normal-exposure levels (dark\n"
+                 "current handled per frame). Faster, noisier live trace.\n"
+                 "Disable when using Auto Exposure.")
+        add_help(self.spinbox_fp_short_pct,
+                 "Short-frame exposure as a percentage of the main integration time.\n"
+                 "E.g. 10% of 1000 ms = 100 ms frames, scaled up ×10.\n"
+                 "Lower = faster refresh but more noise per frame.")
+        add_help(self.button_fusion,
+                 "Smoothing: softens the per-frame noise of the live trace over TIME,\n"
+                 "never across wavelength — peaks keep their exact shape and height.\n"
+                 "On a steady signal you get a clean trace; when the signal changes,\n"
+                 "the display reacts within one frame. Works with or without Fast\n"
+                 "Preview.")
+        add_help(self.spinbox_fusion_smoothing,
+                 "How strongly steady parts of the spectrum are smoothed over time.\n"
+                 "Higher = cleaner, more stable trace (closer to long-exposure noise),\n"
+                 "but a touch more lag on slow changes.\n"
+                 "This only smooths over TIME, never across wavelength — peaks keep\n"
+                 "their exact shape and height. Typical: 80–95%.")
+        add_help(self.spinbox_fusion_sigma,
+                 "Peak sensitivity: how far a pixel must jump (in noise multiples)\n"
+                 "before smoothing backs off and the change is shown immediately.\n"
+                 "Lower = reacts to smaller changes (more responsive, slightly noisier).\n"
+                 "Higher = only large changes break through (smoother, calmer).\n"
+                 "A new or rising peak always appears at full height. Typical: 3–5 σ.")
+        add_help(self.spinbox_fusion_rate,
+                 "How often the trace is pushed to the display.\n"
+                 "Auto (0) derives the rate from the frame cadence, so it scales\n"
+                 "with your settings and the device (a fast spectrometer updates faster).\n"
+                 "Set a fixed value to force a specific refresh rate.")
         add_help(self.combo_reference, "Overlay a reference spectrum (gas lamps, fluorescents, LEDs).")
         add_help(self.button_auto_y_axis, "Auto-scale Y to the tallest visible peak.")
         add_help(self.button_dark_correct, "Enable dark-current subtraction.")
         add_help(self.combo_dark_mode, "Optical Black: per-frame correction.\nParametric: Bias + Rate · t.")
         add_help(self.button_despeckle, "Sliding-median filter to suppress hot pixels.")
+        add_help(self.button_spatial_smooth,
+                 "Moving-average over a window of pixels along the wavelength\n"
+                 "axis. De-noises the trace, including the fixed-pattern structure\n"
+                 "(PRNU / etaloning) that temporal smoothing cannot remove.\n"
+                 "Wider window = smoother trace but broader, lower peaks\n"
+                 "(resolution loss). Keep the width well below the narrowest\n"
+                 "peak's FWHM.")
+        add_help(self.button_response_comp,
+                 "Linearise the TCD1304AP sensor's wavelength-dependent quantum\n"
+                 "efficiency. Boosts UV and NIR pixels so a flat broadband source\n"
+                 "reads flat. Gains are capped (default 15×) to keep edge noise\n"
+                 "from exploding.")
         add_help(self.btn_peaks_toolbar,
                  "Find and label dominant peaks using Savitzky-Golay smoothing\n"
                  "plus prominence-based filtering.")
@@ -741,39 +1083,134 @@ class DashboardWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════
     # CONNECTION
     # ════════════════════════════════════════════════════════════
+    def _on_backend_changed(self, name: str) -> None:
+        """Repopulate the device dropdown when the backend changes."""
+        Config.set("selected_backend", name)
+        self.refresh_device_list()
+
     def refresh_device_list(self) -> None:
+        backend_name = self.combo_backend.currentText()
+        cls = dm.get_backend_class(backend_name)
         self.combo_devices.clear()
-        devices = scan_usb_devices()
+        if cls is None:
+            self.combo_devices.addItem("No backend available")
+            self.button_connect.setEnabled(False)
+            return
+        try:
+            devices = cls.scan()
+        except Exception as e:
+            self.combo_devices.addItem(f"Scan error: {e}")
+            self.button_connect.setEnabled(False)
+            return
         if not devices:
-            self.combo_devices.addItem("No PASCO PS-2600A found")
+            self.combo_devices.addItem(f"No {backend_name} found")
             self.button_connect.setEnabled(False)
         else:
             for d in devices:
-                self.combo_devices.addItem(f"PS-2600A  ({d[-20:]})", d)
+                # Show a short label but store full path as item data
+                label = d if len(d) <= 40 else f"…{d[-37:]}"
+                self.combo_devices.addItem(label, d)
             self.button_connect.setEnabled(True)
 
     def toggle_connection(self) -> None:
-        if self.hardware_thread is not None and self.hardware_thread.isRunning():
+        if self.hardware_thread is not None:
             self.disconnect_device()
         else:
             self.connect_device()
 
     def connect_device(self) -> None:
-        device_path = self.combo_devices.currentData()
-        if not device_path:
+        backend_name = self.combo_backend.currentText()
+        cls = dm.get_backend_class(backend_name)
+        if cls is None:
+            QMessageBox.critical(self, "Error", f"Backend '{backend_name}' not available.")
+            return
+        device_id = self.combo_devices.currentData() or self.combo_devices.currentText()
+        if not device_id or device_id.startswith("No ") or device_id.startswith("Scan"):
             return
         try:
-            connect_usb_device(device_path)
-            self.hardware_thread = SpectrometerHardwareThread()
-            self.hardware_thread.signal_new_spectrum_data.connect(self.process_new_spectrum)
-            self.hardware_thread.signal_auto_exposure_adjusted.connect(self.handle_auto_exposure_update)
-            self.hardware_thread.signal_connection_lost.connect(self.handle_connection_lost)
-            # Push current exposure (from Config) to hardware so it reflects what the user sees
+            backend = cls(
+                on_frame           = self._on_frame_callback,
+                on_auto_exp        = self._on_auto_exp_callback,
+                on_connection_lost = self._on_connection_lost_callback,
+            )
+            # Apply device-specific settings BEFORE connect() so that
+            # the calibration file load inside connect() can use them.
+            if hasattr(backend, "wl_offset_nm"):
+                backend.wl_offset_nm = float(Config.get("lr2t_wl_offset_nm", 0.0))
+            if hasattr(backend, "flip_pixels"):
+                backend.flip_pixels = bool(Config.get("lr2t_flip_pixels", True))
+
+            backend.connect(device_id)
+
+            # Size the exposure control to this device's integration bounds
+            # (per-device; HDX can be pushed below 1 ms via ocean_min_integration_us).
+            lo_ms = getattr(backend, "min_integration_us", 1000) / 1000.0
+            hi_ms = getattr(backend, "max_integration_us", 10_000_000) / 1000.0
+            self.spinbox_exposure.blockSignals(True)
+            self.spinbox_exposure.setRange(lo_ms, hi_ms)
+            self.spinbox_exposure.blockSignals(False)
+
+            # Push current config to the backend
             ms = self.spinbox_exposure.value()
-            self.hardware_thread.current_integration_time_us = int(ms * 1000)
-            self.hardware_thread.apply_hardware_exposure_time(int(ms * 1000))
-            self.hardware_thread.is_auto_exposure_active = self.button_auto_exposure.isChecked()
-            self.hardware_thread.start()
+            us = int(ms * 1000)
+            backend.current_integration_time_us = us
+            backend.set_integration_time_us(us)
+            backend.is_auto_exposure_active    = self.button_auto_exposure.isChecked()
+            backend.fast_preview_enabled       = self.button_fast_preview.isChecked()
+            backend.fast_preview_short_pct     = self.spinbox_fp_short_pct.value()
+
+            # ─────────────────────────────────────────────────────────────
+            # IMPORTANT ORDERING: prepare the wavelength axis, clear stale
+            # averaging history, and arm the fusion stage BEFORE start().
+            # A fast device (HDX at ~6 ms) can deliver its first frame almost
+            # instantly; if start() ran first the frame could reach
+            # process_new_spectrum while active_wavelengths / spectrum_history
+            # still held the previous device's pixel count → np.mean() over
+            # mixed-size arrays crashes. PASCO masked this with its slow first
+            # frame. Everything below is set up first; start() is last.
+            # ─────────────────────────────────────────────────────────────
+
+            # Update active wavelength axis to match the connected device.
+            wl = backend.wavelength_array
+            if len(wl) != self.active_pixel_count or not np.array_equal(wl, self.active_wavelengths):
+                self.active_wavelengths   = wl
+                self.active_pixel_count   = len(wl)
+                resp_table = getattr(backend, "RESPONSE_TABLE", None)
+                if resp_table is not None:
+                    self.active_response_gain = _build_response_gain(
+                        wl, resp_table)
+                else:
+                    self.active_response_gain = np.ones(len(wl))
+                self.current_averaged_pixels = np.zeros(self.active_pixel_count)
+                # Rebuild heatmap buffer for new pixel count
+                self.heatmap_buffer = np.zeros(
+                    (self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+                self.heatmap_linear_waves = np.linspace(
+                    self.active_wavelengths[0], self.active_wavelengths[-1],
+                    self.active_pixel_count)
+                self._cie_mask = ((self.active_wavelengths >= 380) &
+                                  (self.active_wavelengths <= 780))
+                self._rebuild_image_transform()
+                self._load_reference_library()
+
+            self.hardware_thread = backend
+            self.spectrum_history.clear()
+            # Arm the fusion stage fresh for this device (timer running, but it
+            # only emits once frames arrive).
+            self._apply_fusion_config()
+            self._fusion.reset()
+            self._fusion.start()
+
+            # Everything is ready — NOW start acquisition.
+            backend.start()
+            # Re-push exposure — SpectrometerAcquisition.__init__ sends
+            # PASCO_START_INTEGRATION_US to hardware; override it now.
+            backend.set_integration_time_us(us)
+
+
+            self._is_paused = False
+            self._set_pause_button_state(False)
+            self.button_pause.setEnabled(True)
 
             self.button_connect.setText("Disconnect")
             self.button_connect.setObjectName("dangerBtn")
@@ -783,17 +1220,18 @@ class DashboardWindow(QMainWindow):
             self._restyle_live_pill(True)
             self.status_conn.setText("Connected")
             self.combo_devices.setEnabled(False)
+            self.combo_backend.setEnabled(False)
             self.button_scan.setEnabled(False)
             self.control_widget.setEnabled(True)
-            self.spectrum_history.clear()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
 
     def disconnect_device(self) -> None:
+        self._fusion.stop()
         if self.hardware_thread:
-            self.hardware_thread.stop_thread()
+            self._deliberate_disconnect = True
+            self.hardware_thread.disconnect()
             self.hardware_thread = None
-        free_usb_resources()
         self.button_connect.setText("Connect")
         self.button_connect.setObjectName("primaryBtn")
         self.button_connect.style().unpolish(self.button_connect)
@@ -802,8 +1240,12 @@ class DashboardWindow(QMainWindow):
         self._restyle_live_pill(False)
         self.status_conn.setText("Disconnected")
         self.combo_devices.setEnabled(True)
+        self.combo_backend.setEnabled(True)
         self.button_scan.setEnabled(True)
         self.control_widget.setEnabled(False)
+        self._is_paused = False
+        self._set_pause_button_state(False)
+        self.button_pause.setEnabled(False)
         self._clear_peak_labels()
         self.measure_label.setVisible(False)
         self.scatter_peaks.clear()
@@ -811,7 +1253,55 @@ class DashboardWindow(QMainWindow):
         self._set_readout(self.readout_wl,  "—")
         self._set_readout(self.readout_int, "—")
 
+    def _on_frame_callback(self, pixels: np.ndarray, ob_mean: float,
+                           integration_us: int, kind: str = "standard",
+                           ratio: float = 1.0) -> None:
+        """Called from the acquisition thread. Feed the fusion stage; the
+        fusion emitter (or pass-through when disabled) calls _fused_emit,
+        which marshals the result to the GUI thread."""
+        self._fusion.submit(pixels, ob_mean, integration_us, kind, ratio)
+
+    def _fused_emit(self, pixels: np.ndarray, dark: float,
+                    integration_us: int) -> None:
+        """Fusion output sink (may run on the fusion emit-timer thread).
+        Marshal to the GUI thread for rendering."""
+        QMetaObject.invokeMethod(
+            self, "_on_frame_gui",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG("PyQt_PyObject", pixels),
+            Q_ARG(float, dark),
+            Q_ARG(int, integration_us),
+        )
+
+    @pyqtSlot("PyQt_PyObject", float, int)
+    def _on_frame_gui(self, pixels: np.ndarray, ob_mean: float, integration_us: int) -> None:
+        self.process_new_spectrum(pixels, ob_mean, integration_us)
+
+    def _on_auto_exp_callback(self, integration_ms: float) -> None:
+        QMetaObject.invokeMethod(
+            self, "_on_auto_exp_gui",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(float, integration_ms),
+        )
+
+    @pyqtSlot(float)
+    def _on_auto_exp_gui(self, integration_ms: float) -> None:
+        self.handle_auto_exposure_update(integration_ms)
+
+    def _on_connection_lost_callback(self) -> None:
+        QMetaObject.invokeMethod(
+            self, "_on_connection_lost_gui",
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+    @pyqtSlot()
+    def _on_connection_lost_gui(self) -> None:
+        self.handle_connection_lost()
+
     def handle_connection_lost(self) -> None:
+        if getattr(self, "_deliberate_disconnect", False):
+            self._deliberate_disconnect = False
+            return   # user-initiated — no warning
         self.disconnect_device()
         QMessageBox.warning(self, "Connection Lost",
                             "The device was unplugged or stopped responding.")
@@ -819,13 +1309,31 @@ class DashboardWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════
     # MOUSE → live readout
     # ════════════════════════════════════════════════════════════
+    def report_meta(self) -> dict:
+        """Acquisition parameters stamped onto colour/filter reports. Missing
+        values are dropped by the renderer."""
+        from datetime import datetime
+        b = self.hardware_thread
+        us = getattr(b, "current_integration_time_us", None)
+        px = getattr(self, "current_averaged_pixels", None)
+        peak = float(np.max(px)) if (px is not None and len(px)) else None
+        ob = getattr(self, "latest_ob_mean", None)
+        return {
+            "Spectrometer":    self.combo_backend.currentText() or (type(b).__name__ if b else None),
+            "Serial":          getattr(b, "serial", None),
+            "Date/time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Exposure":        (f"{us/1000:.1f} ms" if us else None),
+            "Dark / baseline": (f"{ob:.0f} ADC" if ob is not None else None),
+            "Peak ADC":        (f"{peak:.0f}" if peak is not None else None),
+        }
+
     def handle_mouse_movement(self, ev) -> None:
         pos = ev[0]
         if not self.plot_canvas.sceneBoundingRect().contains(pos):
             return
         view_pt = self.plot_canvas.getPlotItem().vb.mapSceneToView(pos)
-        idx = (np.abs(wavelength_array - view_pt.x())).argmin()
-        sx, sy = wavelength_array[idx], self.current_averaged_pixels[idx]
+        idx = (np.abs(self.active_wavelengths - view_pt.x())).argmin()
+        sx, sy = self.active_wavelengths[idx], self.current_averaged_pixels[idx]
         self.cursor_vline.setPos(sx); self.cursor_hline.setPos(sy)
         self._set_readout(self.readout_pix, str(idx))
         self._set_readout(self.readout_wl,  f"{sx:.1f}")
@@ -838,7 +1346,7 @@ class DashboardWindow(QMainWindow):
         view_pt = self.heatmap_canvas.getPlotItem().vb.mapSceneToView(pos)
         lin_idx = (np.abs(self.heatmap_linear_waves - view_pt.x())).argmin()
         sx = self.heatmap_linear_waves[lin_idx]
-        hw_pixel = (np.abs(wavelength_array - sx)).argmin()
+        hw_pixel = (np.abs(self.active_wavelengths - sx)).argmin()
         frame_index = int(np.clip(round(view_pt.y()), 0, HEATMAP_HISTORY_SIZE - 1))
         intensity = self.heatmap_buffer[lin_idx, frame_index]
         self.heatmap_cursor_vline.setPos(sx)
@@ -850,10 +1358,16 @@ class DashboardWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════
     # CONTROL HANDLERS
     # ════════════════════════════════════════════════════════════
-    def toggle_measurement_pause(self, checked: bool) -> None:
+    def toggle_measurement_pause(self) -> None:
+        """Toggle between running (PAUSE shown) and paused (START shown)."""
+        paused = not getattr(self, "_is_paused", False)
+        self._is_paused = paused
         if self.hardware_thread:
-            self.hardware_thread.is_measurement_paused = checked
-        if checked:
+            self.hardware_thread.is_measurement_paused = paused
+        self._set_pause_button_state(paused)
+
+    def _set_pause_button_state(self, paused: bool) -> None:
+        if paused:
             self.button_pause.setText("▶  START")
             self.button_pause.setObjectName("goBtnPaused")
         else:
@@ -878,7 +1392,7 @@ class DashboardWindow(QMainWindow):
             Config.set("auto_exposure", False)
         us = int(ms * 1000)
         self.hardware_thread.current_integration_time_us = us
-        self.hardware_thread.apply_hardware_exposure_time(us)
+        self.hardware_thread.set_integration_time_us(us)
         self.spectrum_history.clear()
 
     def handle_auto_exposure_update(self, new_ms: float) -> None:
@@ -894,13 +1408,217 @@ class DashboardWindow(QMainWindow):
         Config.set("auto_exposure", bool(checked))
         self.spectrum_history.clear()
 
+    def toggle_fast_preview(self, checked: bool) -> None:
+        Config.set("fast_preview_enabled", bool(checked))
+        if self.hardware_thread:
+            self.hardware_thread.fast_preview_enabled   = checked
+            self.hardware_thread.fast_preview_short_pct = self.spinbox_fp_short_pct.value()
+            # If turning off, restore the main integration time immediately
+            if not checked:
+                us = int(self.spinbox_exposure.value() * 1000)
+                self.hardware_thread.set_integration_time_us(us)
+
+    def _on_fusion_toggle(self, checked: bool) -> None:
+        Config.set("fusion_enabled", bool(checked))
+        self._fusion.configure(fusion_enabled=bool(checked))
+        self._fusion.reset()
+
+    def _set_fusion(self, key: str, value) -> None:
+        """Persist one fusion parameter and push it into the live engine."""
+        Config.set(key, value)
+        self._fusion.configure(**{key: value})
+
     def apply_reference_overlay(self, name: str) -> None:
         Config.set("reference_library", name)
         if name == "None" or name not in self.reference_library:
             self.reference_curve.setVisible(False)
         else:
-            self.reference_curve.setData(wavelength_array, self.reference_library[name])
+            self._update_reference_curve_scale(name)
             self.reference_curve.setVisible(True)
+
+    def _rebuild_image_transform(self) -> None:
+        """Recompute the ImageItem QTransform so the heatmap x-axis maps
+        correctly to wavelength for the currently active pixel grid.
+        Must be called whenever ``heatmap_linear_waves`` changes (device switch,
+        initial build).
+        """
+        transform = QTransform()
+        transform.translate(self.heatmap_linear_waves[0], 0)
+        x_scale = ((self.heatmap_linear_waves[-1] - self.heatmap_linear_waves[0])
+                   / max(len(self.heatmap_linear_waves) - 1, 1))
+        transform.scale(x_scale, 1.0)
+        self.image_item.setTransform(transform)
+        self.heatmap_canvas.setXRange(
+            self.heatmap_linear_waves[0], self.heatmap_linear_waves[-1], padding=0)
+
+    def _update_reference_curve_scale(self, name: str | None = None) -> None:
+        """Scale reference curve to 90% of the current visible Y maximum."""
+        if name is None:
+            name = self.combo_reference.currentText()
+        if name == "None" or name not in self.reference_library:
+            return
+        # Use the current plot Y range as the scaling target so the reference
+        # always fits the displayed spectrum regardless of signal level.
+        _, (y_lo, y_hi) = self.plot_canvas.getViewBox().viewRange()
+        scale = max(y_hi * 0.9, 50.0)
+        scaled = self.reference_library[name] * scale
+        self.reference_curve.setData(self.active_wavelengths, scaled)
+
+    # ──────────────── Scope overlay cluster ────────────────
+    def _sync_overlay_buttons(self) -> None:
+        froze = self.freeze_xy is not None
+        self.btn_freeze.setText("✕  Frozen" if froze else "❄  Freeze")
+        states = ((self.btn_freeze, froze),
+                  (self.btn_diff, self.overlay_diff),
+                  (self.btn_peak_hold, self.overlay_peak_hold),
+                  (self.btn_persist, self.overlay_persist))
+        for b, on in states:
+            b.setChecked(on)
+            b.setObjectName("toolToggleOn" if on else "toolToggleOff")
+            b.style().unpolish(b); b.style().polish(b)
+        self.btn_csvbg_clear.setVisible(self.csvbg_xy is not None)
+
+    def toggle_freeze(self) -> None:
+        if self.freeze_xy is not None:
+            self.freeze_xy = None
+            self.overlay_diff = False           # diff needs a freeze
+        else:
+            live = self.current_averaged_pixels
+            if live is not None and len(live) > 0:
+                self.freeze_xy = (np.array(self.active_wavelengths, dtype=float),
+                                  np.array(live, dtype=float))
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def toggle_diff(self) -> None:
+        if not self.overlay_diff and self.freeze_xy is None:
+            self._sync_overlay_buttons()        # ignore: nothing to diff against
+            return
+        self.overlay_diff = not self.overlay_diff
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def toggle_peak_hold(self) -> None:
+        self.overlay_peak_hold = not self.overlay_peak_hold
+        self.peak_hold_env = None               # (re)arm on any toggle
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def toggle_persist(self) -> None:
+        self.overlay_persist = not self.overlay_persist
+        if not self.overlay_persist:
+            self.persist_ring = []
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def load_csv_background(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load CSV background reference", "",
+            "CSV files (*.csv *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            xs, ys = _load_two_column_csv(path)
+        except Exception as e:
+            QMessageBox.warning(self, "CSV background",
+                                f"Could not parse file:\n{e}")
+            return
+        self.csvbg_xy = (xs, ys)
+        self.lbl_csvbg.setText(f"{os.path.basename(path)} · {len(xs)} pts")
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def clear_csv_background(self) -> None:
+        self.csvbg_xy = None
+        self.lbl_csvbg.setText("")
+        self._sync_overlay_buttons()
+        self._redraw_overlays()
+
+    def _advance_overlays(self, live: np.ndarray) -> None:
+        """Advance stateful overlays on a NEW frame (peak-hold max, persistence
+        ring). Call once per frame, before _redraw_overlays()."""
+        n = len(live)
+        if self.overlay_peak_hold:
+            if self.peak_hold_env is None or len(self.peak_hold_env) != n:
+                self.peak_hold_env = np.array(live, dtype=float)
+            else:
+                np.maximum(self.peak_hold_env, live, out=self.peak_hold_env)
+        if (self.overlay_persist and self.prev_live is not None
+                and len(self.prev_live) == n):
+            self.persist_ring.insert(0, self.prev_live)
+            del self.persist_ring[self.persist_n:]
+        self.prev_live = np.array(live, dtype=float) if n else None
+
+    def _freeze_aligned(self):
+        """The frozen snapshot resampled onto the current wavelength axis (used
+        as-is when the pixel count matches, i.e. same device)."""
+        if self.freeze_xy is None:
+            return None
+        fx, fy = self.freeze_xy
+        wl = self.active_wavelengths
+        if len(fy) == len(wl):
+            return fy
+        return np.interp(wl, fx, fy)            # device changed → resample
+
+    def _redraw_overlays(self) -> None:
+        """Recompute the derived overlay curves from current state. Safe to call
+        while paused — does not advance peak-hold / persistence."""
+        wl = self.active_wavelengths
+        live = self.current_averaged_pixels
+        n = len(wl)
+
+        # CSV background — interp onto axis, normalise, scale to 90% of Y max.
+        if self.csvbg_xy is not None:
+            cx, cy = self.csvbg_xy
+            interp = np.interp(wl, cx, cy, left=np.nan, right=np.nan)
+            finite = np.isfinite(interp)
+            mx = float(np.nanmax(interp)) if np.any(finite) else 0.0
+            if mx > 0:
+                _, (_, y_hi) = self.plot_canvas.getViewBox().viewRange()
+                interp = interp * (max(y_hi * 0.9, 50.0) / mx)
+            self.csvbg_curve.setData(wl, interp, connect="finite")
+            self.csvbg_curve.setVisible(True)
+        else:
+            self.csvbg_curve.setVisible(False)
+
+        # Freeze (grey, absolute ADC).
+        fz = self._freeze_aligned()
+        if fz is not None:
+            self.freeze_curve.setData(wl, fz)
+            self.freeze_curve.setVisible(True)
+        else:
+            self.freeze_curve.setVisible(False)
+
+        # Difference live − freeze (magenta, signed).
+        if (self.overlay_diff and fz is not None
+                and len(fz) == len(live) == n):
+            diff = np.asarray(live, dtype=float) - np.asarray(fz, dtype=float)
+            self.diff_curve.setData(wl, diff)
+            self.diff_curve.setVisible(True)
+            # Extend the Y floor so negative differences stay visible.
+            dmin = float(np.min(diff))
+            if dmin < Y_AXIS_BOTTOM_MARGIN_ADC:
+                _, (_, y_hi) = self.plot_canvas.getViewBox().viewRange()
+                self.plot_canvas.setYRange(dmin * 1.1, y_hi, padding=0)
+        else:
+            self.diff_curve.setVisible(False)
+
+        # Peak-hold envelope (yellow).
+        if (self.overlay_peak_hold and self.peak_hold_env is not None
+                and len(self.peak_hold_env) == n):
+            self.env_curve.setData(wl, self.peak_hold_env)
+            self.env_curve.setVisible(True)
+        else:
+            self.env_curve.setVisible(False)
+
+        # Persistence trails (faded teal echoes of recent frames).
+        for k, c in enumerate(self.persist_curves):
+            if (self.overlay_persist and k < len(self.persist_ring)
+                    and len(self.persist_ring[k]) == n):
+                c.setData(wl, self.persist_ring[k])
+                c.setVisible(True)
+            else:
+                c.setVisible(False)
 
     def toggle_dark_correction(self, checked: bool) -> None:
         self.is_dark_correction_enabled = checked
@@ -923,6 +1641,15 @@ class DashboardWindow(QMainWindow):
     def toggle_despeckle_filter(self, checked: bool) -> None:
         self.is_despeckle_enabled = checked
         Config.set("hot_pixel_filter", bool(checked))
+
+    def toggle_spatial_smoothing(self, checked: bool) -> None:
+        self.is_spatial_smoothing_enabled = checked
+        Config.set("spatial_smoothing", bool(checked))
+
+    def toggle_response_compensation(self, checked: bool) -> None:
+        """Apply the TCD1304AP wavelength-dependent QE inverse gain."""
+        self.is_response_comp_enabled = checked
+        Config.set("spectral_response_compensation", bool(checked))
 
     def _on_toolbar_peaks_toggled(self, checked: bool) -> None:
         self.is_peak_finding_enabled = checked
@@ -949,17 +1676,17 @@ class DashboardWindow(QMainWindow):
         pb = self.measure_line_b.value()
         Config.set("measure_a_nm", float(pa))
         Config.set("measure_b_nm", float(pb))
-        ia = (np.abs(wavelength_array - pa)).argmin()
-        ib = (np.abs(wavelength_array - pb)).argmin()
+        ia = (np.abs(self.active_wavelengths - pa)).argmin()
+        ib = (np.abs(self.active_wavelengths - pb)).argmin()
         va = self.current_averaged_pixels[ia]
         vb = self.current_averaged_pixels[ib]
-        dx = abs(wavelength_array[ib] - wavelength_array[ia])
+        dx = abs(self.active_wavelengths[ib] - self.active_wavelengths[ia])
         dy = abs(vb - va)
         self.measure_label.setHtml(
             f'<div style="background:rgba(0,0,0,0.55);padding:3px 8px;'
             f'border:1px solid {T().WARN};border-radius:4px;'
             f'font-family:{FONT_MONO};font-size:11px;color:{T().WARN};">'
-            f'A {wavelength_array[ia]:.1f}  ·  B {wavelength_array[ib]:.1f}  ·  '
+            f'A {self.active_wavelengths[ia]:.1f}  ·  B {self.active_wavelengths[ib]:.1f}  ·  '
             f'Δλ {dx:.2f} nm  ·  Δy {dy:.0f} ADC'
             f'</div>')
         x_c = (pa + pb) / 2.0
@@ -978,6 +1705,20 @@ class DashboardWindow(QMainWindow):
             "peak_prominence":     float(self.spinbox_prominence.value()),
             "peak_min_distance_px": int(self.spinbox_min_dist.value()),
             "peak_max_count":      int(self.spinbox_peak_count.value()),
+        })
+
+    def _snap_y_to_peak(self) -> None:
+        """Set Y max to the current frame peak and disable auto-scale."""
+        if self.current_averaged_pixels is not None and len(self.current_averaged_pixels):
+            peak = int(np.max(self.current_averaged_pixels))
+            peak = max(peak, 10)   # guard: no signal yet / fully dark
+            self.spinbox_y_max.setValue(peak)
+            # spinbox.valueChanged → apply_manual_y_axis → disables auto-Y + sets range
+
+    def _apply_fusion_config(self) -> None:
+        """Push all fusion_* config values into the fusion engine."""
+        self._fusion.configure(**{
+            k: Config.get(k, FUSION_DEFAULTS[k]) for k in FUSION_DEFAULTS
         })
 
     def apply_manual_y_axis(self, max_y: int) -> None:
@@ -1050,9 +1791,11 @@ class DashboardWindow(QMainWindow):
                     w.writerow(["# Dark correction",
                                 "ON" if self.is_dark_correction_enabled else "OFF"])
                     w.writerow(["# Dark mode", self.dark_correction_mode])
+                    w.writerow(["# Response compensation",
+                                "ON" if self.is_response_comp_enabled else "OFF"])
                     w.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
                     for i, (wl, v) in enumerate(
-                            zip(wavelength_array, self.current_averaged_pixels)):
+                            zip(self.active_wavelengths, self.current_averaged_pixels)):
                         w.writerow([i, round(wl, 2), round(v, 2)])
             QMessageBox.information(self, "Success", f"Saved:\n{filename}")
         except Exception as e:
@@ -1074,18 +1817,52 @@ class DashboardWindow(QMainWindow):
 
     def copy_spectrum_to_clipboard(self) -> None:
         lines = ["Wavelength_nm\tIntensity_ADC"]
-        for wl, v in zip(wavelength_array, self.current_averaged_pixels):
+        for wl, v in zip(self.active_wavelengths, self.current_averaged_pixels):
             lines.append(f"{wl:.2f}\t{v:.2f}")
         QGuiApplication.clipboard().setText("\n".join(lines))
         QToolTip.showText(
             self.button_copy_clip.mapToGlobal(self.button_copy_clip.rect().bottomLeft()),
-            f"Copied {len(wavelength_array)} samples", self.button_copy_clip,
+            f"Copied {len(self.active_wavelengths)} samples", self.button_copy_clip,
             self.button_copy_clip.rect(), 1800)
 
     # ════════════════════════════════════════════════════════════
     # DRAWING / PROCESSING
     # ════════════════════════════════════════════════════════════
     def process_new_spectrum(self, raw_pixels, ob_mean, integration_us) -> None:
+        # --- DYNAMIC RESYNC: Adapt if backend pixel count differs from GUI ---
+        if len(raw_pixels) != len(self.active_wavelengths):
+            if self.hardware_thread:
+                self.active_wavelengths = self.hardware_thread.wavelength_array
+            else:
+                self.active_wavelengths = np.linspace(380, 1050, len(raw_pixels))
+                
+            self.active_pixel_count = len(self.active_wavelengths)
+            self.heatmap_linear_waves = np.linspace(
+                self.active_wavelengths[0], self.active_wavelengths[-1], self.active_pixel_count)
+            self.heatmap_buffer = np.zeros((self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+            self._cie_mask = (self.active_wavelengths >= 380) & (self.active_wavelengths <= 780)
+            self._rebuild_image_transform()
+            
+            resp_table = getattr(self.hardware_thread, "RESPONSE_TABLE", None)
+            if resp_table is not None:
+                self.active_response_gain = _build_response_gain(
+                    self.active_wavelengths, resp_table)
+            else:
+                self.active_response_gain = np.ones(self.active_pixel_count)
+            
+            self._load_reference_library()
+            if self.combo_reference.currentText() != "None":
+                self._update_reference_curve_scale()
+
+            # Pixel count changed: pixel-count-bound overlay state is stale.
+            self.peak_hold_env = None
+            self.persist_ring = []
+            self.prev_live = None
+
+            self.spectrum_history.clear()
+            self.current_averaged_pixels = np.zeros(self.active_pixel_count)
+
+
         # FPS
         now = time.perf_counter()
         if self._last_frame_time is not None:
@@ -1095,11 +1872,17 @@ class DashboardWindow(QMainWindow):
                 if self._fps_history:
                     fps = float(np.mean(self._fps_history))
                     update_stat_cell(self.stat_fps, f"{fps:.1f}")
-                    if self.hardware_thread is not None and self.hardware_thread.isRunning():
+                    if self.hardware_thread is not None:
                         self._restyle_live_pill(True, fps)
         self._last_frame_time = now
 
         self.spectrum_history.append(raw_pixels)
+        # Defensive: if the deque still holds a frame of a different length
+        # (device switch race), drop the stale ones rather than crashing in
+        # np.mean over a ragged stack.
+        if any(len(f) != len(raw_pixels) for f in self.spectrum_history):
+            self.spectrum_history.clear()
+            self.spectrum_history.append(raw_pixels)
         self.current_averaged_pixels = np.mean(self.spectrum_history, axis=0)
         self.latest_ob_mean = ob_mean
         self.latest_integration_us = integration_us
@@ -1125,12 +1908,28 @@ class DashboardWindow(QMainWindow):
             windows = np.lib.stride_tricks.sliding_window_view(padded, ws)
             self.current_averaged_pixels = np.median(windows, axis=1)
 
+        # 2a. Spatial (pixel-window) smoothing — moving average along λ.
+        # Device-agnostic logic lives in processing.py. Off by default; widens
+        # peaks as the window grows (resolution trade-off, see tooltip).
+        if self.is_spatial_smoothing_enabled:
+            self.current_averaged_pixels = processing.apply_spatial_smoothing(
+                self.current_averaged_pixels,
+                self.spinbox_spatial_width.value())
+
+        # 2b. TCD1304AP spectral response compensation
+        # Multiply by per-pixel inverse-QE gain so a flat broadband source
+        # reads flat. Out-of-range pixels and gain > MAX_RESPONSE_GAIN are
+        # capped inside self.active_response_gain already.
+        if self.is_response_comp_enabled:
+            self.current_averaged_pixels = np.clip(
+                self.current_averaged_pixels * self.active_response_gain, 0.0, None)
+
         # 3. Dynamic Y
         current_y_max = self.plot_canvas.getViewBox().viewRange()[1][1]
         ideal_heatmap_max = ADC_SATURATION_THRESHOLD
         if self.is_auto_y_axis_enabled:
             x_lo, x_hi = self.plot_canvas.getViewBox().viewRange()[0]
-            vis = (wavelength_array >= x_lo) & (wavelength_array <= x_hi)
+            vis = (self.active_wavelengths >= x_lo) & (self.active_wavelengths <= x_hi)
             if np.any(vis):
                 mv = float(np.max(self.current_averaged_pixels[vis]))
                 ideal_y = max(mv * 1.1, 50.0)
@@ -1142,12 +1941,18 @@ class DashboardWindow(QMainWindow):
             ideal_heatmap_max = self.spinbox_y_max.value()
 
         # 4. Scope
-        self.spectrum_curve.setData(wavelength_array, self.current_averaged_pixels)
-        self.spectrum_fill.setData(wavelength_array, self.current_averaged_pixels)
+        self.spectrum_curve.setData(self.active_wavelengths, self.current_averaged_pixels)
+        self.spectrum_fill.setData(self.active_wavelengths, self.current_averaged_pixels)
+        # Rescale reference overlay to match current Y range every frame
+        if self.reference_curve.isVisible():
+            self._update_reference_curve_scale()
+        # Overlay cluster (CSV bg / freeze / diff / peak-hold / persistence)
+        self._advance_overlays(self.current_averaged_pixels)
+        self._redraw_overlays()
 
         # 5. Heatmap
         linear_spec = np.interp(self.heatmap_linear_waves,
-                                wavelength_array, self.current_averaged_pixels)
+                                self.active_wavelengths, self.current_averaged_pixels)
         self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
         self.heatmap_buffer[:, 0] = linear_spec
         self.image_item.setImage(self.heatmap_buffer, autoLevels=False,
@@ -1162,7 +1967,8 @@ class DashboardWindow(QMainWindow):
             self._update_peaks()
 
         # 8. CIE tab (throttled inside)
-        self.cie_tab.update_measurement(wavelength_array, self.current_averaged_pixels)
+        self.cie_tab.update_measurement(self.active_wavelengths, self.current_averaged_pixels)
+        self.filter_tab.update_measurement(self.active_wavelengths, self.current_averaged_pixels)
 
     def _update_peaks(self) -> None:
         y = self.current_averaged_pixels
@@ -1193,7 +1999,7 @@ class DashboardWindow(QMainWindow):
         chosen = peak_idx[order_by_prom[:max_n]]
         chosen.sort()
 
-        px = wavelength_array[chosen]
+        px = self.active_wavelengths[chosen]
         py = self.current_averaged_pixels[chosen]
         self.scatter_peaks.setData(px, py)
         self._refresh_peak_labels(px, py)
@@ -1251,10 +2057,11 @@ class DashboardWindow(QMainWindow):
                                             style=Qt.PenStyle.DashLine))
         self.spectrum_fill.update()
         self.cie_tab.apply_theme()
+        self.filter_tab.apply_theme()
 
         # Refresh live pill + sensor chip with new palette colors
         self._restyle_live_pill(
-            self.hardware_thread is not None and self.hardware_thread.isRunning())
+            self.hardware_thread is not None)
         self.update_ob_readout()
         self._sync_peak_measure_buttons()
 
