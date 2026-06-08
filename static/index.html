@@ -1,1 +1,388 @@
-.
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>PS-2600A · Spectrum Analyzer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#21242b" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="dark">
+
+  <!-- ─── Title bar ──────────────────────────────────────── -->
+  <header class="titlebar">
+    <div class="title">
+      <b>Spectrum Analyzer</b>
+      <span class="title-sub"> · PS-2600A · Web</span>
+    </div>
+    <div class="title-actions">
+      <span id="livepill" class="livepill idle">● Idle</span>
+      <div class="seg theme-seg">
+        <button id="theme-dark" class="on">DARK</button>
+        <button id="theme-light">LIGHT</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ─── Toolbar (connection + live readout + quick toggles) ─── -->
+  <div class="toolbar">
+    <div class="conn-block">
+      <span class="conn-dot" id="conn-dot"></span>
+      <select id="backend-select" class="device-select" style="min-width:160px"
+              title="Select spectrometer type"></select>
+      <select id="device-select" class="device-select">
+        <option value="">No device</option>
+      </select>
+      <button id="btn-scan" class="ghost">Scan USB</button>
+      <button id="btn-connect" class="primary">Connect</button>
+      <button id="btn-peaks" class="tool-toggle">● PEAKS</button>
+      <button id="btn-measure" class="tool-toggle">⇿ MEASURE</button>
+    </div>
+    <div class="readout">
+      <div class="cell">
+        <div class="lbl">PIXEL</div>
+        <div class="val" id="ro-pixel">—</div>
+      </div>
+      <div class="cell accent">
+        <div class="lbl">WAVELENGTH</div>
+        <div class="val" id="ro-wave">—<span class="unit"> nm</span></div>
+      </div>
+      <div class="cell">
+        <div class="lbl">INTENSITY</div>
+        <div class="val" id="ro-int">—<span class="unit"> ADC</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Main body ──────────────────────────────────────── -->
+  <main class="main">
+
+    <!-- Plot column (tabs) -->
+    <section class="plot-col">
+      <nav class="tabs" id="tabs">
+        <button class="tab on" data-tab="scope">Scope</button>
+        <button class="tab" data-tab="heatmap">Heatmap</button>
+        <button class="tab" data-tab="color">Color · CRI</button>
+        <button class="tab" data-tab="replay">Replay</button>
+        <button class="tab" data-tab="filter">Filter</button>
+      </nav>
+
+      <!-- Scope -->
+      <div class="tab-pane on" data-pane="scope">
+        <div class="scope-tools">
+          <button id="btn-freeze" class="tool-toggle"
+                  title="Freeze the current trace as a grey snapshot (absolute ADC). Click again to clear.">❄&nbsp; FREEZE</button>
+          <button id="btn-diff" class="tool-toggle"
+                  title="Show live − frozen snapshot (magenta, signed ADC). Freeze a reference first.">Δ&nbsp; DIFF</button>
+          <button id="btn-peakhold" class="tool-toggle"
+                  title="Peak-hold envelope (yellow): per-pixel running maximum, like an equalizer peak meter. Toggle to re-arm.">⎍&nbsp; PEAK-HOLD</button>
+          <button id="btn-persist" class="tool-toggle"
+                  title="Persistence / afterglow: fading echoes of the last few frames, oscilloscope-style.">≈&nbsp; PERSIST</button>
+          <span class="scope-tools-sep"></span>
+          <label for="csvbg-file" class="mini-btn" style="cursor:pointer"
+                 title="Load a 2-column (wavelength, intensity) CSV as a cyan background reference, normalised to the current Y max.">CSV bg…</label>
+          <input id="csvbg-file" type="file" accept=".csv,text/csv" style="display:none">
+          <button id="btn-csvbg-clear" class="mini-btn" style="display:none"
+                  title="Clear the CSV background reference">✕</button>
+          <span id="csvbg-name" class="scope-tools-name"></span>
+        </div>
+        <div id="scope-plot" class="plot scope-plot"></div>
+      </div>
+
+      <!-- Heatmap -->
+      <div class="tab-pane" data-pane="heatmap">
+        <canvas id="heatmap-canvas" class="plot"></canvas>
+        <div class="hm-info" id="hm-info">Heatmap rolls bottom → top · most recent at bottom</div>
+      </div>
+
+      <!-- Color · CRI -->
+      <div class="tab-pane" data-pane="color">
+        <div class="scope-tools">
+          <div class="color-subtabs">
+            <button class="color-subtab on" data-sub="overview">Overview · CRI</button>
+            <button class="color-subtab" data-sub="tm30">TM-30 · CQS</button>
+          </div>
+          <span style="flex:1"></span>
+          <button id="btn-color-pdf" class="mini-btn"
+                  title="Save a colour/CRI report (SPD, CRI radar, TM-30 vector graphic, 99-sample fidelity, full metrics table, white background) as PDF">⤓ PDF</button>
+          <button id="btn-color-png" class="mini-btn"
+                  title="Save the colour/CRI report as PNG">⤓ PNG</button>
+          <button id="btn-color-csv" class="mini-btn"
+                  title="Export all colour metrics as raw data (CSV)">⤓ CSV</button>
+        </div>
+        <div class="color-sub" data-sub="overview">
+        <div class="color-grid">
+          <div class="color-cards" id="color-cards">
+            <div class="card big" title="Correlated Color Temperature — the temperature of the blackbody whose color most closely matches the source (McCamy approximation)."><div class="lbl">CCT</div><div class="val" id="c-cct">—<span class="unit"> K</span></div></div>
+            <div class="card big" title="General Color Rendering Index (average of R1–R8). 100 = perfect rendering; below ~80 colors look noticeably off."><div class="lbl">CRI Ra</div><div class="val" id="c-ra">—</div></div>
+            <div class="card" title="Distance from the Planckian locus on the CIE 1960 uv diagram. + = above (greenish), − = below (pinkish). |Duv| > 0.006 means CCT is less meaningful; beyond ≈ 0.05 (far off-locus) CCT is reported as “—”."><div class="lbl">Duv</div><div class="val" id="c-duv">—</div></div>
+            <div class="card" title="CIE 1931 x chromaticity coordinate."><div class="lbl">x</div><div class="val" id="c-x">—</div></div>
+            <div class="card" title="CIE 1931 y chromaticity coordinate."><div class="lbl">y</div><div class="val" id="c-y">—</div></div>
+            <div class="card" title="CIE 1976 u' chromaticity coordinate (uniform color space)."><div class="lbl">u'</div><div class="val" id="c-u76">—</div></div>
+            <div class="card" title="CIE 1976 v' chromaticity coordinate (uniform color space)."><div class="lbl">v'</div><div class="val" id="c-v76">—</div></div>
+            <div class="card" title="Standard Deviation of Color Matching — MacAdam-ellipse steps from the target white. Lower = tighter color consistency."><div class="lbl">SDCM</div><div class="val" id="c-sdcm">—</div></div>
+            <div class="card" title="Wavelength of maximum spectral intensity."><div class="lbl">Peak λ</div><div class="val" id="c-peak">—<span class="unit"> nm</span></div></div>
+            <div class="card" title="Dominant wavelength — where a line from the white point through the source color meets the spectral locus."><div class="lbl">Dominant λ</div><div class="val" id="c-dom">—<span class="unit"> nm</span></div></div>
+            <div class="card" title="Excitation purity — how saturated the color is (0% = white, 100% = monochromatic)."><div class="lbl">Purity</div><div class="val" id="c-pur">—<span class="unit"> %</span></div></div>
+            <div class="card" title="Full Width at Half Maximum of the main spectral peak — a measure of spectral bandwidth."><div class="lbl">FWHM</div><div class="val" id="c-fwhm">—<span class="unit"> nm</span></div></div>
+            <div class="card" title="Spectral centroid — the intensity-weighted mean wavelength (center of mass of the spectrum)."><div class="lbl">Centroid λ</div><div class="val" id="c-cent">—<span class="unit"> nm</span></div></div>
+            <div class="card" title="Scotopic/Photopic ratio — relates night vision (rod) to day vision (cone) sensitivity. Higher favors low-light efficiency."><div class="lbl">S / P</div><div class="val" id="c-sp">—</div></div>
+            <div class="card r" title="Relative contribution of the red region to the integrated spectrum."><div class="lbl">RED</div><div class="val" id="c-r">—<span class="unit"> %</span></div></div>
+            <div class="card g" title="Relative contribution of the green region to the integrated spectrum."><div class="lbl">GREEN</div><div class="val" id="c-g">—<span class="unit"> %</span></div></div>
+            <div class="card b" title="Relative contribution of the blue region to the integrated spectrum."><div class="lbl">BLUE</div><div class="val" id="c-b">—<span class="unit"> %</span></div></div>
+          </div>
+          <div class="cie-block">
+            <canvas id="cie-canvas" width="380" height="430"></canvas>
+            <canvas id="cri-radar" width="320" height="320"
+                    title="CRI radar — R1…R15 (outer ring = 100, perfect rendering)"></canvas>
+            <div class="cri-bars">
+              <div class="lbl">CRI R1 – R15</div>
+              <div id="cri-bars" class="bars"></div>
+            </div>
+            <button id="btn-cie-csv" class="full" title="Save the current colorimetry results (CCT, Duv, x/y, Ra, R1–R15, …) as a CSV report">Save colorimetry report (CSV)</button>
+          </div>
+        </div>
+        </div><!-- /color-sub overview -->
+
+        <div class="color-sub" data-sub="tm30" hidden>
+          <div class="tm30-wrap">
+            <div class="color-cards" id="tm30-cards"></div>
+            <div class="tm30-graphs">
+              <div class="tm30-graph">
+                <div class="lbl">TM-30 colour vector graphic (16 hue bins)</div>
+                <canvas id="tm30-cvg" width="360" height="360"></canvas>
+              </div>
+              <div class="tm30-graph wide">
+                <div class="lbl">Fidelity of all 99 colour samples (Rf,i)</div>
+                <canvas id="tm30-samples" width="680" height="200"></canvas>
+              </div>
+              <div class="tm30-graph wide">
+                <div class="lbl">Local chroma shift per hue bin — Rcs,hj (%) · &gt;0 more saturated, &lt;0 less</div>
+                <canvas id="tm30-bins" width="680" height="170"></canvas>
+              </div>
+            </div>
+            <div id="tm30-hint" class="tm30-hint">Waiting for a spectrum… (TM-30 needs the optional colour-science package on the server).</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Replay: waterfall player loaded from a CSV file -->
+      <div class="tab-pane" data-pane="replay">
+        <div class="replay-wrap">
+          <div class="replay-toolbar">
+            <label for="replay-file" class="mini-btn" style="cursor:pointer">Load CSV…</label>
+            <input id="replay-file" type="file" accept=".csv,text/csv" style="display:none">
+            <span id="replay-name" class="replay-name">No file loaded</span>
+          </div>
+          <canvas id="replay-canvas" class="plot"></canvas>
+          <div class="replay-transport">
+            <button id="replay-play" class="mini-btn" disabled>▶</button>
+            <input id="replay-scrub" type="range" min="0" max="0" value="0" step="1" disabled>
+            <span id="replay-framelbl" class="replay-framelbl">— / —</span>
+            <label class="replay-speed">Speed
+              <select id="replay-speed">
+                <option value="2">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="0.5">2×</option>
+                <option value="0.25">4×</option>
+                <option value="0.1">10×</option>
+              </select>
+            </label>
+            <label class="replay-loop"><input id="replay-loopchk" type="checkbox" checked> Loop</label>
+          </div>
+          <div class="hm-info" id="replay-info">
+            Load a heatmap CSV (Frame;λ₁;λ₂;… exported from this app) or a single-spectrum CSV.
+            Use ▶ to play and drag the slider to scrub through frames.
+          </div>
+        </div>
+      </div>
+
+      <!-- Filter characterization -->
+      <div class="tab-pane" data-pane="filter">
+        <div class="filter-wrap">
+          <div class="filter-main">
+            <div class="scope-tools">
+              <button id="btn-filter-baseline" class="mini-btn"
+                      title="Capture the current spectrum as the 100% reference (light source with NO filter in the beam).">◎ Set baseline</button>
+              <button id="btn-filter-clear" class="mini-btn" disabled
+                      title="Clear the baseline">Clear</button>
+              <span class="scope-tools-sep"></span>
+              <button id="btn-filter-pdf" class="mini-btn" disabled
+                      title="Save a full report (plot + all metrics, white background) as PDF">⤓ PDF</button>
+              <button id="btn-filter-png" class="mini-btn" disabled
+                      title="Save a full report (plot + all metrics, white background) as PNG">⤓ PNG</button>
+              <button id="btn-filter-csv" class="mini-btn" disabled
+                      title="Save the metrics as a CSV (raw data)">⤓ CSV</button>
+              <span id="filter-state" class="scope-tools-name">No baseline</span>
+            </div>
+            <div class="filter-plot-wrap">
+              <div id="filter-plot" class="plot scope-plot"></div>
+              <div id="filter-hint" class="filter-hint">Set a baseline (light source without filter) to begin.</div>
+            </div>
+          </div>
+          <aside class="filter-side">
+            <div class="filter-side-hdr">FILTER METRICS</div>
+            <div id="filter-metrics" class="filter-metrics"></div>
+            <div id="filter-note" class="filter-note"></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+
+      <!-- GO hero -->
+      <div class="hero">
+        <button id="btn-pause" class="go">■ &nbsp; PAUSE</button>
+        <div class="stats">
+          <div class="cell"><div class="lbl">FRAMES / S</div><div class="val" id="stat-fps">—<span class="unit"> Hz</span></div></div>
+          <div class="cell"><div class="lbl">EXPOSURE</div><div class="val" id="stat-exp">—<span class="unit"> ms</span></div></div>
+          <div class="cell"><div class="lbl" id="stat-dark-lbl">DARK LVL</div><div class="val" id="stat-dark">—<span class="unit"> ADC</span></div></div>
+        </div>
+      </div>
+
+      <!-- Sections -->
+      <details class="section" open>
+        <summary>Acquisition · 04</summary>
+        <div class="row"><label>Exposure <span>ms</span></label>
+          <span class="ctl-group">
+            <button id="btn-exp-reset" class="mini-btn" title="Reset integration time to 20 ms">20 ms</button>
+            <input type="number" id="cfg-exposure_ms" min="1" max="2500" step="50" value="20" />
+          </span></div>
+        <div class="row"><label>Auto exposure</label>
+          <span class="toggle" data-key="auto_exposure"></span></div>
+        <div class="row"><label>Fast preview</label>
+          <span class="toggle" data-key="fast_preview_enabled"
+                title="Shorten the exposure to 'Short frame %' of the main integration time and scale the signal back up. Faster, noisier live trace. Disable with Auto exposure."></span></div>
+        <div class="row"><label>Short frame %</label>
+          <input class="num-input" type="number" data-key="fast_preview_short_pct"
+                 min="1" max="50" step="1"
+                 title="Short-frame exposure as a % of the main integration time. 10% of 1000ms = 100ms, scaled ×10."></div>
+        <div class="row"><label>Frames to average</label>
+          <input type="number" id="cfg-frames_to_average" min="1" max="100" value="1" /></div>
+        <div class="row"><label>Reference library</label>
+          <select id="cfg-reference_library"><option>None</option></select></div>
+      </details>
+
+      <details class="section">
+        <summary>Smoothing · 05</summary>
+        <div class="row"><label>Enable smoothing</label>
+          <span class="toggle" data-key="fusion_enabled"
+                title="Adaptive temporal noise softening: steady pixels are smoothed, changing pixels react instantly. Never mixes across wavelength. Works with or without Fast preview."></span></div>
+        <div class="row"><label>Smoothing <span>%</span></label>
+          <input type="number" data-key="fusion_smoothing" data-scale="0.01"
+                 min="0" max="99" step="1"
+                 title="Temporal smoothing on stable pixels (0–99%). Higher = steadier but slower to react."></div>
+        <div class="row"><label>Peak sensitivity <span>σ</span></label>
+          <input type="number" data-key="fusion_change_sigma"
+                 min="0.5" max="20" step="0.5"
+                 title="Deviation (in σ) at which smoothing backs off. Lower = reacts sooner (more jitter); higher = calmer peaks."></div>
+        <div class="row"><label>Output rate <span>Hz</span></label>
+          <input type="number" data-key="fusion_emit_hz"
+                 min="0" max="120" step="1"
+                 title="Display emit rate. 0 = Auto (derive from the frame cadence)."></div>
+      </details>
+
+      <details class="section" open>
+        <summary>Display · 03</summary>
+        <div class="row"><label>X min <span>nm</span></label>
+          <input type="number" id="cfg-x_min_nm" min="100" max="1500" step="10" value="380" /></div>
+        <div class="row"><label>X max <span>nm</span></label>
+          <input type="number" id="cfg-x_max_nm" min="100" max="1500" step="10" value="1050" /></div>
+        <div class="row"><label>Auto-scale Y</label>
+          <span class="toggle on" data-key="auto_y"></span></div>
+        <div class="row"><label>Y max <span>ADC</span></label>
+          <span class="ctl-group">
+            <button id="btn-y-snap" class="mini-btn" title="Snap Y max to the current frame peak (also disables Auto-scale Y)">▲</button>
+            <input type="number" id="cfg-y_max_adc" min="10" max="65000" step="100" value="4000" />
+          </span></div>
+      </details>
+
+      <details class="section">
+        <summary>Processing · 06</summary>
+        <div class="row"><label>Dark correction</label>
+          <span class="toggle" data-key="dark_correction"></span></div>
+        <div class="row"><label>Dark mode</label>
+          <select id="cfg-dark_mode">
+            <option value="optical_black">Optical Black</option>
+            <option value="parametric">Parametric</option>
+          </select></div>
+        <div class="row"><label>Bias <span>ADC</span></label>
+          <input type="number" id="cfg-dark_bias_adc" step="0.01" value="61.57" /></div>
+        <div class="row"><label>Rate <span>ADC/s</span></label>
+          <input type="number" id="cfg-dark_rate_adc_per_s" step="0.01" value="40.94" /></div>
+        <div class="row"><label>Hot-pixel filter</label>
+          <span class="toggle" data-key="hot_pixel_filter"></span></div>
+        <div class="row"><label>Smoothing <span>px</span></label>
+          <input type="number" id="cfg-smoothing_width" min="3" max="15" step="2" value="5" /></div>
+        <div class="row"><label>Spatial smoothing</label>
+          <span class="toggle" data-key="spatial_smoothing"
+                title="Moving-average over a window of pixels along the wavelength axis. De-noises the trace, including the fixed-pattern structure temporal smoothing can't remove. Wider window = smoother but broader, lower peaks (resolution loss)."></span></div>
+        <div class="row"><label>Spatial width <span>px</span></label>
+          <input type="number" id="cfg-spatial_smoothing_width" min="3" max="51" step="2" value="5" /></div>
+        <div class="row"><label>Response compensation</label>
+          <span class="toggle" data-key="spectral_response_compensation"
+                title="Apply the device spectral-response correction curve (no-op for devices without a response table)."></span></div>
+      </details>
+
+      <details class="section">
+        <summary>Peak detection · 05</summary>
+        <div class="row"><label>SG window <span>px</span></label>
+          <input type="number" id="cfg-peak_savgol_window" min="5" max="101" step="2" value="11" /></div>
+        <div class="row"><label>SG order</label>
+          <input type="number" id="cfg-peak_savgol_order" min="1" max="6" value="3" /></div>
+        <div class="row"><label>Prominence <span>ADC</span></label>
+          <input type="number" id="cfg-peak_prominence" min="0" step="10" value="50" /></div>
+        <div class="row"><label>Min distance <span>px</span></label>
+          <input type="number" id="cfg-peak_min_distance_px" min="1" step="5" value="40" /></div>
+        <div class="row"><label>Max count</label>
+          <input type="number" id="cfg-peak_max_count" min="1" max="12" value="3" /></div>
+      </details>
+
+      <details class="section">
+        <summary>Export</summary>
+        <div class="export-row">
+          <button id="btn-csv">Save CSV</button>
+          <button id="btn-png">Save PNG</button>
+        </div>
+        <button id="btn-clip" class="full">Copy spectrum to clipboard</button>
+      </details>
+    </aside>
+  </main>
+
+  <!-- ─── Status bar ─────────────────────────────────────── -->
+  <footer class="statusbar">
+    <span><span class="k">Integration</span><span class="v" id="sb-integ">—</span></span>
+    <span class="sep"></span>
+    <span><span class="k" id="sb-dark-k">Dark</span><span class="v" id="sb-dark">—</span></span>
+    <span class="sep" id="sb-bias-sep"></span>
+    <span id="sb-bias-wrap"><span class="k">Bias</span><span class="v" id="sb-bias">—</span></span>
+    <span class="sep" id="sb-rate-sep"></span>
+    <span id="sb-rate-wrap"><span class="k">Rate</span><span class="v" id="sb-rate">—</span></span>
+    <span class="sep"></span>
+    <span><span class="k">Backend</span><span class="v" id="sb-backend">—</span></span>
+    <span class="sep"></span>
+    <span><span class="k">WS</span><span class="v" id="sb-ws">—</span></span>
+    <div class="right">
+      <span id="sb-sensor" class="chip neutral">Sensor: —</span>
+    </div>
+  </footer>
+
+  <!-- Floating sidebar toggle for mobile portrait -->
+  <button id="sidebar-toggle" class="sidebar-toggle">CTRL</button>
+
+  <!-- Toast container -->
+  <div id="toast" class="toast"></div>
+
+  <!-- ─── Scripts ────────────────────────────────────────── -->
+  <!-- uPlot from CDN — for fully offline use, download uPlot.iife.min.js
+       and uPlot.min.css from jsdelivr and put them in /static/. -->
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
