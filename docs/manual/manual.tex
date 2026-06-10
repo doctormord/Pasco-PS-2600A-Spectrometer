@@ -142,8 +142,9 @@ a time-lapse heatmap (waterfall); CIE~1931 colorimetry
 colour-vector graphic, 99-sample fidelity) and CQS (Qa/Qf/Qg); optical-filter
 characterization (transmission, type, peak/centre $\lambda$, FWHM, 50\,\% edges,
 10--90\,\% edge steepness, blocking, optical density); PDF/PNG/CSV report export; a
-25-spectrum reference library; dark-current correction; spectral-response
-compensation; auto-exposure; a simple fast-preview mode; optional temporal and
+25-spectrum reference library; dark-current correction; in-app calibration
+(wavelength + response-profile wizards, per-device selection); auto-exposure; a
+simple fast-preview mode; optional temporal and
 spatial smoothing; and (web) a CSV waterfall replay player.
 
 \subsection{How to run}
@@ -183,6 +184,7 @@ the shared report renderers.}
 \file{PS-2600A\_Pro.py}    & Desktop entry point.\\
 \file{spectrometer\_core.py} & App-wide constants, the reference library, context help. \emph{No device code.}\\
 \file{calibration\_utils.py} & Generic polynomial pixel$\to\lambda$ mapping, line fitting, response gain.\\
+\file{calibration\_profiles.py} & Calibration store: line lists, sub-pixel peak find, response-table computation, profile registry + per-device selection.\\
 \file{device\_constants.py}  & Device-agnostic timing and auto-exposure ratios; global integration backstops.\\
 \file{device\_manager.py}    & \code{BaseSpectrometer} abstract base class and the backend registry.\\
 \file{\_device\_pasco.py}    & PASCO: WinUSB ctypes layer + acquisition \code{QThread}.\\
@@ -197,6 +199,7 @@ the shared report renderers.}
 \file{gui\_dashboard.py}    & Main window: scope, heatmap, overlay bar, controls, frame routing.\\
 \file{gui\_cie\_tab.py}     & Colour tab (Overview / CIE 1931 / Color Rendering / TM-30$\cdot$CQS).\\
 \file{gui\_filter\_tab.py}  & Optical-filter tab.\\
+\file{gui\_calibration.py} & Calibration dialog (desktop): wavelength + response wizards.\\
 \file{gui\_theme.py}        & Palettes, stylesheets, custom widgets.\\
 \file{app\_config.py}       & JSON config singleton (\code{Config.get/set}) and \code{DEFAULT\_CONFIG}.\\
 \file{web\_server.py}       & FastAPI + WebSocket server + report/TM-30 endpoints.\\
@@ -329,6 +332,29 @@ applied afterwards with \code{apply\_wl\_offset} (config keys
 \key{lr2t\_wl\_offset\_nm}, \key{ocean\_wl\_offset\_nm}); a positive offset shifts
 the displayed spectrum toward red.
 
+\subsection{The wavelength wizard (desktop)}\label{sec:wl-wizard}
+\emph{Processing\,\textperiodcentered\,06 $\to$ Calibration\ldots\ $\to$
+Wavelength} drives the fit above interactively (\file{gui\_calibration.py},
+device-agnostic helpers in \file{calibration\_profiles.py}). Pick a lamp ---
+curated NIST line lists for Hg, Cd, Ne, Ar, He, Kr, Xe, Na and H are built in ---
+and \emph{Capture \& detect}: the wizard averages
+\key{calibration\_capture\_frames} frames (see \S\ref{sec:cal-capture}), finds
+peaks to sub-pixel precision (parabolic interpolation, $\sim$0.03\,px) and
+auto-pairs them with the known lines on the current axis. Edit the
+pixel\,$\leftrightarrow\lambda$ table if needed, then \emph{Fit \& apply} (live on
+the scope) and \emph{Save to device}, which persists the coefficients to
+\key{pasco\_wl\_poly\_coeffs} / \key{lr2t\_wl\_poly\_coeffs} /
+\key{ocean\_wl\_poly\_coeffs} (\code{null} = factory axis); the driver reloads them
+on the next connect.
+
+\textbf{Residuals are not the whole truth.} The wizard reports the max and RMS
+residual \emph{at the fitted lines}, but a degree-3 polynomial constrained only in
+the middle of the array (e.g.\ by the four visible Cd lines, 467.8--643.8\nm)
+extrapolates badly toward the ends while still showing near-zero residual at the
+lines. The wizard prints an explicit \emph{coverage warning} when the line span
+leaves a large part of the device range unconstrained --- combine lamps
+(Hg + Ne + Ar) for a trustworthy full-range solution.
+
 \subsection{Per-device wavelength sources}
 \begin{itemize}
   \item \textbf{PASCO} --- fixed polynomial above (no on-device coefficients).
@@ -357,14 +383,71 @@ Two models, selected by \key{dark\_mode}:
 Dark correction is applied in \file{processing.py}, not in the drivers, and is only
 subtracted when \key{dark\_correction} is enabled.
 
-\subsection{Spectral-response compensation}
-An optional response table (list of \code{[wavelength\_nm, sensitivity]} pairs,
-sensitivity normalised to 1.0 at peak) is turned into a per-pixel gain by
-\code{calibration\_utils.response\_gain}
+\subsection{Spectral-response correction \& profiles}\label{sec:response}
+A response table (\code{[wavelength\_nm, sensitivity]} pairs, sensitivity
+normalised to 1.0 at peak) becomes a per-pixel gain via
+\code{calibration\_utils.build\_response\_gain}
 ($\text{gain} = \min(1/\text{sensitivity}, \text{max\_gain})$, interpolated onto
-the pixel axis). Multiply raw counts by this gain to flatten the instrument
-response. It is a no-op until a table is provided (\key{ocean\_response\_table});
-enable it with \key{spectral\_response\_compensation}.
+the pixel axis); multiplying raw counts by it flattens the instrument response.
+Unlike wavelength, this is genuinely \emph{per fibre / optical setup} (it folds in
+detector QE, grating efficiency, optics \emph{and} fibre transmission), so it is
+stored as \emph{named, selectable profiles} per device.
+
+\paragraph{The response wizard (desktop).} \emph{Calibration\ldots\ $\to$
+Response} measures a SMOOTH BROADBAND lamp (halogen, white LED --- never a line
+lamp) on the device under test and divides it by a reference of the \emph{same}
+lamp, captured live (e.g.\ on a reference spectrometer) or loaded from a CSV:
+\[
+  S(\lambda) = \frac{\text{measured}_{\mathrm{norm}}(\lambda)}
+                    {\text{reference}_{\mathrm{norm}}(\lambda)} .
+\]
+\emph{Compute} previews $S$; \emph{Save profile} stores it and selects it.
+\code{calibration\_profiles.compute\_response\_table} builds a \emph{full-axis}
+table: measured $S$ where the reference is reliable (above
+\key{ref\_floor\_frac}, default 5\,\% of its peak), and sensitivity $=1.0$
+(\emph{no correction}) everywhere else, so dark gaps and bare edges are never
+amplified. $S$ is peak-normalised by its 98th percentile (noise-spike-proof) and
+lightly smoothed (edge-coverage-normalised). Coverage $<60\,\%$ raises a
+\emph{banded-source warning} --- a line/band lamp (e.g.\ a fluorescent) is the
+wrong reference and yields no meaningful correction away from its bands.
+
+\paragraph{Selecting a correction.} The sidebar \emph{Response correction}
+drop-down (it replaced the old on/off toggle) chooses per device: \emph{None}
+(gain $\equiv 1$, unchanged behaviour), \emph{Device default} (the driver's
+built-in \code{RESPONSE\_TABLE}, offered only where one exists --- currently the
+PASCO datasheet approximation), or a saved profile. Switching applies live. The
+selection persists per device in \key{response\_correction\_active}
+(\code{\{device: selection\}}); the legacy boolean
+\key{spectral\_response\_compensation} is kept in sync automatically, so
+\file{processing.py} needs no awareness of profiles. Profile tables live in a
+separate registry, \key{calibration\_profiles\_file}
+(\file{calibration\_profiles.json}). The web client mirrors the dropdown
+(\code{/api/calibration/profiles}, \code{/select}, \code{/profile/delete});
+profiles are \emph{created} only in the desktop wizard and shared via the registry.
+
+\paragraph{Honest limits.} Outside a table's measured range
+\code{build\_response\_gain} returns gain $1.0$ (no correction), never
+\code{max\_gain} --- a previous \code{min\_floor} fill there multiplied the bare
+noise floor by $\sim$10$\times$ across every uncovered pixel (lifting the whole red
+region and spiking the UV edge for a banded source). A cross-device profile
+matches the device to the \emph{reference's} shape (instrument difference $+$
+fibre folded together), not to an absolute scale, and not to ``pure fibre
+transmission'' --- for that, measure the same device with and without the fibre so
+its response cancels. Never chain calibrations (calibrating against an
+already-corrected reference): errors add in quadrature and clamp artefacts bake
+in. A self-calibration sanity check (reference $=$ measurement) yields gain
+$\approx 1.0$ everywhere.
+
+\subsection{Capture averaging}\label{sec:cal-capture}
+Every wizard capture averages \key{calibration\_capture\_frames} (default 16)
+\emph{genuinely new} frames, counting noise down by $\sqrt{N}$. The capturer
+detects duplicate polls (the live snapshot is sampled faster than the frame rate)
+via array comparison and skips them, so the $\sqrt{N}$ holds regardless of frame
+rate. This matters more for the response correction than for the filter baseline,
+because a response divides two measured spectra (errors add in quadrature,
+amplified by $1/S$ at weak edges). Captures use the dark-corrected,
+response-\emph{un}corrected spectrum --- a calibration must measure the
+instrument, not a previous correction.
 
 \subsection{Absolute radiometric calibration}
 \key{radiometric\_calibration\_factor} is the scale (W/m\textsuperscript{2}/nm per
@@ -590,7 +673,10 @@ $\mathrm{OD}=-\log_{10}T$, which makes the blocking floor readable.}
   \item \textbf{Display} --- X min/max (nm), auto-scale Y or a fixed Y max, snap Y
         to the current peak.
   \item \textbf{Processing} --- dark correction, spatial (pixel-window) smoothing
-        width, spectral-response compensation.
+        width, a \emph{Response correction} dropdown (None / Device default /
+        saved profile) and a \emph{Calibration\ldots} button opening the
+        wavelength + response wizards (\S\ref{sec:wl-wizard},
+        \S\ref{sec:response}).
 \end{itemize}
 
 % =====================================================================
@@ -724,8 +810,15 @@ defaults at load. Edit it while the app is closed, or change values from the UI
 \key{smoothing\_width} & 5 & Despeckle window.\\
 \key{spatial\_smoothing} & false & Pixel-window moving average.\\
 \key{spatial\_smoothing\_width} & 5 & Window (odd, 3--51).\\
-\key{spectral\_response\_compensation} & false & Apply response table.\\
+\key{spectral\_response\_compensation} & false & Master on/off, kept in sync by the response-correction dropdown (do not edit by hand).\\
 \key{radiometric\_calibration\_factor} & 0.0 & W/m\textsuperscript{2}/nm per ADC; 0 = uncalibrated.\\
+\multicolumn{3}{@{}l}{\textit{Calibration (\S\ref{sec:response})}}\\
+\key{response\_correction\_active} & \{\} & Per-device selection \code{\{device: None/Device default/profile\}}.\\
+\key{calibration\_profiles\_file} & \code{calibration\_profiles.json} & Response-profile registry path.\\
+\key{calibration\_capture\_frames} & 16 & New frames averaged per wizard capture.\\
+\key{pasco\_wl\_poly\_coeffs} & null & Persisted wavelength polynomial; null = factory axis.\\
+\key{lr2t\_wl\_poly\_coeffs} & null & Persisted wavelength polynomial; null = device/cal-file axis.\\
+\key{ocean\_wl\_poly\_coeffs} & null & Persisted wavelength polynomial; null = device axis.\\
 \multicolumn{3}{@{}l}{\textit{LR-2T}}\\
 \key{lr2t\_wl\_offset\_nm} & 0.0 & Wavelength fine-tune.\\
 \key{lr2t\_flip\_pixels} & false & Mirror pixel order if needed.\\
@@ -801,8 +894,14 @@ Keep all signal/science work out of the driver --- it belongs in
         this is intended, not a fault. $x,y$ and the wavelengths are still valid.
   \item \textbf{Low FPS at long exposure} --- exposure-limited physics
         (new-data $\approx 1/t_{\text{short}}$), not a bug (\S\ref{sec:perf}).
-  \item \textbf{Response compensation does nothing} --- it is a no-op until a
-        \code{RESPONSE\_TABLE} / \key{ocean\_response\_table} is supplied.
+  \item \textbf{Response correction does nothing} --- the dropdown is on
+        \emph{None}, or \emph{Device default} is hidden because the driver ships no
+        \code{RESPONSE\_TABLE} (LR-2T / HDX). Measure a profile in the response
+        wizard, or select one.
+  \item \textbf{Corrected spectrum has a lifted noise floor / edge spikes} --- the
+        response reference was a line/band source (the wizard warns below 60\,\%
+        coverage). Use a smooth broadband lamp; a banded source carries no
+        information in its gaps.
   \item \textbf{TM-30/CQS sub-tab missing or slow} --- install colour-science; on a
         slow host it is throttled by design. CRI/CIE/other reports are unaffected.
   \item \textbf{Spectrum mirrored (LR-2T)} --- set \key{lr2t\_flip\_pixels} true.
