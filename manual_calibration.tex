@@ -1,0 +1,166 @@
+% ======================================================================
+%  manual_calibration.tex — In-app calibration (wavelength + response)
+% ----------------------------------------------------------------------
+%  Standalone chapter for the user manual. Integrate with
+%      \input{manual_calibration}
+%  near the existing calibration / pixel-to-wavelength material.
+%  Top level is \section; demote to \subsection (or promote to \chapter)
+%  to match the surrounding document. No packages required beyond what a
+%  plain XeLaTeX article already provides (amsmath optional but assumed,
+%  as the manual contains math elsewhere). No figure files referenced.
+% ======================================================================
+
+\section{In-app calibration}
+\label{sec:calibration}
+
+The application distinguishes three calibrations with different physics and
+different lifetimes. Keeping them apart is not pedantry --- it decides where
+each one is stored and when it must be redone.
+
+\begin{enumerate}
+  \item \textbf{Wavelength solution} (pixel $\to\lambda$). A property of the
+        grating and detector geometry. There is exactly \emph{one} per device;
+        swapping a fibre does \emph{not} change it. It drifts only slowly
+        (temperature, mechanics).
+  \item \textbf{Relative spectral response.} The throughput of the
+        \emph{whole system}: detector quantum efficiency $\times$ grating
+        efficiency $\times$ optics $\times$ \emph{fibre transmission}. This is
+        what genuinely changes per fibre or optical setup, so it is stored as
+        \emph{named, selectable profiles} per device.
+  \item \textbf{Absolute radiometric calibration} (counts $\to$
+        W\,m$^{-2}$\,nm$^{-1}$, lux). Not yet implemented; the profile
+        infrastructure is prepared for it.
+\end{enumerate}
+
+Both wizards live in one dialog, opened from \emph{Processing\,\textperiodcentered\,06
+$\to$ Calibration\ldots} in the control sidebar. Every wizard capture averages
+$N$ frames (config key \texttt{calibration\_capture\_frames}, default 16) and
+counts only \emph{genuinely new} frames, so the noise of a capture falls by
+$\sqrt{N}$ regardless of the live frame rate. Captures always use the
+dark-corrected but response-\emph{un}corrected signal --- a calibration must
+measure the instrument, not a previous correction.
+
+% ----------------------------------------------------------------------
+\subsection{Wavelength wizard}
+\label{sec:cal-wavelength}
+
+The wizard fits the degree-3 mapping
+\[
+  \lambda(i) \;=\; C_0 + C_1\,i + C_2\,i^{2} + C_3\,i^{3},
+\]
+with $i$ the pixel index, from the emission lines of a discharge lamp.
+
+\paragraph{Procedure.}
+Point the spectrometer at a line lamp (Cd, Hg, Ne, Ar, He, Kr, Xe, Na or H ---
+curated line lists are built in), choose the lamp, and press
+\emph{Capture \& detect peaks}. Peaks are located with sub-pixel precision
+(parabolic interpolation, typically $\sim$0.03\,px) and automatically paired
+with the nearest known line on the \emph{current} axis. Check the editable
+pixel\,$\leftrightarrow\lambda$ table --- mis-assignments can be corrected or
+removed, additional lines added by hand --- then press \emph{Fit \& apply}.
+The new axis is applied live so the result can be judged on the scope;
+\emph{Save to device} persists the coefficients (config keys
+\texttt{pasco\_/lr2t\_/ocean\_wl\_poly\_coeffs}), which the driver loads on
+every subsequent connect. \texttt{null} restores the factory axis.
+
+\paragraph{Residuals are not the whole truth.}
+The wizard reports the maximum and RMS residual at the fitted lines, but a
+small residual only certifies the fit \emph{inside the wavelength span the
+lines cover}. A degree-3 polynomial constrained only in the middle of the
+detector (for example by the four visible Cd lines, 467.8--643.8\,nm)
+extrapolates freely --- and badly --- towards the array ends while still
+showing essentially zero residual at the lines themselves. The wizard
+therefore prints an explicit \emph{coverage warning} whenever the line span
+leaves a large part of the device range unconstrained. For a trustworthy
+full-range solution, combine lamps in one fit (e.g.\ Hg for the UV/blue, Cd
+for the mid range, Ne or Ar for the red/NIR) before saving.
+
+% ----------------------------------------------------------------------
+\subsection{Response wizard}
+\label{sec:cal-response}
+
+The response wizard builds a \emph{relative} per-wavelength sensitivity
+correction by comparing a measurement of a broadband lamp with a reference
+spectrum of the \emph{same} lamp:
+\[
+  S(\lambda) \;=\;
+  \frac{\text{measured}_{\mathrm{norm}}(\lambda)}
+       {\text{reference}_{\mathrm{norm}}(\lambda)},
+  \qquad
+  \text{gain}(\lambda) \;=\; \min\!\Bigl(\tfrac{1}{S(\lambda)},\,
+  g_{\max}\Bigr),
+\]
+evaluated on the device's wavelength grid (the reference is interpolated onto
+it). $S$ is normalised to 1 at its peak and stored; applying the profile
+multiplies live spectra by the clamped inverse. The clamp $g_{\max}$ is not
+cosmetic: where the lamp delivers little light, $1/S$ diverges and would only
+amplify noise. Points where the reference falls below 5\,\% of its own peak
+are dropped from the table for the same reason.
+
+\paragraph{Requirements.}
+Use a \emph{smooth, broadband} source --- a tungsten--halogen lamp or a white
+LED. Never a line lamp (that is the wavelength wizard's job). Measurement and
+reference must see the \emph{same} lamp under the same conditions. Note that
+tungsten emits almost no UV below $\sim$400\,nm: with such a lamp the response
+there remains noisy or uncalibrated. That is a property of the lamp, not a
+defect of the method.
+
+\paragraph{Where the reference comes from.}
+Either \emph{captured live} (e.g.\ measure the lamp on a reference
+spectrometer, save it with \emph{Save CSV}, reconnect the device under test
+and load it), or \emph{loaded from a CSV} file
+(\texttt{wavelength\_nm,intensity} columns; datasheet or previously saved
+spectra work equally). Both paths are mathematically identical --- a reference
+is simply a spectrum declared to be the target shape.
+
+\paragraph{What the result means --- read this before trusting it.}
+A profile corrects the device \emph{to the shape of the reference}. If the
+reference came from another spectrometer, the profile folds together that
+device's own response \emph{and} the fibre --- correct and useful for making
+two instruments agree, but it is neither ``pure fibre transmission'' nor an
+absolute calibration. To isolate a fibre's transmission $F(\lambda)$, measure
+the \emph{same} device with and without the fibre: the device response cancels
+exactly in the quotient.
+
+\paragraph{Do not chain calibrations.}
+Always compute a profile in a single division against the most fundamental
+real reference available. Calibrating against an already-corrected measurement
+(a ``calibration of a calibration'') roughly doubles the noise variance ---
+relative errors add in quadrature per division --- and bakes the first
+profile's clamped band edges into the second as a systematic error. Since any
+number of profiles can be stored, simply create each one directly
+(device\,+\,fibre vs.\ reference; device bare vs.\ reference; fibre-only as
+with/without) and select whichever matches the current setup.
+
+% ----------------------------------------------------------------------
+\subsection{Selecting a correction; storage}
+\label{sec:cal-storage}
+
+The \emph{Response correction} drop-down in the sidebar (it replaces the
+former on/off switch) selects per device:
+
+\begin{itemize}
+  \item \textbf{None} --- no correction; the gain is identically 1 and the
+        application behaves exactly as without the calibration system;
+  \item \textbf{Device default} --- the driver's built-in sensitivity table,
+        offered only where one exists (currently the PASCO's TCD1304AP
+        datasheet approximation);
+  \item \emph{a saved profile} --- any profile measured with the response
+        wizard for this device.
+\end{itemize}
+
+Switching takes effect live. The selection is persisted per device in the
+main configuration (\texttt{response\_correction\_active}); the profiles
+themselves --- potentially large $[\lambda, S]$ tables --- live in a separate
+registry file, \texttt{calibration\_profiles.json}
+(\texttt{calibration\_profiles\_file}). The web server honours the same
+per-device selection; choosing a profile from the web client is not yet
+implemented.
+
+\paragraph{Relevant configuration keys.}
+\texttt{response\_correction\_active} (per-device selection),
+\texttt{calibration\_profiles\_file},
+\texttt{calibration\_capture\_frames} (capture averaging, default 16),
+\texttt{pasco\_wl\_poly\_coeffs}, \texttt{lr2t\_wl\_poly\_coeffs},
+\texttt{ocean\_wl\_poly\_coeffs} (persisted wavelength polynomials;
+\texttt{null} = factory axis).

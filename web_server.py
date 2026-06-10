@@ -67,6 +67,7 @@ import color_science as cs
 import fusion
 from filter_analysis import analyze_filter, metrics_rows, render_report
 from calibration_utils import build_response_gain
+import calibration_profiles as calprof
 
 
 # ============================================================
@@ -396,7 +397,27 @@ async def _broadcast_frame() -> None:
 # ============================================================
 # Hardware control wrappers
 # ============================================================
-def _apply_device_params(backend: BaseSpectrometer) -> None:
+def _active_device_name() -> str:
+    """Name of the connected device, or the selected backend when idle."""
+    return state.connected_backend_name or Config.get("selected_backend", "")
+
+
+def _rebuild_response_gain(backend=None) -> None:
+    """(Re)build state.response_gain from the active per-device response-
+    correction selection. Shared by connect and the calibration endpoints so the
+    web client applies a profile live, exactly like the desktop dropdown. During
+    connect, state.acquisition is not assigned yet, so the backend is passed in
+    explicitly for its built-in RESPONSE_TABLE."""
+    dev = _active_device_name()
+    src = backend if backend is not None else state.acquisition
+    default_table = getattr(src, "RESPONSE_TABLE", None)
+    selection = calprof.active_selection(dev)
+    state.response_gain, _eff = calprof.build_gain_for_selection(
+        state.wavelength_array, dev, selection,
+        device_default_table=default_table)
+
+
+def _apply_device_params(backend: BaseSpectrometer, backend_name: str | None = None) -> None:
     """Read the connected backend's wavelength axis, pixel count, response
     table and OB constants into shared state so processing, the heatmap,
     color math, payloads, and export all use the *active* device — not a
@@ -408,17 +429,15 @@ def _apply_device_params(backend: BaseSpectrometer) -> None:
     state.adc_saturation   = float(getattr(backend, "ADC_SATURATION",
                                            DEFAULT_ADC_SATURATION))
 
-    # Response gain: build from the device's RESPONSE_TABLE if it has one,
-    # else a no-op (ones). Only PASCO ships a table today; LR-2T / HDX are
-    # None → response compensation is a graceful no-op for them.
-    table = getattr(backend, "RESPONSE_TABLE", None)
-    if table is not None:
-        try:
-            state.response_gain = build_response_gain(wl, np.asarray(table))
-        except Exception:
-            state.response_gain = np.ones_like(wl)
-    else:
-        state.response_gain = np.ones_like(wl)
+    # Response gain follows the per-device calibration selection (shared with
+    # the desktop client): "None" → ones, "Device default" → the driver's
+    # RESPONSE_TABLE, or a saved profile from calibration_profiles.json. The
+    # legacy spectral_response_compensation boolean is kept in sync by the
+    # selection setter; processing.py only reads that flag + this gain.
+    if backend_name is None:
+        backend_name = Config.get("selected_backend", "")
+    state.connected_backend_name = backend_name
+    _rebuild_response_gain(backend)
 
     # OB correction constants only meaningful for OB devices; neutral otherwise.
     if state.supports_ob:
@@ -476,7 +495,7 @@ def _connect(device_path: str, backend_name: str | None = None) -> None:
     # Adopt the device's axis / response / OB params and arm fusion BEFORE
     # start() so the first frame lands on matching buffers (the HDX
     # connect-order race lesson — see BACKLOG "Bugs Fixed").
-    _apply_device_params(backend)
+    _apply_device_params(backend, backend_name)
     state.fusion.configure(**{k: Config.get(k) for k in fusion.DEFAULTS
                               if Config.get(k, None) is not None})
     state.fusion.reset()
@@ -805,6 +824,54 @@ async def api_config_set(payload: dict):
     if fusion_keys:
         state.fusion.configure(**fusion_keys)
     return Config.all()
+
+
+@app.get("/api/calibration/profiles")
+async def api_calibration_profiles():
+    """Response-correction options for the active device: the selectable items
+    (None / Device default if the driver ships a table / saved profiles) and the
+    current selection. Mirrors the desktop dropdown."""
+    dev = _active_device_name()
+    has_default = getattr(state.acquisition, "RESPONSE_TABLE", None) is not None
+    return {
+        "device":    dev,
+        "selection": calprof.active_selection(dev),
+        "items":     calprof.selection_items(dev, has_default),
+        "profiles":  calprof.list_profiles(dev),
+    }
+
+
+@app.post("/api/calibration/select")
+async def api_calibration_select(payload: dict):
+    """Set the active response-correction selection for the current device and
+    rebuild the live gain. selection in {None, Device default, <profile name>}."""
+    dev = _active_device_name()
+    if not dev:
+        raise HTTPException(400, "No device selected.")
+    selection = str(payload.get("selection", calprof.SEL_NONE))
+    valid = calprof.selection_items(
+        dev, getattr(state.acquisition, "RESPONSE_TABLE", None) is not None)
+    if selection not in valid:
+        raise HTTPException(400, f"Unknown selection '{selection}'.")
+    calprof.set_active_selection(dev, selection)
+    _rebuild_response_gain()
+    return {"ok": True, "device": dev, "selection": selection}
+
+
+@app.post("/api/calibration/profile/delete")
+async def api_calibration_profile_delete(payload: dict):
+    """Delete a saved response-correction profile for the current device. If it
+    was active, fall back to None and rebuild the gain."""
+    dev = _active_device_name()
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(400, "Profile name required.")
+    deleted = calprof.delete_profile(dev, name)
+    if calprof.active_selection(dev) == name:
+        calprof.set_active_selection(dev, calprof.SEL_NONE)
+    _rebuild_response_gain()
+    return {"ok": bool(deleted), "device": dev,
+            "selection": calprof.active_selection(dev)}
 
 
 @app.get("/api/heatmap")

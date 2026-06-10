@@ -60,6 +60,7 @@ from _device_pasco import (
     PASCO_SPECTRAL_RESPONSE_GAIN as _default_response_gain,
 )
 from calibration_utils import build_response_gain as _build_response_gain
+import calibration_profiles as calprof
 # PASCO-specific constants — imported from the driver, not from core
 from _device_pasco import (
     PASCO_WAVELENGTH_ARRAY       as wavelength_array,
@@ -149,6 +150,10 @@ class DashboardWindow(QMainWindow):
         
         self.spectrum_history = deque(maxlen=Config.get("frames_to_average", 1))
         self.current_averaged_pixels = np.zeros(self.active_pixel_count)
+        # Dark-corrected spectrum BEFORE response compensation — the signal the
+        # calibration wizards capture (response correction must be off when
+        # *measuring* the instrument response). Updated each frame.
+        self._pixels_pre_response = np.zeros(self.active_pixel_count)
         self.hardware_thread = None
 
         # Spectrum fusion stage (long + short → adaptive temporal stream).
@@ -857,8 +862,14 @@ class DashboardWindow(QMainWindow):
         self.spinbox_spatial_width.valueChanged.connect(
             lambda v: Config.set("spatial_smoothing_width", v))
 
-        self.button_response_comp = ToggleSwitch(self.is_response_comp_enabled)
-        self.button_response_comp.toggled.connect(self.toggle_response_compensation)
+        self.combo_response = QComboBox()
+        self.combo_response.setObjectName("deviceSelect")
+        self.combo_response.setFixedWidth(150)
+        self.combo_response.addItem(calprof.SEL_NONE)
+        self.combo_response.currentTextChanged.connect(self._on_response_selection)
+
+        self.button_calibrate = QPushButton("Calibration…")
+        self.button_calibrate.clicked.connect(self.open_calibration_dialog)
 
         v.addLayout(self._section("Processing · 06", [
             ("Dark correction",       None,  self.button_dark_correct),
@@ -869,7 +880,8 @@ class DashboardWindow(QMainWindow):
             ("Smoothing width",       "px",  self.spinbox_despeckle_width),
             ("Spatial smoothing",     None,  self.button_spatial_smooth),
             ("Spatial width",         "px",  self.spinbox_spatial_width),
-            ("Response compensation", None,  self.button_response_comp),
+            ("Response correction",   None,  self.combo_response),
+            ("Calibrate device",      None,  self.button_calibrate),
         ]))
 
         # ─── Peak detection ───
@@ -1057,11 +1069,16 @@ class DashboardWindow(QMainWindow):
                  "Wider window = smoother trace but broader, lower peaks\n"
                  "(resolution loss). Keep the width well below the narrowest\n"
                  "peak's FWHM.")
-        add_help(self.button_response_comp,
-                 "Linearise the TCD1304AP sensor's wavelength-dependent quantum\n"
-                 "efficiency. Boosts UV and NIR pixels so a flat broadband source\n"
-                 "reads flat. Gains are capped (default 15×) to keep edge noise\n"
-                 "from exploding.")
+        add_help(self.combo_response,
+                 "Per-pixel spectral response correction for this device.\n"
+                 "None = no correction (raw counts). Device default = the\n"
+                 "driver's built-in sensitivity table (if any). Or pick a saved\n"
+                 "profile measured for a specific fibre/optical setup. Gains are\n"
+                 "capped to keep edge noise from exploding.")
+        add_help(self.button_calibrate,
+                 "Open the calibration wizards: fit pixel → wavelength from a\n"
+                 "line lamp (Cd / Hg / Ne / Ar …), or build a response-correction\n"
+                 "profile from a broadband lamp vs a reference.")
         add_help(self.btn_peaks_toolbar,
                  "Find and label dominant peaks using Savitzky-Golay smoothing\n"
                  "plus prominence-based filtering.")
@@ -1087,6 +1104,8 @@ class DashboardWindow(QMainWindow):
         """Repopulate the device dropdown when the backend changes."""
         Config.set("selected_backend", name)
         self.refresh_device_list()
+        if hasattr(self, "combo_response"):
+            self._refresh_response_combo()
 
     def refresh_device_list(self) -> None:
         backend_name = self.combo_backend.currentText()
@@ -1175,13 +1194,9 @@ class DashboardWindow(QMainWindow):
             if len(wl) != self.active_pixel_count or not np.array_equal(wl, self.active_wavelengths):
                 self.active_wavelengths   = wl
                 self.active_pixel_count   = len(wl)
-                resp_table = getattr(backend, "RESPONSE_TABLE", None)
-                if resp_table is not None:
-                    self.active_response_gain = _build_response_gain(
-                        wl, resp_table)
-                else:
-                    self.active_response_gain = np.ones(len(wl))
+                self.active_response_gain = np.ones(len(wl))
                 self.current_averaged_pixels = np.zeros(self.active_pixel_count)
+                self._pixels_pre_response    = np.zeros(self.active_pixel_count)
                 # Rebuild heatmap buffer for new pixel count
                 self.heatmap_buffer = np.zeros(
                     (self.active_pixel_count, HEATMAP_HISTORY_SIZE))
@@ -1194,6 +1209,10 @@ class DashboardWindow(QMainWindow):
                 self._load_reference_library()
 
             self.hardware_thread = backend
+            # Populate the response-correction dropdown for this device and
+            # apply its persisted selection (None / Device default / profile).
+            self._refresh_response_combo()
+            self.apply_response_correction()
             self.spectrum_history.clear()
             # Arm the fusion stage fresh for this device (timer running, but it
             # only emits once frames arrive).
@@ -1646,10 +1665,64 @@ class DashboardWindow(QMainWindow):
         self.is_spatial_smoothing_enabled = checked
         Config.set("spatial_smoothing", bool(checked))
 
-    def toggle_response_compensation(self, checked: bool) -> None:
-        """Apply the TCD1304AP wavelength-dependent QE inverse gain."""
-        self.is_response_comp_enabled = checked
-        Config.set("spectral_response_compensation", bool(checked))
+    def _device_default_response_table(self):
+        """The connected backend's built-in RESPONSE_TABLE, or None."""
+        return getattr(self.hardware_thread, "RESPONSE_TABLE", None)
+
+    def _refresh_response_combo(self) -> None:
+        """Populate the response-correction dropdown for the connected device
+        and restore its persisted selection (without re-triggering apply)."""
+        dev = self.combo_backend.currentText()
+        has_default = self._device_default_response_table() is not None
+        items = calprof.selection_items(dev, has_default)
+        sel = calprof.active_selection(dev)
+        if sel not in items:
+            sel = calprof.SEL_NONE
+        self.combo_response.blockSignals(True)
+        self.combo_response.clear()
+        self.combo_response.addItems(items)
+        self.combo_response.setCurrentText(sel)
+        self.combo_response.blockSignals(False)
+
+    def _on_response_selection(self, selection: str) -> None:
+        """User picked a correction in the dropdown — persist + apply live."""
+        if not selection:
+            return
+        dev = self.combo_backend.currentText()
+        calprof.set_active_selection(dev, selection)
+        self.apply_response_correction()
+
+    def apply_response_correction(self) -> None:
+        """Rebuild active_response_gain from the device's current selection and
+        update the enable flag. Used on connect, on dropdown change, and after a
+        new profile is saved. None -> ones (no-op)."""
+        dev = self.combo_backend.currentText()
+        sel = calprof.active_selection(dev)
+        gain, eff = calprof.build_gain_for_selection(
+            self.active_wavelengths, dev, sel,
+            device_default_table=self._device_default_response_table())
+        self.active_response_gain = gain
+        self.is_response_comp_enabled = (eff != calprof.SEL_NONE)
+
+    def capture_snapshot(self):
+        """Return (wavelengths, intensities) of the current dark-corrected,
+        response-UNcorrected averaged spectrum — what the calibration wizards
+        measure. Copies so the caller can accumulate safely."""
+        return (np.array(self.active_wavelengths, dtype=float),
+                np.array(self._pixels_pre_response, dtype=float))
+
+    def open_calibration_dialog(self) -> None:
+        from gui_calibration import CalibrationDialog
+        dlg = CalibrationDialog(self)
+        dlg.exec()
+        # Re-apply: a new profile may have been saved / selected, or the
+        # wavelength axis recalibrated.
+        self._refresh_response_combo()
+        self.apply_response_correction()
+        if self.hardware_thread is not None:
+            wl = self.hardware_thread.wavelength_array
+            if len(wl) == self.active_pixel_count:
+                self.active_wavelengths = wl
 
     def _on_toolbar_peaks_toggled(self, checked: bool) -> None:
         self.is_peak_finding_enabled = checked
@@ -1842,13 +1915,8 @@ class DashboardWindow(QMainWindow):
             self.heatmap_buffer = np.zeros((self.active_pixel_count, HEATMAP_HISTORY_SIZE))
             self._cie_mask = (self.active_wavelengths >= 380) & (self.active_wavelengths <= 780)
             self._rebuild_image_transform()
-            
-            resp_table = getattr(self.hardware_thread, "RESPONSE_TABLE", None)
-            if resp_table is not None:
-                self.active_response_gain = _build_response_gain(
-                    self.active_wavelengths, resp_table)
-            else:
-                self.active_response_gain = np.ones(self.active_pixel_count)
+
+            self.apply_response_correction()
             
             self._load_reference_library()
             if self.combo_reference.currentText() != "None":
@@ -1916,10 +1984,12 @@ class DashboardWindow(QMainWindow):
                 self.current_averaged_pixels,
                 self.spinbox_spatial_width.value())
 
-        # 2b. TCD1304AP spectral response compensation
-        # Multiply by per-pixel inverse-QE gain so a flat broadband source
-        # reads flat. Out-of-range pixels and gain > MAX_RESPONSE_GAIN are
-        # capped inside self.active_response_gain already.
+        # 2b. Spectral response compensation
+        # Multiply by the per-pixel inverse-sensitivity gain (from the selected
+        # response-correction profile) so the chosen reference shape reads flat.
+        # Capture the dark-corrected, pre-correction spectrum first — that is
+        # what the calibration wizards measure.
+        self._pixels_pre_response = self.current_averaged_pixels.copy()
         if self.is_response_comp_enabled:
             self.current_averaged_pixels = np.clip(
                 self.current_averaged_pixels * self.active_response_gain, 0.0, None)

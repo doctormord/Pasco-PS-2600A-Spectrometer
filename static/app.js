@@ -1514,6 +1514,51 @@ function snapYToPeak() {
   pushCfg({ y_max_adc: peak, auto_y: false });
 }
 
+// ── Response-correction profiles (mirrors the desktop dropdown) ──────────
+// Profiles are created in the desktop calibration wizard and shared via
+// calibration_profiles.json; the web client lists, selects and deletes them.
+async function loadResponseProfiles() {
+  const sel = $('#response-correction-select');
+  if (!sel) return;
+  try {
+    const r = await fetch('/api/calibration/profiles').then(r => r.json());
+    sel.innerHTML = '';
+    (r.items || ['None']).forEach((name) => {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      sel.appendChild(o);
+    });
+    sel.value = r.selection || 'None';
+    const del = $('#btn-response-delete');
+    if (del) del.disabled = !(r.profiles || []).includes(sel.value);
+  } catch (e) { /* server may be idle/disconnected — leave default */ }
+}
+
+async function selectResponseProfile(selection) {
+  try {
+    const r = await fetch('/api/calibration/select', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ selection }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail);
+    loadResponseProfiles();
+  } catch (e) { toast('Response correction: ' + e.message); }
+}
+
+async function deleteResponseProfile() {
+  const sel = $('#response-correction-select');
+  const name = sel && sel.value;
+  if (!name || name === 'None' || name === 'Device default') return;
+  if (!confirm(`Delete response profile “${name}” for this device?`)) return;
+  try {
+    await fetch('/api/calibration/profile/delete', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    loadResponseProfiles();
+  } catch (e) { toast('Delete failed: ' + e.message); }
+}
+
 function pushCfg(partial) {
   Object.assign(State.cfg, partial);
   sendWS({ type: 'set_config', payload: partial });
@@ -1635,6 +1680,7 @@ async function toggleConnection() {
       // Re-fetch the active reference: the server interpolates onto the
       // connected device's wavelength axis, which differs per device.
       applyReference($('#cfg-reference_library')?.value || State.referenceName);
+      loadResponseProfiles();        // populate the response-correction dropdown
     } catch (e) { toast('Connect failed: ' + e.message); }
   }
   updateConnectButton();
@@ -1817,6 +1863,9 @@ async function init() {
     $('#sidebar-toggle').addEventListener('click', () => {
       $('#sidebar').classList.toggle('open');
     });
+    $('#response-correction-select')?.addEventListener('change', (e) =>
+      selectResponseProfile(e.target.value));
+    $('#btn-response-delete')?.addEventListener('click', deleteResponseProfile);
     wireConfigInputs();
   } catch (e) {
     console.error('init: wiring controls failed', e);
@@ -1828,6 +1877,7 @@ async function init() {
     $('#sb-backend').textContent = s.backend;
     State.hardwareConnected = !!s.connected;
     updateConnectButton();
+    if (s.connected) loadResponseProfiles();
   } catch (e) { console.warn('init: /api/status failed', e); }
 
   // WebSocket — populates backend/device dropdowns from the hello frame.

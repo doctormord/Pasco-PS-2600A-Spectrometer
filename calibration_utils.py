@@ -198,13 +198,18 @@ def build_response_gain(
         Per-pixel gain: multiply raw ADC values by this to compensate.
         1.0 = no correction at the peak sensitivity wavelength.
     """
+    # OUTSIDE the table's measured wavelength range there is no calibration
+    # information, so the gain must be 1.0 (no correction) — NOT max_gain.
+    # Filling with min_floor here would set gain = 1/min_floor = max_gain across
+    # every uncovered pixel, amplifying the bare noise floor (e.g. the whole red
+    # region for a banded source whose table only spans the visible bands).
     sensitivity = np.clip(
         np.interp(
             wavelength_array,
             response_table[:, 0],
             response_table[:, 1],
-            left=min_floor,
-            right=min_floor,
+            left=1.0,
+            right=1.0,
         ),
         min_floor,
         1.0,

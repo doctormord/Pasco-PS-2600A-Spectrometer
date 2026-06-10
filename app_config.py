@@ -49,6 +49,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "spatial_smoothing_width": 5,            # odd, 3–51
     "spectral_response_compensation": False,
 
+    # ── Calibration profiles (calibration_profiles.py) ────────────────────
+    # Per-device response-correction selection, set by the GUI dropdown:
+    #   {device_name: "None" | "Device default" | "<profile name>"}.
+    # "None" => no correction (gain = ones, behaviour unchanged). The legacy
+    # boolean spectral_response_compensation above is kept in sync automatically
+    # (None -> off, anything else -> on) so processing.py needs no awareness.
+    "response_correction_active": {},
+    # Saved [lambda, sensitivity] tables live in this separate JSON registry
+    # (large arrays — kept out of the main config).
+    "calibration_profiles_file": "calibration_profiles.json",
+    # Frames averaged into one calibration capture (wavelength peak finding and
+    # response measurement). A response correction divides two measured spectra,
+    # so noise propagates in quadrature and blows up at weak band edges where
+    # gain = 1/S amplifies it — average like the filter baseline (noise ~/sqrt N).
+    # Only genuinely new frames are counted, so this is sqrt(N) regardless of the
+    # live frame rate.
+    "calibration_capture_frames": 16,
+    # Persisted degree-3 wavelength polynomials from the wavelength wizard.
+    # null = use the device's factory/default axis. Pixel -> lambda:
+    #   lambda(i) = C0 + C1*i + C2*i**2 + C3*i**3.
+    "pasco_wl_poly_coeffs": None,
+    "lr2t_wl_poly_coeffs": None,
+    "ocean_wl_poly_coeffs": None,
+
     # Absolute radiometric calibration factor: W/m²/nm per ADC count.
     # 0.0 means uncalibrated — lux and foot-candle displays will show "—".
     # Derive this by measuring a lamp with known spectral irradiance at a

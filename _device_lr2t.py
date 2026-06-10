@@ -297,6 +297,18 @@ class LasertrackLR2T(BaseSpectrometer):
         # Read actual frame size from device
         self._n_pixels_in_frame = self._cmd_get_frame_format()
 
+        # A persisted wavelength polynomial (from the wavelength wizard) takes
+        # precedence over the device's linear/cal-file axis. The cal-file block
+        # below already honours self.wl_poly_coeffs; the fallback after it covers
+        # the no-cal-file case.
+        try:
+            from app_config import Config as _Cfg
+            _persisted = _Cfg.get("lr2t_wl_poly_coeffs", None)
+            if _persisted:
+                self.wl_poly_coeffs = list(_persisted)
+        except Exception:
+            pass
+
         # Load calibration file if present
         if serial:
             for search_dir in (os.path.dirname(__file__), os.getcwd()):
@@ -327,6 +339,18 @@ class LasertrackLR2T(BaseSpectrometer):
                               f"flip_pixels={self.flip_pixels}, "
                               f"offset={self.wl_offset_nm:+.1f} nm")
                     break
+
+        # Fallback: if a polynomial calibration is set but no cal file applied
+        # it above (no .cal present for this serial), build the axis from the
+        # polynomial now so the wizard's calibration still takes effect.
+        if self.wl_poly_coeffs is not None and not np.array_equal(
+                self._wl,
+                poly_wavelength_array(self.wl_poly_coeffs, self.PIXEL_COUNT)
+                + self.wl_offset_nm):
+            self._wl = (poly_wavelength_array(self.wl_poly_coeffs, self.PIXEL_COUNT)
+                        + self.wl_offset_nm)
+            self.WL_MIN_NM = float(self._wl[0])
+            self.WL_MAX_NM = float(self._wl[-1])
 
         # Resolve per-device integration bounds from config (fall back to the
         # hardware constants). Exposed so the GUI / web server size the exposure

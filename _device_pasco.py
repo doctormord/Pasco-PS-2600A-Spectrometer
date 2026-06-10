@@ -656,6 +656,19 @@ class PascoPS2600A(BaseSpectrometer):
 
     def connect(self, device_id: str) -> None:
         connect_usb_device(device_id)
+        # Apply a persisted wavelength calibration (from the wavelength wizard)
+        # over the factory polynomial, if one is stored for this device.
+        try:
+            from app_config import Config
+            coeffs = Config.get("pasco_wl_poly_coeffs", None)
+            if coeffs:
+                self._wl = poly_wavelength_array(list(coeffs), PASCO_PIXEL_COUNT)
+                self.WL_MIN_NM = float(self._wl[0])
+                self.WL_MAX_NM = float(self._wl[-1])
+                print(f"[PASCO] Wavelength calibration loaded from config "
+                      f"({self.WL_MIN_NM:.1f}-{self.WL_MAX_NM:.1f} nm)")
+        except Exception as e:
+            print(f"[PASCO] wl coeff load skipped: {e}")
         # Do NOT reset current_integration_time_us here — the GUI sets it
         # from the spinbox value before calling start().
 

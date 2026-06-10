@@ -410,6 +410,13 @@ class OceanHDX(BaseSpectrometer):
             Config.get(CFG_FP_LONG_REFRESH_S, DEF_FP_LONG_REFRESH_S))
         self._n_pixels          = int(Config.get(CFG_PIXEL_COUNT, DEF_PIXEL_COUNT))
 
+        # Persisted wavelength polynomial from the wavelength wizard takes
+        # precedence over the device-reported coeffs in _rebuild_wavelength_axis
+        # (which prefers self.wl_poly_coeffs). null = use the device axis.
+        _persisted = Config.get("ocean_wl_poly_coeffs", None)
+        if _persisted:
+            self.wl_poly_coeffs = list(_persisted)
+
         # Build the optional response table from config (enables the GUI's
         # response-compensation control for this device).
         self.RESPONSE_TABLE = self._response_table_from_config()
