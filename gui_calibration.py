@@ -34,6 +34,12 @@ from PyQt6.QtWidgets import (
 )
 
 import calibration_profiles as calprof
+import gui_theme as gt
+
+
+def _T():
+    """Current palette (alias rebinds during a theme switch)."""
+    return gt.Theme
 
 
 # Poll interval for live capture. Only genuinely NEW frames are accumulated
@@ -128,6 +134,14 @@ class CalibrationDialog(QDialog):
         self.dash = dashboard
         self.setWindowTitle("Device calibration")
         self.setMinimumSize(820, 600)
+        # The app stylesheet themes backgrounds by objectName (#central, #sidebar
+        # …); a bare QDialog and its unnamed tab-page QWidgets have none, so they
+        # fall back to the light system palette. Give them a scoped dark
+        # background — selectors are limited to QDialog and #calTabPage so button
+        # / combo / table styling is left untouched.
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {_T().BG1}; }}"
+            f"QWidget#calTabPage {{ background-color: {_T().BG1}; }}")
 
         # captured data
         self._wl_capture = None          # (wl, inten) of the line lamp
@@ -162,11 +176,75 @@ class CalibrationDialog(QDialog):
         from app_config import Config
         return max(1, int(Config.get("calibration_capture_frames", 16)))
 
+    def _style_cal_plot(self, plot, default_x=(300.0, 1050.0)):
+        """Match the app chrome and fix the empty-plot axis.
+
+        An empty pyqtgraph view shows a bare 0..1 range on BOTH axes until data
+        is plotted — that is what the old black plot's "0.1 … 1.0" ticks were,
+        NOT a real wavelength axis and NOT a CCD-stepping artefact. Here we give
+        the plot the themed background + axes, a small top/right margin so the
+        top tick label is not clipped, and a sensible nm default range for the
+        empty state (the connected device's span, or a wide fallback). Captures
+        call plot.autoRange() afterwards to frame the actual data."""
+        plot.setBackground(_T().BG0)
+        plot.getPlotItem().setContentsMargins(6, 10, 14, 6)
+        for axis in ("bottom", "left"):
+            ax = plot.getAxis(axis)
+            ax.setPen(pg.mkPen(_T().BORDER2, width=1))
+            ax.setTextPen(pg.mkPen(_T().FG3))
+        plot.showGrid(x=True, y=True, alpha=0.12)
+        wl = getattr(self.dash, "active_wavelengths", None)
+        if wl is not None and len(wl) > 1:
+            lo, hi = float(wl[0]), float(wl[-1])
+        else:
+            lo, hi = default_x
+        plot.setXRange(lo, hi, padding=0.02)
+
+    def _style_cal_table(self, table):
+        """Dark-theme the pixel↔λ table. The global stylesheet doesn't reach
+        QTableWidget here, so its viewport and header render bare white in dark
+        mode — style them explicitly from the palette (header sections, corner
+        button, grid, selection and the inline cell editor)."""
+        t = _T()
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(f"""
+            QTableWidget {{
+                background: {t.BG1};
+                alternate-background-color: {t.BG2};
+                color: {t.FG1};
+                gridline-color: {t.BORDER1};
+                border: 1px solid {t.BORDER1};
+                border-radius: 6px;
+                selection-background-color: {t.BG3};
+                selection-color: {t.FG1};
+            }}
+            QTableWidget::item {{ padding: 2px 6px; }}
+            QTableWidget::item:selected {{ background: {t.BG3}; color: {t.FG1}; }}
+            QTableWidget QLineEdit {{
+                background: {t.BG3}; color: {t.FG1};
+                border: 1px solid {t.ACCENT}; selection-background-color: {t.ACCENT};
+            }}
+            QHeaderView::section {{
+                background: {t.BG2};
+                color: {t.FG3};
+                padding: 4px 8px;
+                border: none;
+                border-bottom: 1px solid {t.BORDER1};
+                border-right: 1px solid {t.BORDER1};
+                font-weight: 500;
+            }}
+            QTableCornerButton::section {{
+                background: {t.BG2};
+                border: none;
+                border-bottom: 1px solid {t.BORDER1};
+            }}
+        """)
+
     # ══════════════════════════════════════════════════════════════════════
     #  WAVELENGTH TAB
     # ══════════════════════════════════════════════════════════════════════
     def _build_wavelength_tab(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget(); w.setObjectName("calTabPage"); v = QVBoxLayout(w)
 
         intro = QLabel(
             "Measure a discharge lamp, assign detected peaks to known lines, "
@@ -195,6 +273,7 @@ class CalibrationDialog(QDialog):
         self.plot_wl.setLabel("bottom", "Wavelength", units="nm")
         self.plot_wl.setLabel("left", "Intensity", units="ADC")
         self.plot_wl.setMinimumHeight(180)
+        self._style_cal_plot(self.plot_wl)
         v.addWidget(self.plot_wl, 1)
 
         mid = QHBoxLayout()
@@ -202,6 +281,7 @@ class CalibrationDialog(QDialog):
         self.tbl_wl.setHorizontalHeaderLabels(["Pixel", "Known λ (nm)"])
         self.tbl_wl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl_wl.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        self._style_cal_table(self.tbl_wl)
         mid.addWidget(self.tbl_wl, 1)
 
         btns = QVBoxLayout()
@@ -287,6 +367,7 @@ class CalibrationDialog(QDialog):
         for _, nm in self._wl_table_pairs():
             self.plot_wl.addItem(pg.InfiniteLine(
                 pos=nm, angle=90, pen=pg.mkPen((255, 170, 60), style=Qt.PenStyle.DashLine)))
+        self.plot_wl.autoRange()
 
     def _wl_fit_clicked(self):
         backend = self._backend()
@@ -367,7 +448,7 @@ class CalibrationDialog(QDialog):
     #  RESPONSE TAB
     # ══════════════════════════════════════════════════════════════════════
     def _build_response_tab(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
+        w = QWidget(); w.setObjectName("calTabPage"); v = QVBoxLayout(w)
 
         intro = QLabel(
             "Build a per-wavelength sensitivity correction. Measure a SMOOTH, "
@@ -401,6 +482,7 @@ class CalibrationDialog(QDialog):
         self.plot_resp.setLabel("left", "Sensitivity / gain")
         self.plot_resp.addLegend()
         self.plot_resp.setMinimumHeight(200)
+        self._style_cal_plot(self.plot_resp)
         v.addWidget(self.plot_resp, 1)
 
         bottom = QHBoxLayout()
@@ -480,6 +562,9 @@ class CalibrationDialog(QDialog):
         if self._resp_table is not None:
             self.plot_resp.plot(self._resp_table[:, 0], self._resp_table[:, 1],
                                 pen=pg.mkPen((255, 170, 60), width=2), name="sensitivity S")
+        if (self._ref is not None or self._meas is not None
+                or self._resp_table is not None):
+            self.plot_resp.autoRange()
 
     def _compute_response(self):
         if self._ref is None or self._meas is None:

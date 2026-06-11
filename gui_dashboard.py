@@ -868,6 +868,16 @@ class DashboardWindow(QMainWindow):
         self.combo_response.addItem(calprof.SEL_NONE)
         self.combo_response.currentTextChanged.connect(self._on_response_selection)
 
+        # Delete the selected saved profile (parity with the web client's
+        # "Manage profile" delete). Disabled for None / Device default.
+        self.button_response_delete = QPushButton("✕")
+        self.button_response_delete.setObjectName("ghostBtn")
+        self.button_response_delete.setFixedWidth(34)
+        self.button_response_delete.setEnabled(False)
+        self.button_response_delete.setToolTip(
+            "Delete the selected response-correction profile for this device.")
+        self.button_response_delete.clicked.connect(self._on_response_delete)
+
         self.button_calibrate = QPushButton("Calibration…")
         self.button_calibrate.clicked.connect(self.open_calibration_dialog)
 
@@ -880,7 +890,7 @@ class DashboardWindow(QMainWindow):
             ("Smoothing width",       "px",  self.spinbox_despeckle_width),
             ("Spatial smoothing",     None,  self.button_spatial_smooth),
             ("Spatial width",         "px",  self.spinbox_spatial_width),
-            ("Response correction",   None,  self.combo_response),
+            ("Response correction",   None,  [self.combo_response, self.button_response_delete]),
             ("Calibrate device",      None,  self.button_calibrate),
         ]))
 
@@ -1683,6 +1693,7 @@ class DashboardWindow(QMainWindow):
         self.combo_response.addItems(items)
         self.combo_response.setCurrentText(sel)
         self.combo_response.blockSignals(False)
+        self._sync_response_delete_enabled()
 
     def _on_response_selection(self, selection: str) -> None:
         """User picked a correction in the dropdown — persist + apply live."""
@@ -1690,6 +1701,36 @@ class DashboardWindow(QMainWindow):
             return
         dev = self.combo_backend.currentText()
         calprof.set_active_selection(dev, selection)
+        self.apply_response_correction()
+        self._sync_response_delete_enabled()
+
+    def _sync_response_delete_enabled(self) -> None:
+        """Enable delete only for a real saved profile (not None / Device
+        default)."""
+        if not hasattr(self, "button_response_delete"):
+            return
+        dev = self.combo_backend.currentText()
+        sel = self.combo_response.currentText()
+        self.button_response_delete.setEnabled(sel in calprof.list_profiles(dev))
+
+    def _on_response_delete(self) -> None:
+        """Delete the selected saved response-correction profile for this device
+        (mirrors the web client). If the deleted profile was active, fall back to
+        None and rebuild the live gain."""
+        dev = self.combo_backend.currentText()
+        name = self.combo_response.currentText()
+        if name not in calprof.list_profiles(dev):
+            return
+        if QMessageBox.question(
+                self, "Delete profile",
+                f"Delete response-correction profile \u201c{name}\u201d for {dev}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        calprof.delete_profile(dev, name)
+        if calprof.active_selection(dev) == name:
+            calprof.set_active_selection(dev, calprof.SEL_NONE)
+        self._refresh_response_combo()   # repopulates + re-syncs delete-enable
         self.apply_response_correction()
 
     def apply_response_correction(self) -> None:
