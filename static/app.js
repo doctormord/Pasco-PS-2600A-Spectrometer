@@ -1170,6 +1170,8 @@ function updateColorTab(c) {
   // R1..R15 bar chart + radar / spider
   drawCRIBars(c.Ri || []);
   drawCRIRadar(c.Ri || []);
+  // Reference vs. test colour-patch panel
+  drawCRIPatches(c.tcs_swatches);
 }
 
 // CIE 1931 horseshoe (static layer cached in an offscreen canvas) -----
@@ -1394,6 +1396,49 @@ function drawCRIBars(Ri) {
   }
 }
 
+// Ref/Test colour-patch panel: top row reference appearance, bottom row test
+// appearance (both Bradford-adapted to D65), with the per-sample ΔE*ab as a
+// tooltip. Fed by the measure_all 'tcs_swatches' carried in the frame payload.
+function drawCRIPatches(sw) {
+  const host = $('#cri-patches');
+  if (!host) return;
+  if (!sw || !sw.ref || !sw.ref.length) { host.innerHTML = ''; return; }
+  const labels = sw.labels || [], ref = sw.ref, test = sw.test, dE = sw.dE || [];
+  const n = ref.length;
+  // (re)build once for the right column count
+  if (host.childElementCount !== n + 1) {
+    host.innerHTML = '';
+    const make = (i, isSrc) => {
+      const col = document.createElement('div');
+      col.className = 'patch-col';
+      col.innerHTML =
+        `<div class="patch patch-ref" id="pr-${i}"></div>` +
+        `<div class="patch patch-test" id="pt-${i}"></div>` +
+        `<span class="patch-lbl" id="pl-${i}"></span>`;
+      host.appendChild(col);
+    };
+    for (let i = 0; i < n; i++) make(i, false);
+    make(n, true);                       // source column
+  }
+  for (let i = 0; i < n; i++) {
+    const name = (labels[i] || `TCS${i + 1}`);
+    const d = dE[i];
+    const tip = (d == null) ? name : `${name}  ΔE*ab = ${d.toFixed(1)}`;
+    const pr = $(`#pr-${i}`), pt = $(`#pt-${i}`), pl = $(`#pl-${i}`);
+    pr.style.background = ref[i]; pt.style.background = test[i];
+    pr.title = tip; pt.title = tip;
+    pl.textContent = name.replace('TCS', '');
+  }
+  // source column
+  const pr = $(`#pr-${n}`), pt = $(`#pt-${n}`), pl = $(`#pl-${n}`);
+  if (pr) {
+    pr.style.background = sw.source_ref || '#222';
+    pt.style.background = sw.source_test || '#222';
+    pr.title = pt.title = 'Source white (Ref vs Test tint)';
+    pl.textContent = 'Src';
+  }
+}
+
 // R1..R15 radar / spider chart -------------------------------
 const TCS_COLORS = [
   '#E8B89B','#D9C982','#C7D068','#8FBE7C','#7BBFAE','#7AA3D4','#9F8DCB','#C77AB1',
@@ -1512,51 +1557,6 @@ function snapYToPeak() {
   // One push carries both changes; pushCfg re-feeds the plot so the new fixed
   // range applies immediately even while paused.
   pushCfg({ y_max_adc: peak, auto_y: false });
-}
-
-// ── Response-correction profiles (mirrors the desktop dropdown) ──────────
-// Profiles are created in the desktop calibration wizard and shared via
-// calibration_profiles.json; the web client lists, selects and deletes them.
-async function loadResponseProfiles() {
-  const sel = $('#response-correction-select');
-  if (!sel) return;
-  try {
-    const r = await fetch('/api/calibration/profiles').then(r => r.json());
-    sel.innerHTML = '';
-    (r.items || ['None']).forEach((name) => {
-      const o = document.createElement('option');
-      o.value = name; o.textContent = name;
-      sel.appendChild(o);
-    });
-    sel.value = r.selection || 'None';
-    const del = $('#btn-response-delete');
-    if (del) del.disabled = !(r.profiles || []).includes(sel.value);
-  } catch (e) { /* server may be idle/disconnected — leave default */ }
-}
-
-async function selectResponseProfile(selection) {
-  try {
-    const r = await fetch('/api/calibration/select', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ selection }),
-    });
-    if (!r.ok) throw new Error((await r.json()).detail);
-    loadResponseProfiles();
-  } catch (e) { toast('Response correction: ' + e.message); }
-}
-
-async function deleteResponseProfile() {
-  const sel = $('#response-correction-select');
-  const name = sel && sel.value;
-  if (!name || name === 'None' || name === 'Device default') return;
-  if (!confirm(`Delete response profile “${name}” for this device?`)) return;
-  try {
-    await fetch('/api/calibration/profile/delete', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    loadResponseProfiles();
-  } catch (e) { toast('Delete failed: ' + e.message); }
 }
 
 function pushCfg(partial) {
@@ -1680,7 +1680,6 @@ async function toggleConnection() {
       // Re-fetch the active reference: the server interpolates onto the
       // connected device's wavelength axis, which differs per device.
       applyReference($('#cfg-reference_library')?.value || State.referenceName);
-      loadResponseProfiles();        // populate the response-correction dropdown
     } catch (e) { toast('Connect failed: ' + e.message); }
   }
   updateConnectButton();
@@ -1863,9 +1862,6 @@ async function init() {
     $('#sidebar-toggle').addEventListener('click', () => {
       $('#sidebar').classList.toggle('open');
     });
-    $('#response-correction-select')?.addEventListener('change', (e) =>
-      selectResponseProfile(e.target.value));
-    $('#btn-response-delete')?.addEventListener('click', deleteResponseProfile);
     wireConfigInputs();
   } catch (e) {
     console.error('init: wiring controls failed', e);
@@ -1877,7 +1873,6 @@ async function init() {
     $('#sb-backend').textContent = s.backend;
     State.hardwareConnected = !!s.connected;
     updateConnectButton();
-    if (s.connected) loadResponseProfiles();
   } catch (e) { console.warn('init: /api/status failed', e); }
 
   // WebSocket — populates backend/device dropdowns from the hello frame.
@@ -2633,11 +2628,13 @@ const Tm30 = (() => {
       ctx.fillText(String(lv), 24, y + 3);
     }
     const bw = (W - 30) / n;
+    const hex = (data.Rs_hex && data.Rs_hex.length === n) ? data.Rs_hex : null;
     for (let i = 0; i < n; i++) {
       const x = 30 + i * bw, y = yOf(Rs[i]);
-      // Per-sample colour: continuous red→magenta hue ramp so all 99 bars are
-      // distinct (was the 16 hue-bin colours, which only gave ~12 visible).
-      ctx.fillStyle = `hsl(${((i / Math.max(n - 1, 1)) * 300).toFixed(1)},70%,58%)`;
+      // Per-sample colour: the CES sample's true (reference) colour when the
+      // server provides it, else a continuous red→magenta hue ramp.
+      ctx.fillStyle = hex ? hex[i]
+        : `hsl(${((i / Math.max(n - 1, 1)) * 300).toFixed(1)},70%,58%)`;
       ctx.fillRect(x, y, Math.max(1, bw - 0.5), yOf(0) - y);
     }
   }

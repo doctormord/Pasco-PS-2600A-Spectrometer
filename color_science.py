@@ -272,6 +272,120 @@ def _xyz_under(spd_illum: np.ndarray, reflectance: np.ndarray
     return X, Y, Z
 
 
+# ════════════════════════════════════════════════════════════
+# Display-colour helpers — render a reflective sample under an illuminant to an
+# sRGB hex string, for the Ref/Test colour-patch panels and the per-sample bar
+# colours. The sample XYZ are chromatically adapted (Bradford) from the source
+# white to D65 before the sRGB transform, so what is drawn is the *adapted*
+# appearance (how an observer adapted to the source perceives the object) — the
+# Ref vs Test difference then shows the pure colour-rendering shift, not the
+# overall white-point tint. Pure numpy: no dependency on the optional
+# colour-science package.
+# ════════════════════════════════════════════════════════════
+_BRADFORD = np.array([[ 0.8951,  0.2664, -0.1614],
+                      [-0.7502,  1.7135,  0.0367],
+                      [ 0.0389, -0.0685,  1.0296]])
+_BRADFORD_INV = np.linalg.inv(_BRADFORD)
+_D65_XYZ = np.array([95.047, 100.0, 108.883])      # 2° D65 reference white
+_SRGB_M = np.array([[ 3.2406, -1.5372, -0.4986],   # linear sRGB (D65)
+                    [-0.9689,  1.8758,  0.0415],
+                    [ 0.0557, -0.2040,  1.0570]])
+
+
+def _adapt_xyz_to_d65(XYZ: np.ndarray, white_xyz: np.ndarray) -> np.ndarray:
+    """Bradford-adapt XYZ (relative to ``white_xyz``) to the D65 viewing white.
+    Accepts a single (3,) vector or an (N,3) array."""
+    white_xyz = np.asarray(white_xyz, dtype=float)
+    src = _BRADFORD @ white_xyz
+    dst = _BRADFORD @ _D65_XYZ
+    M = _BRADFORD_INV @ np.diag(dst / np.where(src == 0, 1e-9, src)) @ _BRADFORD
+    return np.asarray(XYZ, dtype=float) @ M.T
+
+
+def _xyz_to_srgb_hex(XYZ: np.ndarray) -> "str | list[str]":
+    """Convert D65-relative XYZ (Y≈100 = white) to a clipped sRGB '#rrggbb' hex.
+    Accepts a (3,) vector (returns one string) or an (N,3) array (returns list)."""
+    arr = np.atleast_2d(np.asarray(XYZ, dtype=float)) / 100.0
+    rgb = arr @ _SRGB_M.T
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb = np.where(rgb <= 0.0031308, 12.92 * rgb,
+                   1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    out = ["#%02x%02x%02x" % tuple((row * 255 + 0.5).astype(int)) for row in rgb]
+    return out[0] if np.ndim(XYZ) == 1 else out
+
+
+def _xyz_to_lab_d65(XYZ: np.ndarray) -> np.ndarray:
+    """CIELAB (under D65) from D65-relative XYZ (Y≈100 = white). (3,) or (N,3)."""
+    arr = np.atleast_2d(np.asarray(XYZ, dtype=float)) / _D65_XYZ
+    eps, kappa = 216.0 / 24389.0, 24389.0 / 27.0
+    f = np.where(arr > eps, np.cbrt(arr), (kappa * arr + 16.0) / 116.0)
+    L = 116.0 * f[:, 1] - 16.0
+    a = 500.0 * (f[:, 0] - f[:, 1])
+    b = 200.0 * (f[:, 1] - f[:, 2])
+    lab = np.stack([L, a, b], axis=1)
+    return lab[0] if np.ndim(XYZ) == 1 else lab
+
+
+def _render_sample_hex(spd_illum: np.ndarray, reflectance: np.ndarray,
+                       white_xyz: np.ndarray) -> tuple[str, np.ndarray]:
+    """Render one reflective sample under ``spd_illum`` to an adapted sRGB hex and
+    its CIELAB triplet. ``white_xyz`` is the (raw, un-normalised) illuminant white
+    so the sample is scaled relative to it before adaptation."""
+    w = np.asarray(white_xyz, dtype=float)
+    scale = 100.0 / max(w[1], 1e-12)
+    xyz = np.array(_xyz_under(spd_illum, reflectance)) * scale
+    xyz_d65 = _adapt_xyz_to_d65(xyz, w * scale)
+    return _xyz_to_srgb_hex(xyz_d65), _xyz_to_lab_d65(xyz_d65)
+
+
+def cri_tcs_swatches(wavelengths_nm: np.ndarray, intensities: np.ndarray
+                     ) -> "dict | None":
+    """Render the 15 CIE 13.3 test-colour samples (TCS01–TCS15) under both the
+    measured source and the CRI reference illuminant, for the Ref/Test colour-
+    patch panel. Returns a JSON-safe dict::
+
+        {labels:[...], ref:[hex...], test:[hex...], dE:[float|None...],
+         source_ref:hex, source_test:hex}
+
+    where ``ref``/``test`` are the adapted sRGB appearances and ``dE`` is the
+    CIELAB ΔE*ab between them per sample. ``source_*`` are the un-adapted source
+    white tints (Ref vs Test white point). None if the spectrum is degenerate."""
+    spd_test = resample_spd(wavelengths_nm, intensities)
+    if np.sum(spd_test) <= 0:
+        return None
+    X_t, Y_t, Z_t = spectrum_to_xyz(CIE_WL_5, spd_test)
+    x_t, y_t = xyz_to_xy(X_t, Y_t, Z_t)
+    cct = cct_mccamy(x_t, y_t)
+    if not np.isfinite(cct) or cct <= 0:
+        return None
+    spd_ref = reference_illuminant_spd(cct)
+    X_r, Y_r, Z_r = spectrum_to_xyz(CIE_WL_5, spd_ref)
+    if Y_r > 0:                                   # normalise ref to the test Y
+        spd_ref = spd_ref * (Y_t / Y_r)
+    w_test = np.array(spectrum_to_xyz(CIE_WL_5, spd_test))
+    w_ref = np.array(spectrum_to_xyz(CIE_WL_5, spd_ref))
+
+    labels, ref_hex, test_hex, dE = [], [], [], []
+    for k in range(len(TCS)):
+        hr, lab_r = _render_sample_hex(spd_ref, TCS[k], w_ref)
+        ht, lab_t = _render_sample_hex(spd_test, TCS[k], w_test)
+        labels.append(f"TCS{k + 1:02d}")
+        ref_hex.append(hr); test_hex.append(ht)
+        d = float(np.sqrt(np.sum((lab_t - lab_r) ** 2)))
+        dE.append(d if np.isfinite(d) else None)
+
+    # Source patches: the un-adapted white-point tint of each illuminant, so the
+    # observer sees Ref vs Test colour temperature / Duv at a glance.
+    def _white_tint(white_xyz):
+        w = np.asarray(white_xyz, dtype=float)
+        return _xyz_to_srgb_hex(w * (100.0 / max(w[1], 1e-12)))
+    return {
+        "labels": labels, "ref": ref_hex, "test": test_hex, "dE": dE,
+        "source_ref": _white_tint(w_ref), "source_test": _white_tint(w_test),
+    }
+
+
 def _adapt_uv(u_ki: float, v_ki: float,
               u_t: float, v_t: float,
               u_r: float, v_r: float) -> tuple[float, float]:
@@ -647,7 +761,8 @@ def measure_all(wavelengths_nm: np.ndarray,
                         fwhm_nm=float('nan'),
                         purity_pct=float('nan'),
                         red_pct=float('nan'), green_pct=float('nan'),
-                        blue_pct=float('nan')))
+                        blue_pct=float('nan'),
+                        tcs_swatches=None))
         return out
 
     X, Y, Z = spectrum_to_xyz(wavelengths_nm, intensities)
@@ -672,6 +787,10 @@ def measure_all(wavelengths_nm: np.ndarray,
     cw = central_wavelength(wavelengths_nm, intensities)
     dom, pur = dominant_wavelength_and_purity(x, y, cct)
     r_p, g_p, b_p = rgb_band_ratios(wavelengths_nm, intensities)
+    try:
+        swatches = cri_tcs_swatches(wavelengths_nm, intensities)
+    except Exception:
+        swatches = None
 
     out.update(dict(X=X, Y=Y, Z=Z, x=x, y=y,
                     cct=cct, duv=duv,
@@ -683,7 +802,8 @@ def measure_all(wavelengths_nm: np.ndarray,
                     centroid_nm=cn, central_nm=cw,
                     fwhm_nm=fw,
                     purity_pct=pur,
-                    red_pct=r_p, green_pct=g_p, blue_pct=b_p))
+                    red_pct=r_p, green_pct=g_p, blue_pct=b_p,
+                    tcs_swatches=swatches))
     return out
 
 
@@ -810,13 +930,15 @@ def render_color_report(dst, wavelengths_nm, intensities,
         bars_box = [0.50, 0.645, 0.45, 0.145]
         cvg_box  = [0.06, 0.40, 0.34, 0.185]
         s99_box  = [0.47, 0.41, 0.49, 0.165]
-        tbl_box  = [0.06, 0.02, 0.90, 0.34]
+        patch_box= [0.06, 0.315, 0.90, 0.060]
+        tbl_box  = [0.06, 0.02, 0.90, 0.275]
     else:
         spd_box  = [0.10, 0.74, 0.85, 0.20]
-        radar_box= [0.07, 0.42, 0.36, 0.28]
-        bars_box = [0.52, 0.44, 0.43, 0.24]
+        radar_box= [0.07, 0.435, 0.36, 0.27]
+        bars_box = [0.52, 0.455, 0.43, 0.25]
         cvg_box = s99_box = None
-        tbl_box  = [0.08, 0.03, 0.88, 0.34]
+        patch_box= [0.08, 0.345, 0.88, 0.060]
+        tbl_box  = [0.08, 0.03, 0.88, 0.285]
 
     # 1) Spectral power distribution
     ax1 = fig.add_axes(spd_box); ax1.set_facecolor("white")
@@ -851,13 +973,21 @@ def render_color_report(dst, wavelengths_nm, intensities,
         _draw_tm30_cvg(fig.add_axes(cvg_box), t)
         axs = fig.add_axes(s99_box); axs.set_facecolor("white")
         Rs = t["Rs"]; bins = t["bins"]
-        cols = _sample_ramp_colors(len(Rs))
+        # Each bar in the CES sample's true (reference) colour; fall back to the
+        # synthetic ramp only if the colorimetry data couldn't be derived.
+        cols = t.get("Rs_hex") or _sample_ramp_colors(len(Rs))
         axs.bar(np.arange(len(Rs)), Rs, color=cols, width=1.0)
         axs.axhline(100, color="#999", lw=0.5, ls="--")
         axs.set_ylim(0, max(105, (max(Rs) if Rs else 100) + 5))
         axs.set_xlim(-1, len(Rs)); axs.set_xticks([])
         axs.set_ylabel("Rf,i"); axs.grid(axis="y", alpha=0.3)
-        axs.set_title("TM-30 — fidelity of all 99 colour samples", fontsize=9)
+        axs.set_title("TM-30 — fidelity of all 99 colour samples (true sample colour)",
+                      fontsize=9)
+
+    # 3b) CRI Ref/Test colour-patch panel — top row reference, bottom row test
+    sw = m.get("tcs_swatches")
+    if sw:
+        _draw_cri_patches(fig.add_axes(patch_box), sw)
 
     # 4) Metrics table
     rows = color_report_rows(wl, inten, lux_calibration)
@@ -903,6 +1033,42 @@ def _draw_cri_radar(ax, vals) -> None:
     ax.set_xlim(-1.32, 1.32); ax.set_ylim(-1.32, 1.32)
     ax.set_aspect("equal"); ax.axis("off")
     ax.set_title("CRI radar (R1–R15)", fontsize=9)
+
+
+def _draw_cri_patches(ax, sw: dict) -> None:
+    """CRI Ref/Test colour-patch panel: for each of the 15 TCS (plus the source
+    white) a reference swatch (top row) over the test swatch (bottom row), with
+    the sample label and ΔE*ab underneath. Visualises the per-sample colour shift
+    the same way as professional CRI tools."""
+    ax.set_facecolor("white")
+    labels = list(sw.get("labels", []))
+    ref = list(sw.get("ref", [])); test = list(sw.get("test", []))
+    dE = list(sw.get("dE", []))
+    # append the source-white column
+    cols = list(zip(labels, ref, test, dE))
+    cols.append(("Src", sw.get("source_ref", "#fff"),
+                 sw.get("source_test", "#fff"), None))
+    n = len(cols)
+    import matplotlib.patches as mpatches
+    for i, (lab, hr, ht, d) in enumerate(cols):
+        x = i / n
+        w = 1.0 / n * 0.86
+        ax.add_patch(mpatches.Rectangle((x, 0.52), w, 0.46, transform=ax.transAxes,
+                                        facecolor=hr, edgecolor="#888", lw=0.4))
+        ax.add_patch(mpatches.Rectangle((x, 0.04), w, 0.46, transform=ax.transAxes,
+                                        facecolor=ht, edgecolor="#888", lw=0.4))
+        ax.text(x + w / 2, -0.10, lab, transform=ax.transAxes, ha="center",
+                va="top", fontsize=5.0, color="#333", rotation=0)
+        if d is not None:
+            ax.text(x + w / 2, -0.30, f"{d:.1f}", transform=ax.transAxes,
+                    ha="center", va="top", fontsize=4.6, color="#777")
+    ax.text(-0.012, 0.75, "Ref", transform=ax.transAxes, ha="right", va="center",
+            fontsize=6, color="#555")
+    ax.text(-0.012, 0.27, "Test", transform=ax.transAxes, ha="right", va="center",
+            fontsize=6, color="#555")
+    ax.set_title("CRI — reference vs. test appearance (ΔE*ab per sample)",
+                 fontsize=9, pad=2)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
 
 
 def _draw_tm30_cvg(ax, t: dict) -> None:
@@ -1004,6 +1170,7 @@ def tm30_metrics(wavelengths_nm, intensities) -> dict | None:
         "Rf": _fl(s.R_f), "Rg": _fl(s.R_g),
         "CCT": cct_v, "Duv": duv_v,
         "Rs":    [_fl(v) for v in np.asarray(s.R_s).ravel()],
+        "Rs_hex": _ces_sample_hex(s),
         "bins":  [int(b) for b in np.asarray(s.bins).ravel()],
         "Rfhj":  [_fl(v) for v in np.asarray(s.R_fs).ravel()],
         "Rcshj": [_fl(v) for v in np.asarray(s.R_cs).ravel()],
@@ -1011,6 +1178,30 @@ def tm30_metrics(wavelengths_nm, intensities) -> dict | None:
         "avg_test": np.asarray(s.averages_test, dtype=float).tolist(),
         "avg_ref":  np.asarray(s.averages_reference, dtype=float).tolist(),
     }
+
+
+def _ces_sample_hex(spec) -> "list[str] | None":
+    """Per-CES bar colours: the *reference* appearance (stable across sources) of
+    all 99 colour-evaluation samples, from the TM-30 spec's colorimetry data,
+    Bradford-adapted to D65. Returns None if the data can't be derived (the bars
+    then fall back to a synthetic ramp). Uses the CIE 1964 10° observer (the
+    TM-30 observer) for the reference white."""
+    try:
+        ref_xyz = np.asarray(spec.colorimetry_data[1].XYZ, dtype=float)  # (99,3)
+        if ref_xyz.ndim != 2 or ref_xyz.shape[1] != 3:
+            return None
+        try:
+            from colour.colorimetry import sd_to_XYZ, MSDS_CMFS
+            cmfs = MSDS_CMFS["CIE 1964 10 Degree Standard Observer"].copy().align(
+                spec.sd_reference.shape)
+            wp = np.asarray(sd_to_XYZ(spec.sd_reference, cmfs), dtype=float)
+            wp = wp * (100.0 / max(wp[1], 1e-12))
+            ref_xyz = _adapt_xyz_to_d65(ref_xyz, wp)
+        except Exception:
+            pass                       # no white → draw un-adapted (still sane)
+        return _xyz_to_srgb_hex(ref_xyz)
+    except Exception:
+        return None
 
 
 def cqs_metrics(wavelengths_nm, intensities) -> dict | None:

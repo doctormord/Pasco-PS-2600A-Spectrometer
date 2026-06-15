@@ -488,6 +488,85 @@ class _ChromaticityPage(QWidget):
 # ════════════════════════════════════════════════════════════
 # Sub-tab 3: Color Rendering (radar + bars + table)
 # ════════════════════════════════════════════════════════════
+class _TcsPatchPanel(QWidget):
+    """Ref/Test colour-patch grid for the 15 CIE 13.3 TCS plus the source white.
+    Top row = reference appearance, bottom row = test appearance, both
+    chromatically adapted to D65 so the visible difference is the pure colour-
+    rendering shift. Fed by ``update_swatches`` with the dict from
+    ``color_science.cri_tcs_swatches`` (carried in measure_all['tcs_swatches'])."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._n = 16                       # 15 TCS + source
+        g = QGridLayout(self)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(2); g.setVerticalSpacing(2)
+        for c in range(self._n):
+            g.setColumnStretch(c + 1, 1)
+
+        def _row_label(text):
+            l = QLabel(text)
+            l.setStyleSheet(f"color:{_T().FG3};font-size:9.5px;")
+            l.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return l
+
+        g.addWidget(_row_label("Ref"), 0, 0)
+        g.addWidget(_row_label("Test"), 1, 0)
+
+        def _cell():
+            f = QFrame()
+            f.setMinimumHeight(20)
+            f.setFrameShape(QFrame.Shape.NoFrame)
+            f.setStyleSheet("background:#222;border-radius:2px;")
+            return f
+
+        self._ref_cells, self._test_cells, self._labels = [], [], []
+        for c in range(self._n):
+            rc, tc = _cell(), _cell()
+            self._ref_cells.append(rc); self._test_cells.append(tc)
+            g.addWidget(rc, 0, c + 1); g.addWidget(tc, 1, c + 1)
+            lab = QLabel("")
+            lab.setStyleSheet(f"color:{_T().FG3};font-family:{FONT_MONO};font-size:8px;")
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._labels.append(lab)
+            g.addWidget(lab, 2, c + 1)
+
+    def clear(self) -> None:
+        for c in range(self._n):
+            self._ref_cells[c].setStyleSheet("background:#222;border-radius:2px;")
+            self._test_cells[c].setStyleSheet("background:#222;border-radius:2px;")
+            self._labels[c].setText("")
+            self._ref_cells[c].setToolTip("")
+
+    def update_swatches(self, sw: "dict | None") -> None:
+        if not sw:
+            self.clear(); return
+        ref = sw.get("ref", []); test = sw.get("test", [])
+        labels = sw.get("labels", []); dE = sw.get("dE", [])
+        n_tcs = min(len(ref), len(test), len(labels))
+        for i in range(self._n):
+            if i < n_tcs:
+                hr, ht, name = ref[i], test[i], labels[i]
+                d = dE[i] if i < len(dE) else None
+                tip = f"{name}  ΔE*ab = {d:.1f}" if d is not None else name
+                self._labels[i].setText(name.replace("TCS", ""))
+            elif i == n_tcs:                              # source-white column
+                hr = sw.get("source_ref", "#222"); ht = sw.get("source_test", "#222")
+                tip = "Source white (Ref vs Test tint)"
+                self._labels[i].setText("Src")
+            else:
+                self._ref_cells[i].setStyleSheet("background:#222;border-radius:2px;")
+                self._test_cells[i].setStyleSheet("background:#222;border-radius:2px;")
+                self._labels[i].setText(""); continue
+            self._ref_cells[i].setStyleSheet(f"background:{hr};border-radius:2px;")
+            self._test_cells[i].setStyleSheet(f"background:{ht};border-radius:2px;")
+            self._ref_cells[i].setToolTip(tip); self._test_cells[i].setToolTip(tip)
+
+    def apply_theme(self) -> None:
+        for lab in self._labels:
+            lab.setStyleSheet(f"color:{_T().FG3};font-family:{FONT_MONO};font-size:8px;")
+
+
 class _ColorRenderingPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -621,6 +700,12 @@ class _ColorRenderingPage(QWidget):
         legend.setStyleSheet(f"color:{_T().FG3};font-size:10.5px;")
         rv.addWidget(legend)
 
+        # Ref/Test colour-patch panel (reference vs. measured appearance)
+        rv.addWidget(make_hsep())
+        rv.addWidget(_section_header("Reference vs. test appearance"))
+        self.patch_panel = _TcsPatchPanel()
+        rv.addWidget(self.patch_panel)
+
         root.addWidget(right, 1)
 
     def apply(self, m: dict) -> None:
@@ -657,6 +742,9 @@ class _ColorRenderingPage(QWidget):
                 f'font-size:9pt;">  {txt}</span>')
             lbl.setPos(max(0.0, w), 15 - i)
 
+        # Ref/Test colour patches
+        self.patch_panel.update_swatches(m.get("tcs_swatches"))
+
     def apply_theme(self) -> None:
         for plot in (self.radar, self.bars_plot):
             plot.setBackground(_T().BG0)
@@ -668,6 +756,7 @@ class _ColorRenderingPage(QWidget):
                                        style=Qt.PenStyle.DashLine))
         self._radar_fill.setPen(pg.mkPen(_T().ACCENT, width=1.5))
         self._radar_dots.setBrush(pg.mkBrush(_T().ACCENT))
+        self.patch_panel.apply_theme()
 
 
 # ════════════════════════════════════════════════════════════
@@ -788,13 +877,18 @@ class _TM30Page(QWidget):
                 else:
                     self._cvg_arrows[j].setData([], [])
 
-        # 99-sample fidelity bars
+        # 99-sample fidelity bars — coloured with each CES sample's true
+        # (reference) colour when available, else a synthetic hue ramp.
         Rs = np.asarray(tm.get("Rs") or [], dtype=float)
         bins = tm.get("bins") or []
         if self._samples_bars is not None:
             self.samples.removeItem(self._samples_bars)
         if Rs.size:
-            brushes = _sample_hue_brushes(len(Rs))
+            hexes = tm.get("Rs_hex")
+            if hexes and len(hexes) == len(Rs):
+                brushes = [pg.mkBrush(QColor(h)) for h in hexes]
+            else:
+                brushes = _sample_hue_brushes(len(Rs))
             self._samples_bars = pg.BarGraphItem(
                 x=np.arange(len(Rs)), height=Rs, width=1.0, brushes=brushes, pen=pg.mkPen(None))
             self.samples.addItem(self._samples_bars)

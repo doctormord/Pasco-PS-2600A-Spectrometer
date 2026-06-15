@@ -143,6 +143,10 @@
               <div class="lbl">CRI R1 – R15</div>
               <div id="cri-bars" class="bars"></div>
             </div>
+            <div class="cri-patches-wrap">
+              <div class="lbl">Reference vs. test appearance (hover for ΔE*ab)</div>
+              <div id="cri-patches" class="cri-patches"></div>
+            </div>
             <button id="btn-cie-csv" class="full" title="Save the current colorimetry results (CCT, Duv, x/y, Ra, R1–R15, …) as a CSV report">Save colorimetry report (CSV)</button>
           </div>
         </div>
@@ -325,14 +329,9 @@
                 title="Moving-average over a window of pixels along the wavelength axis. De-noises the trace, including the fixed-pattern structure temporal smoothing can't remove. Wider window = smoother but broader, lower peaks (resolution loss)."></span></div>
         <div class="row"><label>Spatial width <span>px</span></label>
           <input type="number" id="cfg-spatial_smoothing_width" min="3" max="51" step="2" value="5" /></div>
-        <div class="row"><label>Response correction</label>
-          <select id="response-correction-select"
-                  title="Per-pixel spectral response correction for this device. None = no correction (raw counts). Device default = the driver's built-in sensitivity table (if any). Or pick a saved profile measured for a specific fibre/optical setup. Profiles are created in the desktop app's calibration wizard and shared via calibration_profiles.json.">
-            <option value="None">None</option>
-          </select></div>
-        <div class="row"><label>Manage profile</label>
-          <button id="btn-response-delete" class="mini-btn"
-                  title="Delete the currently selected response-correction profile for this device.">Delete</button></div>
+        <div class="row"><label>Response compensation</label>
+          <span class="toggle" data-key="spectral_response_compensation"
+                title="Apply the device spectral-response correction curve (no-op for devices without a response table)."></span></div>
       </details>
 
       <details class="section">

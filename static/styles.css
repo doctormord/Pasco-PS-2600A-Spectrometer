@@ -478,6 +478,26 @@ button.full { width: calc(100% - 28px); margin: 8px 14px 0 14px; display: block;
 }
 .cri-bars .bar-val { color: var(--fg-1); text-align: right; }
 
+/* CRI Ref/Test colour-patch panel */
+.cie-block .cri-patches-wrap { grid-column: 1 / -1; }
+.cri-patches-wrap .lbl {
+  color: var(--fg-3); font-size: 10px; letter-spacing: 1.5px; margin-bottom: 8px;
+}
+.cri-patches {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px;
+}
+.cri-patches .patch-col {
+  display: flex; flex-direction: column; gap: 2px; align-items: stretch;
+}
+.cri-patches .patch {
+  height: 22px; background: var(--bg-2); border-radius: 2px;
+}
+.cri-patches .patch-test { border-radius: 2px; }
+.cri-patches .patch-lbl {
+  text-align: center; font: 500 8px var(--font-mono); color: var(--fg-3);
+  margin-top: 1px;
+}
+
 /* ───────────── Sidebar mobile toggle ───────────── */
 .sidebar-toggle {
   position: fixed; right: 14px; bottom: 50px;
