@@ -30,7 +30,7 @@ matplotlib>=3.7
 # On Windows: the device uses the default HID driver — no Zadig needed.
 # On Linux: run once:  sudo cp udev/99-pasco-ps2600a.rules /etc/udev/rules.d/
 #           then add a matching rule for VID_E220 PID_0100 if not present.
-# hid>=0.15.0
+# hidapi>=0.15.0
 
 # --- Web GUI (web_server.py) ---
 # FastAPI server + uvicorn ASGI server, accessed from a browser on the same WiFi.
