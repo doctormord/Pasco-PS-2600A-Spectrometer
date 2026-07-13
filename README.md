@@ -12,7 +12,7 @@ Supported back-ends:
 |---|---|---|---|---|
 | **PASCO PS-2600A** | WinUSB (Zadig) / libusb on macOS·Linux | 3648 | 12-bit | ~300–1085 nm |
 | **Ocean HDX-UV-VIS** | libusb (`libusb-package`), Ocean Binary Protocol | 2068 | 16-bit | 346–929 nm |
-| **ASEQ / Lasertack LR-2T** | HID (`hid`) | 3653 | 16-bit | 297–981 nm |
+| **ASEQ / Lasertack LR-2T** | HID (`hidapi`) | 3653 | 16-bit | 297–981 nm |
 | **Demo (virtual)** | none — pure numpy | 2048 | 16-bit | 340–850 nm |
 
 The **Demo (virtual)** device needs no hardware, so the entire application — every
@@ -164,7 +164,7 @@ pip install -r requirements.txt
 Required: PyQt6, pyqtgraph, numpy, scipy. Optional but recommended:
 **colour-science** (enables the TM-30/CQS sub-tab and `/api/tm30`),
 **matplotlib** (CIE diagram fill + PDF/PNG reports). Hardware extras:
-`pyusb` + `libusb-package` (Ocean HDX), `hid` (LR-2T); the web server also needs
+`pyusb` + `libusb-package` (Ocean HDX), `hidapi` (LR-2T); the web server also needs
 `fastapi`, `uvicorn`, `websockets`.
 
 ### Per-device driver notes
@@ -174,7 +174,7 @@ Required: PyQt6, pyqtgraph, numpy, scipy. Optional but recommended:
   `apt install libusb-1.0-0`).
 - **Ocean HDX** — `pip install pyusb libusb-package` (the latter bundles libusb,
   so no system install is needed). Linux: udev rule for VID `2457` / PID `2003`.
-- **LR-2T** — `pip install hid`. Windows uses the default HID driver (no Zadig).
+- **LR-2T** — `pip install hidapi`. Windows uses the default HID driver (no Zadig).
 - **Demo** — nothing to install.
 
 On Linux, install the bundled udev rule once for non-root USB access:
