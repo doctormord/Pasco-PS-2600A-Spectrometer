@@ -37,7 +37,7 @@ pip install -r requirements.txt
 | **colour-science** | TM-30/CQS | enables the *TM-30 · CQS* sub-tab and `/api/tm30`; everything else works without it |
 | **matplotlib** | reports + CIE fill | PDF/PNG colour & filter reports, CIE diagram fill; CSV export works without it |
 | pyusb + libusb-package | Ocean HDX | `libusb-package` bundles libusb — no system libusb needed |
-| hid | LR-2T | Windows uses the default HID driver (no Zadig) |
+| hidapi | LR-2T | Windows uses the default HID driver (no Zadig) |
 
 The **Demo** device needs only numpy, so the app always runs even with no
 hardware and no optional packages.
@@ -69,7 +69,7 @@ access (see the udev step under Linux).
 ### ASEQ / Lasertack LR-2T
 
 ```bash
-pip install hid
+pip install hidapi
 ```
 
 On Windows the device uses the default HID driver — no Zadig. On Linux a udev
