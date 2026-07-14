@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QLineEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QTabWidget, QWidget, QMessageBox, QFileDialog, QAbstractItemView,
+    QCheckBox,
 )
 
 import calibration_profiles as calprof
@@ -145,6 +146,8 @@ class CalibrationDialog(QDialog):
 
         # captured data
         self._wl_capture = None          # (wl, inten) of the line lamp
+        self._wl_peaks = None            # cached sub-pixel peaks of the capture
+        self._resume_after_capture = False  # re-pause the device after a capture
         self._wl_pairs = []              # [(pixel, known_nm)]
         self._wl_last_fit = None         # dict from calibrate_from_lines
         self._ref = None                 # (wl, inten) response reference
@@ -175,6 +178,22 @@ class CalibrationDialog(QDialog):
     def _capture_frames(self) -> int:
         from app_config import Config
         return max(1, int(Config.get("calibration_capture_frames", 16)))
+
+    def _resume_for_capture(self) -> None:
+        """A live capture needs fresh frames; if the user left acquisition
+        paused, resume it now and remember to re-pause when the capture ends."""
+        dash = self.dash
+        if hasattr(dash, "is_measurement_paused") and dash.is_measurement_paused():
+            self._resume_after_capture = True
+            dash.set_measurement_paused(False)
+        else:
+            self._resume_after_capture = False
+
+    def _restore_pause_after_capture(self) -> None:
+        if self._resume_after_capture:
+            self._resume_after_capture = False
+            if hasattr(self.dash, "set_measurement_paused"):
+                self.dash.set_measurement_paused(True)
 
     def _style_cal_plot(self, plot, default_x=(300.0, 1050.0)):
         """Match the app chrome and fix the empty-plot axis.
@@ -258,11 +277,24 @@ class CalibrationDialog(QDialog):
         top.addWidget(QLabel("Lamp:"))
         self.cmb_lamp = QComboBox()
         self.cmb_lamp.addItems(list(calprof.CALIBRATION_LINES.keys()))
+        # Selecting a lamp re-assigns lines against the last capture (no re-measure).
+        self.cmb_lamp.currentIndexChanged.connect(self._wl_rematch)
         top.addWidget(self.cmb_lamp)
         top.addSpacing(12)
         top.addWidget(QLabel("Degree:"))
         self.spn_degree = QSpinBox(); self.spn_degree.setRange(2, 3); self.spn_degree.setValue(3)
         top.addWidget(self.spn_degree)
+        top.addSpacing(12)
+        # Multi-lamp: when checked, a Capture or a lamp switch ADDS its matched
+        # lines to the table instead of replacing it — so you can build a
+        # full-span fit from several lamps (Cd+Hg, then Ne/Ar) sequentially.
+        self.chk_accum = QCheckBox("Add to existing (multi-lamp)")
+        self.chk_accum.setToolTip(
+            "Off: each capture / lamp replaces the line table (single lamp).\n"
+            "On: each capture or lamp switch appends its lines, so you can\n"
+            "combine several lamps into one full-range fit. Pixel positions are\n"
+            "stable across a lamp swap, so mixing lamps in one fit is correct.")
+        top.addWidget(self.chk_accum)
         top.addStretch(1)
         self.btn_wl_capture = QPushButton("Capture && detect peaks")
         self.btn_wl_capture.clicked.connect(self._wl_capture_clicked)
@@ -331,6 +363,7 @@ class CalibrationDialog(QDialog):
             return
         self.btn_wl_capture.setEnabled(False)
         self.btn_wl_capture.setText("Capturing…")
+        self._resume_for_capture()
         self._cap = _Capturer(self.dash, self._capture_frames(), self.lbl_wl_result,
                               self._wl_capture_done)
         self._cap.start()
@@ -338,24 +371,67 @@ class CalibrationDialog(QDialog):
     def _wl_capture_done(self, wl, inten):
         self.btn_wl_capture.setEnabled(True)
         self.btn_wl_capture.setText("Capture && detect peaks")
+        self._restore_pause_after_capture()
         self._wl_capture = (wl, inten)
         if float(np.max(inten)) < 1.0:
+            self._wl_peaks = None
             self.lbl_wl_result.setText(
                 "<b>Captured signal is ~0.</b> Is the lamp on and the exposure set?")
             return
-        # detect peaks in pixel space
-        peaks = calprof.detect_peaks(inten, min_distance_px=10)
+        # detect peaks once; keep them so switching the lamp dropdown can
+        # re-assign against the SAME capture without re-measuring.
+        self._wl_peaks = calprof.detect_peaks(inten, min_distance_px=10)
+        self._wl_rematch()
+
+    def _wl_merge_pairs(self, pairs, dedup_px: float = 4.0):
+        """Add (pixel, nm) pairs to the table, skipping any whose pixel is within
+        dedup_px of a row already present (so re-matching the same lamp, or an
+        overlapping line from another lamp, doesn't duplicate a row). Returns the
+        number actually added."""
+        existing = [p for p, _ in self._wl_table_pairs()]
+        added = 0
+        for px, nm in pairs:
+            if any(abs(px - e) <= dedup_px for e in existing):
+                continue
+            self._wl_add_row(px, nm)
+            existing.append(px)
+            added += 1
+        return added
+
+    def _wl_rematch(self):
+        """(Re)assign the selected lamp's known lines to the peaks of the last
+        capture. Wired to the lamp dropdown so picking a lamp pulls that lamp's
+        lines. With 'Add to existing' checked, the matches are APPENDED (build a
+        multi-lamp fit); otherwise they REPLACE the table (single lamp)."""
+        if self._wl_capture is None or not getattr(self, "_wl_peaks", None):
+            return
+        wl, _inten = self._wl_capture
+        peaks = self._wl_peaks
         lamp = self.cmb_lamp.currentText()
         known = [k for k in calprof.CALIBRATION_LINES[lamp]
                  if wl[0] <= k <= wl[-1]]
-        pairs = calprof.auto_match_lines(peaks, wl, known, tol_nm=6.0)
-        self.tbl_wl.setRowCount(0)
-        for px, nm in pairs:
-            self._wl_add_row(px, nm)
+        pairs = calprof.auto_match_lines(peaks, wl, known, tol_nm=8.0)
+        accum = self.chk_accum.isChecked()
+        if accum:
+            added = self._wl_merge_pairs(pairs)
+        else:
+            self.tbl_wl.setRowCount(0)
+            for px, nm in pairs:
+                self._wl_add_row(px, nm)
+            added = len(pairs)
         self._wl_redraw_plot(peaks)
+        total = self.tbl_wl.rowCount()
+        dropped = len(known) - len(pairs)
+        note = (f", {dropped} skipped (no clean peak)" if dropped > 0 else "")
+        verb = f"added {added}" if accum else f"assigned {len(pairs)}"
         self.lbl_wl_result.setText(
-            f"Detected {len(peaks)} peaks, auto-assigned {len(pairs)} of "
-            f"{len(known)} {lamp} lines in range. Check/edit the table, then Fit.")
+            f"Detected {len(peaks)} peaks; {verb} of {len(known)} {lamp} "
+            f"lines in range{note}. Table now holds {total} line(s). "
+            + ("Switch lamp / recapture with another lamp to add more, then Fit. "
+               if accum else
+               "Tick 'Add to existing' to combine several lamps (Cd+Hg, then "
+               "Ne/Ar for the red/NIR end) into one full-span fit. ")
+            + "Edit the table if needed, then Fit.")
 
     def _wl_redraw_plot(self, peaks=None, wl_fit=None):
         self.plot_wl.clear()
@@ -507,11 +583,14 @@ class CalibrationDialog(QDialog):
     def _ref_capture(self):
         if not self._is_streaming():
             QMessageBox.warning(self, "Not connected", "Connect a device first."); return
+        self._resume_for_capture()
         self._cap = _Capturer(self.dash, self._capture_frames(), self.lbl_resp_status,
                               lambda wl, it: self._set_ref(wl, it, "live"))
         self._cap.start()
 
     def _set_ref(self, wl, inten, src):
+        if src == "live":
+            self._restore_pause_after_capture()
         self._ref = (wl, inten)
         self.lbl_ref.setText(f"{src}: {len(wl)} pts, {wl[0]:.0f}–{wl[-1]:.0f} nm, "
                              f"peak {float(np.max(inten)):.0f}")
@@ -539,11 +618,13 @@ class CalibrationDialog(QDialog):
     def _meas_capture(self):
         if not self._is_streaming():
             QMessageBox.warning(self, "Not connected", "Connect a device first."); return
+        self._resume_for_capture()
         self._cap = _Capturer(self.dash, self._capture_frames(), self.lbl_resp_status,
                               self._set_meas)
         self._cap.start()
 
     def _set_meas(self, wl, inten):
+        self._restore_pause_after_capture()
         self._meas = (wl, inten)
         self.lbl_meas.setText(f"{self._device_name()}: {len(wl)} pts, "
                               f"{wl[0]:.0f}–{wl[-1]:.0f} nm, peak {float(np.max(inten)):.0f}")

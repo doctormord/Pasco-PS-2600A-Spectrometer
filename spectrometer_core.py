@@ -56,7 +56,8 @@ REFERENCE_LIBRARY_FILENAME = "reference_spectra.csv"
 def ensure_reference_library_exists():
     """
     Generates reference_spectra.csv.
-    Regenerated when "Solar AM1.5G" column is absent (version sentinel).
+    Regenerated when "Tungsten 2856K (Illuminant A)" column is absent
+    (version sentinel — bump this string whenever columns are added).
 
     Normalisation strategy
     ----------------------
@@ -72,7 +73,7 @@ def ensure_reference_library_exists():
     so the reference always fits the current measurement regardless of
     signal level.
     """
-    sentinel_col = "Solar AM1.5G"
+    sentinel_col = "Tungsten 2856K (Illuminant A)"
     if os.path.exists(REFERENCE_LIBRARY_FILENAME):
         try:
             with open(REFERENCE_LIBRARY_FILENAME, newline="") as f:
@@ -181,6 +182,22 @@ def ensure_reference_library_exists():
         # Blackbody 5778 K envelope with key Fraunhofer absorption lines
         # and atmospheric bands, normalised to 1.0 at ~550 nm.
         "Solar AM1.5G": [],   # generated analytically below
+        # ── Incandescent / thermal sources (Planckian, no lines) ──────────
+        # Continuous blackbody-like emitters. Each is a Planck curve at its
+        # colour temperature (tungsten filament ≈ graybody), rising steadily
+        # toward the red/NIR — the classic warm-source shape. Generated below.
+        "Incandescent 2700K":            [],   # classic household bulb (Glühlampe)
+        "Tungsten 2856K (Illuminant A)": [],   # CIE Standard Illuminant A
+        "Halogen 3000K":                 [],   # typical halogen
+        "Halogen 3200K":                 [],   # studio / photographic tungsten-halogen
+    }
+
+    # Colour temperatures (K) for the Planckian thermal sources above.
+    BLACKBODY_SOURCES = {
+        "Incandescent 2700K":            2700.0,
+        "Tungsten 2856K (Illuminant A)": 2856.0,
+        "Halogen 3000K":                 3000.0,
+        "Halogen 3200K":                 3200.0,
     }
 
     # Normalisation groups — spectra within a group share the same
@@ -197,6 +214,12 @@ def ensure_reference_library_exists():
          "LED Yellow", "LED Amber", "LED Orange", "LED Red"],
         ["LED White Warm", "LED White Neutral", "LED White Cool"],
         ["Solar AM1.5G"],
+        # Each thermal source normalised to its own peak so it fills the plot
+        # (the overlay is rescaled to the live Y-max, which assumes peak = 1.0).
+        ["Incandescent 2700K"],
+        ["Tungsten 2856K (Illuminant A)"],
+        ["Halogen 3000K"],
+        ["Halogen 3200K"],
     ]
 
     generic_waves = np.arange(300.0, 1100.5, 0.5)
@@ -277,11 +300,25 @@ def ensure_reference_library_exists():
             spd /= ref
         return np.clip(spd, 0.0, None)
 
+    def _planck(waves, T):
+        """Relative Planck spectral radiance at temperature T (K) over waves
+        (nm). Absolute scale is irrelevant — the caller normalises. Used for
+        tungsten/halogen/incandescent references (tungsten ≈ graybody, so the
+        Planckian shape is the standard approximation; Illuminant A is defined
+        exactly as a 2856 K Planckian radiator)."""
+        h, c, k = 6.626e-34, 3.0e8, 1.381e-23
+        lam = np.asarray(waves, dtype=float) * 1e-9
+        with np.errstate(over="ignore", invalid="ignore"):
+            rad = (2 * h * c**2 / lam**5) / (np.exp(h * c / (lam * k * T)) - 1.0)
+        return np.where(np.isfinite(rad), rad, 0.0)
+
     # ── Render all spectra ─────────────────────────────────────────────────
     rendered = {}
     for name, peaks in spectral_defs.items():
         if name == "Solar AM1.5G":
             rendered[name] = _solar_am15(generic_waves)
+        elif name in BLACKBODY_SOURCES:
+            rendered[name] = _planck(generic_waves, BLACKBODY_SOURCES[name])
         else:
             rendered[name] = _render(peaks, generic_waves)
 

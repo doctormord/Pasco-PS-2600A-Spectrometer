@@ -48,7 +48,7 @@ from calibration_utils import (
 # Used to pre-fill the wizard's line-assignment table. Broad phosphor/LED bands
 # are intentionally excluded — only sharp lines make good calibration anchors.
 
-CALIBRATION_LINES: dict[str, list[float]] = {
+CALIBRATION_ELEMENT_LINES: dict[str, list[float]] = {
     "Mercury (Hg)": [365.0, 404.7, 435.8, 546.1, 576.9, 579.1],
     "Cadmium (Cd)": [346.6, 361.1, 467.8, 480.0, 508.6, 643.8],
     "Neon (Ne)":    [585.2, 594.5, 607.4, 614.3, 640.2, 650.6,
@@ -63,6 +63,41 @@ CALIBRATION_LINES: dict[str, list[float]] = {
                      823.2, 828.0, 834.7, 880.0],
     "Sodium (Na)":  [589.0, 589.6],
     "Hydrogen (H)": [410.2, 434.0, 486.1, 656.3],
+}
+
+
+def _combine_lines(*element_keys: str, min_sep_nm: float = 1.5) -> list[float]:
+    """Union of several elements' lines, sorted, with lines closer than
+    min_sep_nm collapsed to one. Two known lines that fall inside the same
+    detector peak can't be assigned separately (that's the exact trap that
+    produces impossible matches), so near-coincident lines are merged."""
+    lines = sorted(l for k in element_keys for l in CALIBRATION_ELEMENT_LINES[k])
+    merged: list[float] = []
+    for l in lines:
+        if not merged or (l - merged[-1]) >= min_sep_nm:
+            merged.append(l)
+    return merged
+
+
+# Combination lamps (single bulb containing several fill gases/metals, or a
+# common pen-ray pairing). Selecting one matches ALL its elements against one
+# capture in a single step — no need to switch lamps in the wizard.
+CALIBRATION_COMBO_LINES: dict[str, list[float]] = {
+    "Cadmium-Mercury (Cd/Hg)":      _combine_lines("Cadmium (Cd)", "Mercury (Hg)"),
+    "Mercury-Argon (Hg/Ar)":        _combine_lines("Mercury (Hg)", "Argon (Ar)"),
+    "Mercury-Neon (Hg/Ne)":         _combine_lines("Mercury (Hg)", "Neon (Ne)"),
+    "Neon-Argon (Ne/Ar)":           _combine_lines("Neon (Ne)", "Argon (Ar)"),
+    "Argon-Krypton (Ar/Kr)":        _combine_lines("Argon (Ar)", "Krypton (Kr)"),
+    "Mercury-Cadmium-Argon (Hg/Cd/Ar)":
+        _combine_lines("Mercury (Hg)", "Cadmium (Cd)", "Argon (Ar)"),
+    "Mercury-Neon-Argon (Hg/Ne/Ar)":
+        _combine_lines("Mercury (Hg)", "Neon (Ne)", "Argon (Ar)"),
+}
+
+# Public list the wizard reads: pure elements first, then combination lamps.
+CALIBRATION_LINES: dict[str, list[float]] = {
+    **CALIBRATION_ELEMENT_LINES,
+    **CALIBRATION_COMBO_LINES,
 }
 
 
@@ -83,7 +118,10 @@ def detect_peaks(
 
     Returns fractional pixel positions, strongest peak first.
 
-    prominence defaults to 2 % of the spectrum's dynamic range if not given.
+    prominence defaults to 0.4 % of the spectrum's dynamic range if not given.
+    (A high default like 2 % of a range dominated by one very strong line
+    silently drops genuine but weaker calibration lines — e.g. Hg 404.7 next to
+    a 50 000-ADC line — so the wizard then can't anchor those and mis-assigns.)
     """
     from scipy.signal import find_peaks
 
@@ -92,7 +130,7 @@ def detect_peaks(
         return []
     if prominence is None:
         rng = float(np.nanmax(y) - np.nanmin(y))
-        prominence = max(rng * 0.02, 1.0)
+        prominence = max(rng * 0.004, 1.0)
 
     idx, _ = find_peaks(
         y, prominence=prominence, distance=max(1, int(min_distance_px))
@@ -112,41 +150,115 @@ def detect_peaks(
     return [p for p, _ in refined[:max_peaks]]
 
 
+def _assign_nearest(peak_nm, known_nm, tol_nm):
+    """Globally pair known lines to peaks by ascending distance (nearest pair
+    first), each peak and each line used at most once. Order-independent, unlike
+    a per-line greedy scan — so a bright peak from another element in the same
+    lamp can't 'steal' a line just because that line was listed first.
+
+    Returns {known_index: peak_index}.
+    """
+    cand = [
+        (abs(pnm - k), ki, pj)
+        for ki, k in enumerate(known_nm)
+        for pj, pnm in enumerate(peak_nm)
+        if abs(pnm - k) <= tol_nm
+    ]
+    cand.sort()
+    used_k: set[int] = set()
+    used_p: set[int] = set()
+    out: dict[int, int] = {}
+    for _d, ki, pj in cand:
+        if ki in used_k or pj in used_p:
+            continue
+        used_k.add(ki)
+        used_p.add(pj)
+        out[ki] = pj
+    return out
+
+
 def auto_match_lines(
     peak_px,
     wl_axis,
     known_nm,
-    tol_nm: float = 6.0,
+    tol_nm: float = 8.0,
+    *,
+    max_resid_nm: float = 1.2,
+    min_keep: int = 4,
+    reject_nm: float = 2.5,
 ) -> list[tuple[float, float]]:
     """
-    Greedily pair detected peak pixel positions with known line wavelengths,
-    using the *current* (approximate) wavelength axis to evaluate proximity.
+    Pair detected peak pixel positions with known line wavelengths, robustly.
 
-    Each known line is matched to its nearest unused peak within tol_nm.
+    The old version matched each known line to its nearest unused peak on the
+    *current* (approximate) axis, in list order. Two failure modes bit us:
+      • A known line with NO real peak in the spectrum (e.g. Cd 361.1 on a lamp
+        that doesn't show it) grabbed an unrelated nearby peak within tol —
+        producing a geometrically impossible pair (two lines 14 nm apart mapped
+        to pixels 2 px apart) that then skewed the whole fit and made the axis
+        "run apart" at the ends.
+      • On a coarse start axis (off by ~tol at the ends), the tight tol dropped
+        or mis-assigned the extreme lines, leaving the fit unconstrained there.
 
-    Returns [(pixel_position, known_wavelength_nm), ...] suitable for
-    calibrate_from_lines(..., pixel_positions=...).
+    This version:
+      1. Global nearest-first assignment (order-independent) at a generous tol.
+      2. One provisional low-degree refit to recentre the axis, then re-assign —
+         so end lines that the coarse start axis pushed just out of tol come back.
+      3. Robust trim: fit, drop the single worst-residual pair while the max
+         residual exceeds max_resid_nm and > min_keep pairs remain. This is what
+         removes the impossible/absent-line matches instead of trusting them.
+
+    Returns [(pixel_position, known_wavelength_nm), ...] sorted by pixel,
+    suitable for calibrate_from_lines(..., pixel_positions=...).
     """
     wl_axis = np.asarray(wl_axis, dtype=float)
     n = len(wl_axis)
     px_axis = np.arange(n, dtype=float)
-    peak_nm = [float(np.interp(p, px_axis, wl_axis)) for p in peak_px]
+    peak_px = np.asarray(peak_px, dtype=float)
+    if peak_px.size == 0 or len(known_nm) == 0:
+        return []
 
-    pairs: list[tuple[float, float]] = []
-    used: set[int] = set()
-    # Match brighter/known lines first by iterating in the order given.
-    for k in known_nm:
-        best_j, best_d = None, tol_nm
-        for j, pnm in enumerate(peak_nm):
-            if j in used:
-                continue
-            d = abs(pnm - k)
-            if d < best_d:
-                best_d, best_j = d, j
-        if best_j is not None:
-            used.add(best_j)
-            pairs.append((float(peak_px[best_j]), float(k)))
-    # Sort by pixel position for a tidy table.
+    def peaks_to_nm(axis_of_px):
+        return [float(v) for v in axis_of_px(peak_px)]
+
+    cur_axis = lambda p: np.interp(p, px_axis, wl_axis)
+
+    m = _assign_nearest(peaks_to_nm(cur_axis), known_nm, tol_nm)
+
+    # provisional recentre so the extreme lines get a fair second assignment
+    if len(m) >= 3:
+        xs = np.array([peak_px[pj] for pj in m.values()])
+        ys = np.array([known_nm[ki] for ki in m.keys()])
+        deg = min(3, len(m) - 1)
+        coeffs = np.polyfit(xs, ys, deg)
+        refit_axis = lambda p, c=coeffs: np.polyval(c, p)
+        m = _assign_nearest(peaks_to_nm(refit_axis), known_nm, tol_nm)
+
+    pairs = [(float(peak_px[pj]), float(known_nm[ki])) for ki, pj in m.items()]
+
+    # robust trim: discard the worst geometric outlier until the fit is clean
+    while len(pairs) > max(min_keep, 2):
+        xs = np.array([p for p, _ in pairs])
+        ys = np.array([w for _, w in pairs])
+        deg = min(3, len(pairs) - 1)
+        coeffs = np.polyfit(xs, ys, deg)
+        resid = np.polyval(coeffs, xs) - ys
+        worst = int(np.argmax(np.abs(resid)))
+        if abs(resid[worst]) <= max_resid_nm:
+            break
+        pairs.pop(worst)
+
+    # Final consistency guard: if a well-populated set still can't be fit to
+    # within reject_nm, the lines almost certainly don't belong to this capture
+    # (e.g. a lamp selected that isn't the one measured). Return nothing rather
+    # than inject bogus rows — important for the multi-lamp 'add' workflow.
+    if len(pairs) >= max(min_keep, 4):
+        xs = np.array([p for p, _ in pairs])
+        ys = np.array([w for _, w in pairs])
+        coeffs = np.polyfit(xs, ys, min(3, len(pairs) - 1))
+        if float(np.max(np.abs(np.polyval(coeffs, xs) - ys))) > reject_nm:
+            return []
+
     pairs.sort(key=lambda t: t[0])
     return pairs
 

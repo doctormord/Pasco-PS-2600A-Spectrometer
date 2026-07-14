@@ -1395,6 +1395,20 @@ class DashboardWindow(QMainWindow):
             self.hardware_thread.is_measurement_paused = paused
         self._set_pause_button_state(paused)
 
+    def is_measurement_paused(self) -> bool:
+        """Whether live acquisition is currently paused."""
+        return bool(getattr(self, "_is_paused", False))
+
+    def set_measurement_paused(self, paused: bool) -> None:
+        """Set the paused state explicitly (used by the calibration wizard to
+        resume streaming for a live capture, then restore the prior state).
+        No-op if nothing is connected."""
+        paused = bool(paused)
+        self._is_paused = paused
+        if self.hardware_thread:
+            self.hardware_thread.is_measurement_paused = paused
+        self._set_pause_button_state(paused)
+
     def _set_pause_button_state(self, paused: bool) -> None:
         if paused:
             self.button_pause.setText("▶  START")
