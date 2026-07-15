@@ -206,6 +206,7 @@ class LasertrackLR2T(BaseSpectrometer):
     PIXEL_COUNT           = ASEQ_PIXEL_COUNT
     WL_MIN_NM             = 297.0
     WL_MAX_NM             = 981.0
+    SPEC_CONFIG_PREFIX    = "lr2t"       # lr2t_spec_min_nm / lr2t_spec_max_nm
     SUPPORTS_OB           = False
     SUPPORTS_FAST_PREVIEW = True
     RESPONSE_TABLE        = None   # no response correction characterised yet

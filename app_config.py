@@ -84,6 +84,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Measure against known lines (e.g. Ne 640.2 nm) and adjust.
     "lr2t_wl_offset_nm": 0.0,
 
+    # ── Out-of-spec shading (per device) ──────────────────────────────────
+    # Wavelength range (nm) the manufacturer actually guarantees. The sensor
+    # still returns data outside it; the GUI and web UI shade those edges in
+    # translucent red. null (either bound) → that side is not shaded. Set these
+    # to your datasheet's guaranteed range. Demo has a built-in sample band.
+    "lr2t_spec_min_nm": None,
+    "lr2t_spec_max_nm": None,
+    "ocean_spec_min_nm": None,
+    "ocean_spec_max_nm": None,
+    "pasco_spec_min_nm": None,
+    "pasco_spec_max_nm": None,
+    "demo_spec_min_nm": 380.0,
+    "demo_spec_max_nm": 780.0,
+
     # ASEQ pixel order: False = device sends UV first (no flip needed).
     # Set to True if the spectrum appears mirrored after connecting.
     # ASQ_SPC5636146 confirmed: False is correct.

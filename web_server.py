@@ -113,6 +113,9 @@ class ServerState:
         self.ob_offset:        float      = DEFAULT_OB_CORRECTION_OFFSET
         self.adc_saturation:   float      = float(DEFAULT_ADC_SATURATION)
         self.supports_ob:      bool       = True
+        # Manufacturer-guaranteed wavelength range (nm) of the connected device;
+        # each bound may be None. Sent to the web client for out-of-spec shading.
+        self.spec_range_nm: tuple[float | None, float | None] = (None, None)
 
         # Latest processed state (held for WS broadcast + export)
         self.current_pixels: np.ndarray = np.zeros(self.pixel_count)
@@ -364,6 +367,11 @@ def _build_frame_payload(downsample: int = 1) -> dict:
         # meaningful. LR-2T / HDX have no OB — the value is an estimated
         # baseline (median of the darkest pixels) and Bias/Rate do not apply.
         "supports_ob": bool(state.supports_ob),
+        # Manufacturer-guaranteed range; the client shades data outside it.
+        "spec_min": (None if state.spec_range_nm[0] is None
+                     else round(float(state.spec_range_nm[0]), 2)),
+        "spec_max": (None if state.spec_range_nm[1] is None
+                     else round(float(state.spec_range_nm[1]), 2)),
         "dark_label": "OB mean" if state.supports_ob else "Baseline",
         "integration_us": int(state.latest_integration_us),
         "integration_ms": round(state.latest_integration_us / 1000.0, 2),
@@ -426,6 +434,10 @@ def _apply_device_params(backend: BaseSpectrometer, backend_name: str | None = N
     state.wavelength_array = wl
     state.pixel_count      = int(backend.PIXEL_COUNT)
     state.supports_ob      = bool(getattr(backend, "SUPPORTS_OB", False))
+    try:
+        state.spec_range_nm = tuple(getattr(backend, "spec_range_nm", (None, None)))
+    except Exception:
+        state.spec_range_nm = (None, None)
     state.adc_saturation   = float(getattr(backend, "ADC_SATURATION",
                                            DEFAULT_ADC_SATURATION))
 
@@ -463,6 +475,7 @@ def _reset_device_params() -> None:
     state.ob_offset        = DEFAULT_OB_CORRECTION_OFFSET
     state.adc_saturation   = float(DEFAULT_ADC_SATURATION)
     state.supports_ob      = True
+    state.spec_range_nm    = (None, None)
     state.current_pixels   = np.zeros(state.pixel_count)
     state.heatmap_linear_waves = np.linspace(
         state.wavelength_array[0], state.wavelength_array[-1], state.pixel_count)

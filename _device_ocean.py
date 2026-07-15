@@ -315,6 +315,7 @@ class OceanHDX(BaseSpectrometer):
     PIXEL_COUNT          = DEF_PIXEL_COUNT
     WL_MIN_NM            = 346.0
     WL_MAX_NM            = 929.0
+    SPEC_CONFIG_PREFIX   = "ocean"      # ocean_spec_min_nm / ocean_spec_max_nm
     SUPPORTS_OB          = False          # no optical-black pixels in raw mode
     RESPONSE_TABLE       = None           # filled from config if a table is provided
     SUPPORTS_FAST_PREVIEW = True          # FP: short exposure (trigger mode 0) + scaling

@@ -48,6 +48,36 @@ class BaseSpectrometer(ABC):
     SUPPORTS_FAST_PREVIEW: bool = False
     RESPONSE_TABLE = None
 
+    # Manufacturer-specified (guaranteed) wavelength range in nm. The sensor
+    # still returns data outside this, but the maker doesn't guarantee accuracy
+    # there — the GUI and web UI shade those edges. Subclasses set a config
+    # prefix; users override per device via '{prefix}_spec_min_nm' /
+    # '{prefix}_spec_max_nm'. Either bound None → that side isn't shaded.
+    SPEC_CONFIG_PREFIX:  str | None   = None
+    SPEC_MIN_NM_DEFAULT: float | None = None
+    SPEC_MAX_NM_DEFAULT: float | None = None
+
+    @property
+    def spec_range_nm(self) -> tuple[float | None, float | None]:
+        """(min_nm, max_nm) of the manufacturer-guaranteed range, each possibly
+        None. Read from config (falling back to the class defaults) so it can be
+        set per device without code changes."""
+        lo, hi = self.SPEC_MIN_NM_DEFAULT, self.SPEC_MAX_NM_DEFAULT
+        if self.SPEC_CONFIG_PREFIX:
+            try:
+                from app_config import Config
+                lo = Config.get(f"{self.SPEC_CONFIG_PREFIX}_spec_min_nm", lo)
+                hi = Config.get(f"{self.SPEC_CONFIG_PREFIX}_spec_max_nm", hi)
+            except Exception:
+                pass
+
+        def _num(v):
+            try:
+                return None if v is None or v == "" else float(v)
+            except (TypeError, ValueError):
+                return None
+        return (_num(lo), _num(hi))
+
     def __init__(
         self,
         *,

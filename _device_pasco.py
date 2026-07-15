@@ -569,6 +569,7 @@ class PascoPS2600A(BaseSpectrometer):
     PIXEL_COUNT           = PASCO_PIXEL_COUNT
     WL_MIN_NM             = float(PASCO_WAVELENGTH_ARRAY[0])
     WL_MAX_NM             = float(PASCO_WAVELENGTH_ARRAY[-1])
+    SPEC_CONFIG_PREFIX    = "pasco"      # pasco_spec_min_nm / pasco_spec_max_nm
     SUPPORTS_OB           = True
     SUPPORTS_FAST_PREVIEW = True
     RESPONSE_TABLE        = PASCO_RESPONSE_TABLE   # Nx2 array; GUI builds gain from this

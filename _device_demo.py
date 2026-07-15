@@ -167,6 +167,11 @@ class DemoSpectrometer(BaseSpectrometer):
     PIXEL_COUNT           = DEMO_PIXEL_COUNT
     WL_MIN_NM             = DEMO_WL_MIN_NM
     WL_MAX_NM             = DEMO_WL_MAX_NM
+    # Demo ships with a visible spec sub-band (380–780 nm inside its 340–850 nm
+    # data) so the out-of-spec shading is demonstrable without real hardware.
+    SPEC_CONFIG_PREFIX    = "demo"       # demo_spec_min_nm / demo_spec_max_nm
+    SPEC_MIN_NM_DEFAULT   = 380.0
+    SPEC_MAX_NM_DEFAULT   = 780.0
     SUPPORTS_OB           = False
     SUPPORTS_FAST_PREVIEW = True
     RESPONSE_TABLE        = None

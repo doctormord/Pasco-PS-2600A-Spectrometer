@@ -455,6 +455,29 @@ class DashboardWindow(QMainWindow):
             pen=pg.mkPen(QColor(T().WARN), width=1.5, style=Qt.PenStyle.DashLine))
         self.reference_curve.setVisible(False)
 
+        # ── Out-of-spec shading ────────────────────────────────────────────
+        # Two translucent-red bands mark where the device still returns data but
+        # the manufacturer no longer guarantees it (left of spec-min, right of
+        # spec-max). Filled to the plot edges (±1e9) and pinned behind the data;
+        # a thin brighter line marks the exact spec boundary. Positioned by
+        # _update_spec_overlay() from the connected device's spec_range_nm.
+        _spec_brush = pg.mkBrush(230, 60, 60, 10)
+        _spec_pen   = pg.mkPen(230, 60, 60, 80, width=1)
+        self.spec_region_lo = pg.LinearRegionItem(
+            values=(-1e9, -1e9), movable=False, brush=_spec_brush,
+            pen=pg.mkPen(None))
+        self.spec_region_hi = pg.LinearRegionItem(
+            values=(1e9, 1e9), movable=False, brush=_spec_brush,
+            pen=pg.mkPen(None))
+        # Boundary lines at the spec edges.
+        self.spec_line_lo = pg.InfiniteLine(angle=90, movable=False, pen=_spec_pen)
+        self.spec_line_hi = pg.InfiniteLine(angle=90, movable=False, pen=_spec_pen)
+        for _it in (self.spec_region_lo, self.spec_region_hi,
+                    self.spec_line_lo, self.spec_line_hi):
+            _it.setZValue(-100)          # behind spectrum, fill, overlays
+            _it.setVisible(False)
+            self.plot_canvas.addItem(_it, ignoreBounds=True)
+
         # ── Overlay cluster curves (CSV bg / freeze / diff / peak-hold /
         # persistence). All start hidden; driven per frame in _redraw_overlays().
         # Persistence trails sit BEHIND the live curve (negative Z), the rest on
@@ -1252,6 +1275,7 @@ class DashboardWindow(QMainWindow):
             self.combo_backend.setEnabled(False)
             self.button_scan.setEnabled(False)
             self.control_widget.setEnabled(True)
+            self._update_spec_overlay()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
 
@@ -1261,6 +1285,7 @@ class DashboardWindow(QMainWindow):
             self._deliberate_disconnect = True
             self.hardware_thread.disconnect()
             self.hardware_thread = None
+        self._update_spec_overlay()
         self.button_connect.setText("Connect")
         self.button_connect.setObjectName("primaryBtn")
         self.button_connect.style().unpolish(self.button_connect)
@@ -1766,6 +1791,54 @@ class DashboardWindow(QMainWindow):
         return (np.array(self.active_wavelengths, dtype=float),
                 np.array(self._pixels_pre_response, dtype=float))
 
+    def _update_spec_overlay(self) -> None:
+        """Position the out-of-spec shading from the connected device's
+        guaranteed range. Hidden when no device is connected or the range is
+        unset. Bands fill to the plot edges; boundary lines mark the exact
+        spec limits."""
+        lo = hi = None
+        bk = self.hardware_thread
+        if bk is not None:
+            try:
+                lo, hi = bk.spec_range_nm
+            except Exception:
+                lo = hi = None
+        show_lo = lo is not None
+        show_hi = hi is not None
+        if show_lo:
+            self.spec_region_lo.setRegion((-1e9, float(lo)))
+            self.spec_line_lo.setPos(float(lo))
+        if show_hi:
+            self.spec_region_hi.setRegion((float(hi), 1e9))
+            self.spec_line_hi.setPos(float(hi))
+        self.spec_region_lo.setVisible(show_lo)
+        self.spec_line_lo.setVisible(show_lo)
+        self.spec_region_hi.setVisible(show_hi)
+        self.spec_line_hi.setVisible(show_hi)
+
+    def sync_active_axis(self, wl) -> bool:
+        """Adopt a new per-pixel wavelength axis (after a live wavelength
+        calibration) and keep everything indexed by wavelength consistent with
+        it. Crucially this RE-INTERPOLATES the reference library onto the new
+        axis, so reference lines stay pinned to their TRUE wavelengths (Hg
+        546.1 nm stays at 546.1) instead of sliding along with the measured
+        spectrum — otherwise both move together and the fit can't be judged.
+        No-op if the axis is unchanged or the pixel count doesn't match.
+        Returns True if the axis was actually updated."""
+        wl = np.asarray(wl, dtype=float)
+        if wl.size != self.active_pixel_count or np.array_equal(
+                wl, self.active_wavelengths):
+            return False
+        self.active_wavelengths = wl
+        self.heatmap_linear_waves = np.linspace(
+            wl[0], wl[-1], self.active_pixel_count)
+        self._cie_mask = ((wl >= 380) & (wl <= 780))
+        self._rebuild_image_transform()
+        self._load_reference_library()          # reference back onto true nm
+        if self.combo_reference.currentText() != "None":
+            self._update_reference_curve_scale()
+        return True
+
     def open_calibration_dialog(self) -> None:
         from gui_calibration import CalibrationDialog
         dlg = CalibrationDialog(self)
@@ -1775,9 +1848,10 @@ class DashboardWindow(QMainWindow):
         self._refresh_response_combo()
         self.apply_response_correction()
         if self.hardware_thread is not None:
-            wl = self.hardware_thread.wavelength_array
-            if len(wl) == self.active_pixel_count:
-                self.active_wavelengths = wl
+            # Keep the reference library pinned to true wavelengths if the axis
+            # changed (also handled live during the fit — this covers the final
+            # state on close).
+            self.sync_active_axis(self.hardware_thread.wavelength_array)
 
     def _on_toolbar_peaks_toggled(self, checked: bool) -> None:
         self.is_peak_finding_enabled = checked

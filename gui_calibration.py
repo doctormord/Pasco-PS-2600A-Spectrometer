@@ -476,7 +476,14 @@ class CalibrationDialog(QDialog):
 
         # Honest quality report: residuals AND coverage / extrapolation.
         wl_new = backend.wavelength_array
-        self.dash.active_wavelengths = wl_new  # live preview on the main scope
+        # Live preview on the main scope. Route through sync_active_axis so the
+        # reference library is re-interpolated onto the new axis in the SAME
+        # step — otherwise the reference lines slide along with the spectrum in
+        # the background and the fit looks wrong even when it's right.
+        if hasattr(self.dash, "sync_active_axis"):
+            self.dash.sync_active_axis(wl_new)
+        else:
+            self.dash.active_wavelengths = wl_new
         self._wl_capture = (wl_new, self._wl_capture[1])  # re-plot on new axis
         self._wl_redraw_plot()
 
