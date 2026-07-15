@@ -34,6 +34,8 @@ const State = {
   referenceValues: null,     // active reference spectrum, normalised 0..1,
                              // aligned to the device wavelength axis (or null)
   referenceName: 'None',
+  specRange: { min: null, max: null },  // manufacturer-guaranteed range (nm);
+                             // data outside it is shaded on the scope.
   // Overlay cluster (client-only, reset on reload — these hold captured data
   // that can't meaningfully persist across a page load).
   overlay: { diff: false, peakHold: false, persist: false },
@@ -192,6 +194,9 @@ function handleFrame(msg) {
   // heatmap and CSV export read it too).
   State.scopeData[0] = msg.wavelengths;
   State.scopeData[1] = msg.intensities;
+  // Manufacturer-guaranteed range for out-of-spec shading (may be null).
+  if (msg.spec_min !== undefined) State.specRange.min = msg.spec_min;
+  if (msg.spec_max !== undefined) State.specRange.max = msg.spec_max;
   // Reference overlay: scale the normalised (0..1) library spectrum to 90% of
   // the current Y maximum so it always fits the displayed signal. Aligned to
   // the device axis at fetch time; null-filled (drawn as a gap) when off or on
@@ -323,6 +328,7 @@ function makeScopePlot() {
       y: { range: () => autoYRange() },
     },
     plugins: [
+      outOfSpecPlugin(),
       hoverReadoutPlugin(),
       measureModePlugin(),
       wheelZoomPlugin(),
@@ -401,6 +407,44 @@ function xRange() {
   // true) re-runs this every frame, so returning xView here makes the zoom
   // survive live updates instead of snapping back.
   return State.xView || configXRange();
+}
+
+// Shade the wavelength ranges the manufacturer doesn't guarantee (data still
+// arrives from the sensor, but accuracy isn't specified there). Drawn in the
+// drawClear hook so the translucent-red bands sit BEHIND the spectrum; a
+// brighter line marks the exact spec edge. Mirrors the desktop app's overlay.
+// Reads State.specRange, populated per frame from the server payload.
+function outOfSpecPlugin() {
+  return { hooks: { drawClear: u => {
+    const sr = State.specRange || {};
+    const lo = sr.min, hi = sr.max;
+    if (lo == null && hi == null) return;
+    const ctx = u.ctx;
+    const { left, top, width, height } = u.bbox;
+    const xmin = u.scales.x.min, xmax = u.scales.x.max;
+    if (xmin == null || xmax == null) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(230,60,60,0.13)';
+    // left band: from the plot's left edge up to spec-min
+    if (lo != null && lo > xmin) {
+      const x1 = Math.round(u.valToPos(Math.min(lo, xmax), 'x', true));
+      if (x1 > left) ctx.fillRect(left, top, x1 - left, height);
+    }
+    // right band: from spec-max to the plot's right edge
+    if (hi != null && hi < xmax) {
+      const x0 = Math.round(u.valToPos(Math.max(hi, xmin), 'x', true));
+      if (left + width > x0) ctx.fillRect(x0, top, left + width - x0, height);
+    }
+    // exact spec-edge boundary lines
+    ctx.strokeStyle = 'rgba(230,60,60,0.55)';
+    ctx.lineWidth = 1;
+    for (const val of [lo, hi]) {
+      if (val == null || val <= xmin || val >= xmax) continue;
+      const x = Math.round(u.valToPos(val, 'x', true)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + height); ctx.stroke();
+    }
+    ctx.restore();
+  } } };
 }
 
 // Mouse-wheel zoom on the x (wavelength) axis, centred on the cursor, matching
