@@ -424,7 +424,7 @@ function outOfSpecPlugin() {
     const xmin = u.scales.x.min, xmax = u.scales.x.max;
     if (xmin == null || xmax == null) return;
     ctx.save();
-    ctx.fillStyle = 'rgba(230,60,60,0.13)';
+    ctx.fillStyle = 'rgba(230,60,60,0.04)';
     // left band: from the plot's left edge up to spec-min
     if (lo != null && lo > xmin) {
       const x1 = Math.round(u.valToPos(Math.min(lo, xmax), 'x', true));
@@ -436,7 +436,7 @@ function outOfSpecPlugin() {
       if (left + width > x0) ctx.fillRect(x0, top, left + width - x0, height);
     }
     // exact spec-edge boundary lines
-    ctx.strokeStyle = 'rgba(230,60,60,0.55)';
+    ctx.strokeStyle = 'rgba(230,60,60,0.31)';
     ctx.lineWidth = 1;
     for (const val of [lo, hi]) {
       if (val == null || val <= xmin || val >= xmax) continue;
