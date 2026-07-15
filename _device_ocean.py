@@ -380,6 +380,7 @@ class OceanHDX(BaseSpectrometer):
 
         # Optional override polynomial (e.g. fit from emission lines).
         self.wl_poly_coeffs: list[float] | None = None
+        self._session_calibrated: bool = False
 
     # ── Config snapshot ─────────────────────────────────────────────────────
 
@@ -411,9 +412,9 @@ class OceanHDX(BaseSpectrometer):
             Config.get(CFG_FP_LONG_REFRESH_S, DEF_FP_LONG_REFRESH_S))
         self._n_pixels          = int(Config.get(CFG_PIXEL_COUNT, DEF_PIXEL_COUNT))
 
-        # Persisted wavelength polynomial from the wavelength wizard takes
-        # precedence over the device-reported coeffs in _rebuild_wavelength_axis
-        # (which prefers self.wl_poly_coeffs). null = use the device axis.
+        # Persisted wavelength polynomial from the wavelength wizard. It is used
+        # as the axis when ocean_use_device_wavelength is False (see
+        # _rebuild_wavelength_axis); null = no saved calibration.
         _persisted = Config.get("ocean_wl_poly_coeffs", None)
         if _persisted:
             self.wl_poly_coeffs = list(_persisted)
@@ -571,10 +572,26 @@ class OceanHDX(BaseSpectrometer):
         return float(Config.get(CFG_WL_OFFSET_NM, DEF_WL_OFFSET_NM))
 
     def _rebuild_wavelength_axis(self) -> None:
-        """Recompute the base wavelength axis from the active calibration."""
-        coeffs = self.wl_poly_coeffs or self._wl_coeffs
+        """Recompute the base wavelength axis from the active calibration.
+
+        Source is selectable:
+          • ocean_use_device_wavelength = True  → the device's own factory
+            coefficients (out-of-the-box behaviour).
+          • ocean_use_device_wavelength = False → your saved calibration from
+            config.json (ocean_wl_poly_coeffs).
+        Either way the other source is used as a fallback if the preferred one
+        is missing, and a linear fallback axis if neither exists. A fresh fit in
+        the wizard sets _session_calibrated, so the live preview always shows the
+        new calibration even while the flag still says 'device'; saving the fit
+        flips the flag so it persists across reconnects."""
         use_device = bool(Config.get(CFG_WL_FROM_DEVICE, DEF_WL_FROM_DEVICE))
-        if coeffs and use_device:
+        prefer_calibration = (not use_device) or getattr(
+            self, "_session_calibrated", False)
+        if prefer_calibration:
+            coeffs = self.wl_poly_coeffs or self._wl_coeffs
+        else:
+            coeffs = self._wl_coeffs or self.wl_poly_coeffs
+        if coeffs:
             self._wl_base = poly_wavelength_array(coeffs, self._n_pixels)
         else:
             lo = float(Config.get(CFG_WL_FALLBACK_MIN, DEF_WL_FALLBACK_MIN))
@@ -611,6 +628,7 @@ class OceanHDX(BaseSpectrometer):
             pixel_positions, known_wavelengths_nm, degree=degree,
             pixel_count=self._n_pixels)
         self.wl_poly_coeffs = coeffs
+        self._session_calibrated = True   # live preview prefers this fit
         self._rebuild_wavelength_axis()
 
         result = {

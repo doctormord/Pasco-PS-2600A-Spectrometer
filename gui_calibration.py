@@ -522,10 +522,18 @@ class CalibrationDialog(QDialog):
             return
         from app_config import Config
         Config.set(key, list(self._wl_last_fit["coeffs"]))
+        extra = ""
+        # The Ocean HDX defaults to its on-device factory axis; saving a
+        # calibration means "use mine now", so flip it to the config poly.
+        if dev == "Ocean HDX-UV-VIS":
+            Config.set("ocean_use_device_wavelength", False)
+            extra = ("<br>Switched 'ocean_use_device_wavelength' → false so "
+                     "this calibration is used instead of the device's factory "
+                     "axis. Set it back to true to revert to the device axis.")
         QMessageBox.information(
             self, "Saved",
             f"Wavelength calibration saved to '{key}'. It will load "
-            f"automatically on the next connect.")
+            f"automatically on the next connect.{extra}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  RESPONSE TAB
