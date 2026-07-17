@@ -477,6 +477,9 @@ class DashboardWindow(QMainWindow):
             _it.setZValue(-100)          # behind spectrum, fill, overlays
             _it.setVisible(False)
             self.plot_canvas.addItem(_it, ignoreBounds=True)
+        # Keep the bands reaching the plot edges as the user zooms/pans.
+        self.plot_canvas.getViewBox().sigXRangeChanged.connect(
+            lambda *a: self._update_spec_overlay())
 
         # ── Overlay cluster curves (CSV bg / freeze / diff / peak-hold /
         # persistence). All start hidden; driven per frame in _redraw_overlays().
@@ -1805,11 +1808,20 @@ class DashboardWindow(QMainWindow):
                 lo = hi = None
         show_lo = lo is not None
         show_hi = hi is not None
+        # Bound the bands to the current view (plus one span of margin) rather
+        # than ±1e9. Huge fixed bounds lose float precision when zoomed in very
+        # close and the fill can flip to the wrong side; view-relative bounds
+        # near the data scale stay stable while still reaching the plot edge.
+        try:
+            (vx0, vx1), _ = self.plot_canvas.getViewBox().viewRange()
+        except Exception:
+            vx0, vx1 = 0.0, 2000.0
+        pad = max(vx1 - vx0, 1.0)
         if show_lo:
-            self.spec_region_lo.setRegion((-1e9, float(lo)))
+            self.spec_region_lo.setRegion((vx0 - pad, float(lo)))
             self.spec_line_lo.setPos(float(lo))
         if show_hi:
-            self.spec_region_hi.setRegion((float(hi), 1e9))
+            self.spec_region_hi.setRegion((float(hi), vx1 + pad))
             self.spec_line_hi.setPos(float(hi))
         self.spec_region_lo.setVisible(show_lo)
         self.spec_line_lo.setVisible(show_lo)

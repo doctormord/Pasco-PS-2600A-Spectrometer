@@ -562,6 +562,23 @@ class OceanHDX(BaseSpectrometer):
 
     # ── Wavelength axis ──────────────────────────────────────────────────────
 
+    def wl_calibration_snapshot(self) -> dict:
+        return {
+            "base": np.asarray(self._wl_base, dtype=float).copy(),
+            "poly": None if self.wl_poly_coeffs is None else list(self.wl_poly_coeffs),
+            "sess": bool(getattr(self, "_session_calibrated", False)),
+        }
+
+    def wl_calibration_restore(self, snap: dict) -> None:
+        if not snap:
+            return
+        self._wl_base = np.asarray(snap["base"], dtype=float)
+        self.wl_poly_coeffs = None if snap["poly"] is None else list(snap["poly"])
+        self._session_calibrated = bool(snap["sess"])
+        wl = self.wavelength_array
+        self.WL_MIN_NM = float(wl[0])
+        self.WL_MAX_NM = float(wl[-1])
+
     @property
     def wavelength_array(self) -> np.ndarray:
         """Per-pixel wavelength in nm, including the live config offset."""

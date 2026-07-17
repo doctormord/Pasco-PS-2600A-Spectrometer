@@ -56,7 +56,7 @@ REFERENCE_LIBRARY_FILENAME = "reference_spectra.csv"
 def ensure_reference_library_exists():
     """
     Generates reference_spectra.csv.
-    Regenerated when "Tungsten 2856K (Illuminant A)" column is absent
+    Regenerated when "Cadmium-Mercury (Cd/Hg)" column is absent
     (version sentinel — bump this string whenever columns are added).
 
     Normalisation strategy
@@ -73,7 +73,7 @@ def ensure_reference_library_exists():
     so the reference always fits the current measurement regardless of
     signal level.
     """
-    sentinel_col = "Tungsten 2856K (Illuminant A)"
+    sentinel_col = "Cadmium-Mercury (Cd/Hg)"
     if os.path.exists(REFERENCE_LIBRARY_FILENAME):
         try:
             with open(REFERENCE_LIBRARY_FILENAME, newline="") as f:
@@ -200,6 +200,25 @@ def ensure_reference_library_exists():
         "Halogen 3200K":                 3200.0,
     }
 
+    # ── Combination lamps ────────────────────────────────────────────────
+    # Same set as the calibration wizard's combo lamps, so the reference
+    # library and the calibration dropdown offer identical multi-element
+    # sources. Each is the union of its elements' line lists.
+    _COMBO_REFS = {
+        "Cadmium-Mercury (Cd/Hg)":            ["Cadmium (Cd)", "Mercury (Hg)"],
+        "Mercury-Argon (Hg/Ar)":              ["Mercury (Hg)", "Argon (Ar)"],
+        "Mercury-Neon (Hg/Ne)":               ["Mercury (Hg)", "Neon (Ne)"],
+        "Neon-Argon (Ne/Ar)":                 ["Neon (Ne)", "Argon (Ar)"],
+        "Argon-Krypton (Ar/Kr)":              ["Argon (Ar)", "Krypton (Kr)"],
+        "Mercury-Cadmium-Argon (Hg/Cd/Ar)":   ["Mercury (Hg)", "Cadmium (Cd)", "Argon (Ar)"],
+        "Mercury-Neon-Argon (Hg/Ne/Ar)":      ["Mercury (Hg)", "Neon (Ne)", "Argon (Ar)"],
+    }
+    for _cname, _celems in _COMBO_REFS.items():
+        _clines = []
+        for _ce in _celems:
+            _clines.extend(spectral_defs[_ce])
+        spectral_defs[_cname] = _clines
+
     # Normalisation groups — spectra within a group share the same
     # 1.0-reference point so relative brightness is comparable.
     # Groups:  list of keys that belong together.
@@ -220,6 +239,8 @@ def ensure_reference_library_exists():
         ["Tungsten 2856K (Illuminant A)"],
         ["Halogen 3000K"],
         ["Halogen 3200K"],
+        # Each combination lamp normalised to its own peak.
+        *[[_k] for _k in _COMBO_REFS],
     ]
 
     generic_waves = np.arange(300.0, 1100.5, 0.5)

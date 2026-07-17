@@ -149,6 +149,11 @@ class CalibrationDialog(QDialog):
         self._wl_peaks = None            # cached sub-pixel peaks of the capture
         self._resume_after_capture = False  # re-pause the device after a capture
         self._wl_pairs = []              # [(pixel, known_nm)]
+        # Snapshot the axis as it is on open, so Close (without Save) discards any
+        # live preview and a rejected fit can be rolled back — no broken live view.
+        _bk = self._backend()
+        self._wl_open_snap = _bk.wl_calibration_snapshot() if _bk is not None else None
+        self._wl_saved = False
         self._wl_last_fit = None         # dict from calibrate_from_lines
         self._ref = None                 # (wl, inten) response reference
         self._meas = None                # (wl, inten) response measurement
@@ -299,6 +304,11 @@ class CalibrationDialog(QDialog):
         self.btn_wl_capture = QPushButton("Capture && detect peaks")
         self.btn_wl_capture.clicked.connect(self._wl_capture_clicked)
         top.addWidget(self.btn_wl_capture)
+        self.btn_wl_clear = QPushButton("Clear")
+        self.btn_wl_clear.setToolTip("Remove all assigned lines and the current "
+                                     "capture — start the lamp selection over.")
+        self.btn_wl_clear.clicked.connect(self._wl_clear_clicked)
+        top.addWidget(self.btn_wl_clear)
         v.addLayout(top)
 
         self.plot_wl = pg.PlotWidget()
@@ -433,6 +443,30 @@ class CalibrationDialog(QDialog):
                "Ne/Ar for the red/NIR end) into one full-span fit. ")
             + "Edit the table if needed, then Fit.")
 
+    def _wl_clear_clicked(self):
+        """Reset the line table and the current capture so the user can start
+        the lamp selection over (e.g. after picking the wrong lamp)."""
+        self.tbl_wl.setRowCount(0)
+        self._wl_capture = None
+        self._wl_peaks = None
+        self._wl_last_fit = None
+        self.btn_wl_save.setEnabled(False)
+        self.plot_wl.clear()
+        self.lbl_wl_result.setText("Cleared. Select a lamp and capture again.")
+
+    def closeEvent(self, ev):
+        """Closing without Save discards any live preview: roll the device axis
+        back to how it was on open so the live view is never left in a modified
+        (or broken) state. Save persists; Close cancels."""
+        try:
+            bk = self._backend()
+            if (bk is not None and not getattr(self, "_wl_saved", False)
+                    and self._wl_open_snap is not None):
+                bk.wl_calibration_restore(self._wl_open_snap)
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
     def _wl_redraw_plot(self, peaks=None, wl_fit=None):
         self.plot_wl.clear()
         if self._wl_capture is None:
@@ -460,6 +494,8 @@ class CalibrationDialog(QDialog):
             return
         pxs = [p for p, _ in pairs]
         nms = [n for _, n in pairs]
+        # Snapshot so we can roll back if the fit is bad.
+        snap = backend.wl_calibration_snapshot()
         try:
             res = backend.calibrate_from_lines(nms, pixel_positions=pxs, degree=deg)
         except Exception as e:
@@ -471,11 +507,42 @@ class CalibrationDialog(QDialog):
                 "This device does not support wavelength calibration "
                 "(its axis is fixed/virtual).")
             return
+
+        # ── Sanity guard ──────────────────────────────────────────────────
+        # A degree-3 fit through mis-assigned lines (wrong lamp, stray peak) can
+        # produce a wildly wrong axis — non-monotonic or with coefficients that
+        # flip the start wavelength to something absurd (e.g. +200 → −150 nm).
+        # Applying that breaks the live view. Validate first; roll back if bad.
+        wl_new = np.asarray(backend.wavelength_array, dtype=float)
+        max_res = float(res["max_error"])
+        monotonic = bool(np.all(np.diff(wl_new) > 0))
+        in_band = (120.0 < wl_new[0] < 1350.0) and (200.0 < wl_new[-1] < 1400.0)
+        if (not monotonic) or (not in_band) or (max_res > 8.0):
+            backend.wl_calibration_restore(snap)
+            if hasattr(self.dash, "sync_active_axis"):
+                self.dash.sync_active_axis(backend.wavelength_array)
+            self._wl_last_fit = None
+            self.btn_wl_save.setEnabled(False)
+            reasons = []
+            if not monotonic:
+                reasons.append("the wavelength axis comes out non-monotonic")
+            if not in_band:
+                reasons.append(f"the axis runs {wl_new[0]:.0f}–{wl_new[-1]:.0f} nm "
+                               f"(outside a plausible range)")
+            if max_res > 8.0:
+                reasons.append(f"the max residual is {max_res:.1f} nm")
+            self.lbl_wl_result.setText(
+                "<b style='color:#ff6060'>Fit rejected</b> — " + "; ".join(reasons)
+                + ". Almost always a mis-assigned line (wrong lamp, or a stray "
+                "peak matched to the wrong wavelength). The previous axis was "
+                "kept. Fix the table — remove bad rows or pick the right lamp — "
+                "then Fit again.")
+            self._wl_redraw_plot()
+            return
+
         self._wl_last_fit = res
         self.btn_wl_save.setEnabled(True)
 
-        # Honest quality report: residuals AND coverage / extrapolation.
-        wl_new = backend.wavelength_array
         # Live preview on the main scope. Route through sync_active_axis so the
         # reference library is re-interpolated onto the new axis in the SAME
         # step — otherwise the reference lines slide along with the spectrum in
@@ -489,7 +556,6 @@ class CalibrationDialog(QDialog):
 
         line_lo, line_hi = min(nms), max(nms)
         dev_lo, dev_hi = float(wl_new[0]), float(wl_new[-1])
-        max_res = res["max_error"]
         rms = float(np.sqrt(np.mean(np.square(res["residuals"]))))
         warn = ""
         # warn if lines leave large unconstrained spans at either end
@@ -500,6 +566,9 @@ class CalibrationDialog(QDialog):
                     f"<b>extrapolated</b> outside the line span — small residuals "
                     f"do not guarantee accuracy there. Add lines from other "
                     f"lamps for full coverage.</span>")
+        elif rms > 0.5:
+            warn = (f"<br><span style='color:#ff8c3c'>RMS {rms:.2f} nm is a bit "
+                    f"high — check for a mis-assigned line before saving.</span>")
         self.lbl_wl_result.setText(
             f"<b>Fit (degree {self.spn_degree.value()}, {len(nms)} lines):</b> "
             f"max residual {max_res:.3f} nm, RMS {rms:.3f} nm. "
@@ -522,6 +591,7 @@ class CalibrationDialog(QDialog):
             return
         from app_config import Config
         Config.set(key, list(self._wl_last_fit["coeffs"]))
+        self._wl_saved = True
         extra = ""
         # The Ocean HDX defaults to its on-device factory axis; saving a
         # calibration means "use mine now", so flip it to the config poly.

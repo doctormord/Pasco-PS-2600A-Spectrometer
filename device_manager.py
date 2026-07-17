@@ -78,6 +78,21 @@ class BaseSpectrometer(ABC):
                 return None
         return (_num(lo), _num(hi))
 
+    # ── Wavelength-calibration snapshot/restore ───────────────────────────
+    # Used by the calibration wizard to discard an unsaved live preview (or to
+    # roll back a fit that failed the sanity check) so a bad calibration can't
+    # leave the live view in a broken state. Default operates on self._wl, which
+    # PASCO and LR-2T use directly; Ocean overrides (coeff-based axis).
+    def wl_calibration_snapshot(self) -> dict:
+        wl = getattr(self, "_wl", None)
+        if wl is None:
+            wl = np.asarray(self.wavelength_array)
+        return {"_wl": np.asarray(wl, dtype=float).copy()}
+
+    def wl_calibration_restore(self, snap: dict) -> None:
+        if snap and "_wl" in snap and hasattr(self, "_wl"):
+            self._wl = np.asarray(snap["_wl"], dtype=float)
+
     def __init__(
         self,
         *,
