@@ -330,10 +330,17 @@ class CalibrationDialog(QDialog):
         b_rm = QPushButton("Remove row"); b_rm.clicked.connect(self._wl_remove_row)
         b_add = QPushButton("Add row");   b_add.clicked.connect(lambda: self._wl_add_row(0.0, 0.0))
         self.btn_wl_fit = QPushButton("Fit && apply"); self.btn_wl_fit.clicked.connect(self._wl_fit_clicked)
+        self.chk_wl_confirm = QCheckBox("Back up && confirm")
+        self.chk_wl_confirm.setToolTip(
+            "Required before saving. Writes a timestamped backup of the current "
+            "calibration (old_calib_data_<datetime>.json, next to the config) "
+            "before the new one overwrites it.")
         self.btn_wl_save = QPushButton("Save to device"); self.btn_wl_save.clicked.connect(self._wl_save_clicked)
         self.btn_wl_save.setEnabled(False)
-        for b in (b_add, b_rm, self.btn_wl_fit, self.btn_wl_save):
+        for b in (b_add, b_rm, self.btn_wl_fit):
             btns.addWidget(b)
+        btns.addWidget(self.chk_wl_confirm)
+        btns.addWidget(self.btn_wl_save)
         btns.addStretch(1)
         mid.addLayout(btns)
         v.addLayout(mid, 1)
@@ -574,8 +581,39 @@ class CalibrationDialog(QDialog):
             f"max residual {max_res:.3f} nm, RMS {rms:.3f} nm. "
             f"Applied live. {warn}")
 
+    def _backup_calibration(self) -> str | None:
+        """Write a timestamped snapshot of the current calibration-related config
+        keys next to the config file, so an overwrite can always be rolled back.
+        Returns the backup path (or None on failure)."""
+        import os, json, datetime
+        from app_config import Config
+        keys = ["pasco_wl_poly_coeffs", "lr2t_wl_poly_coeffs", "ocean_wl_poly_coeffs",
+                "lr2t_wl_offset_nm", "ocean_wl_offset_nm", "ocean_use_device_wavelength"]
+        snap = {k: Config.get(k, None) for k in keys}
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap["_backed_up_at"] = ts
+        snap["_note"] = "Calibration snapshot taken before the wizard overwrote it."
+        try:
+            cfg_dir = os.path.dirname(os.path.abspath(Config.path)) or "."
+            path = os.path.join(cfg_dir, f"old_calib_data_{ts}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=2, sort_keys=True)
+            return path
+        except Exception as e:
+            QMessageBox.warning(self, "Backup failed",
+                                f"Could not write the calibration backup: {e}\n"
+                                f"Nothing was saved.")
+            return None
+
     def _wl_save_clicked(self):
         if not self._wl_last_fit:
+            return
+        if not self.chk_wl_confirm.isChecked():
+            QMessageBox.warning(
+                self, "Confirmation required",
+                "Tick 'Back up & confirm' first. Saving overwrites the current "
+                "wavelength calibration in the config — the checkbox makes sure "
+                "a timestamped backup is written before that happens.")
             return
         dev = self._device_name()
         key = {
@@ -589,9 +627,14 @@ class CalibrationDialog(QDialog):
                 f"No wavelength-coefficient config key for '{dev}'. "
                 f"The fit is applied for this session but not saved.")
             return
+        # Back up BEFORE overwriting; abort if the backup couldn't be written.
+        backup_path = self._backup_calibration()
+        if backup_path is None:
+            return
         from app_config import Config
         Config.set(key, list(self._wl_last_fit["coeffs"]))
         self._wl_saved = True
+        self.chk_wl_confirm.setChecked(False)   # require a fresh tick next time
         extra = ""
         # The Ocean HDX defaults to its on-device factory axis; saving a
         # calibration means "use mine now", so flip it to the config poly.
@@ -600,10 +643,12 @@ class CalibrationDialog(QDialog):
             extra = ("<br>Switched 'ocean_use_device_wavelength' → false so "
                      "this calibration is used instead of the device's factory "
                      "axis. Set it back to true to revert to the device axis.")
+        import os
         QMessageBox.information(
             self, "Saved",
             f"Wavelength calibration saved to '{key}'. It will load "
-            f"automatically on the next connect.{extra}")
+            f"automatically on the next connect.<br>Backup of the previous "
+            f"calibration: <b>{os.path.basename(backup_path)}</b>.{extra}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  RESPONSE TAB

@@ -1,0 +1,25 @@
+name: Stamp VERSION
+on:
+  push:
+    branches: [ future, main ]
+jobs:
+  stamp:
+    # Don't re-trigger on the stamp commit itself.
+    if: "!contains(github.event.head_commit.message, 'Stamp VERSION')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write VERSION from the commit datetime
+        run: |
+          date -u -d "@$(git log -1 --format=%ct)" +"%Y-%m-%d %H:%M UTC" > VERSION
+      - name: Commit if changed
+        run: |
+          if ! git diff --quiet -- VERSION; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add VERSION
+            git commit -m "Stamp VERSION [skip ci]"
+            git push
+          fi

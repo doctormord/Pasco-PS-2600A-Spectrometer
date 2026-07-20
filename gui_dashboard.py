@@ -1026,6 +1026,16 @@ class DashboardWindow(QMainWindow):
         self.chip_sensor_temp.setObjectName("sensorChip")
         self._restyle_sensor_chip("neutral", "Sensor: —")
         h.addWidget(self.chip_sensor_temp)
+        h.addWidget(make_vsep())
+        try:
+            from version import app_version
+            _ver = app_version()
+        except Exception:
+            _ver = "unknown"
+        self.lbl_version = QLabel(f"v{_ver}")
+        self.lbl_version.setObjectName("statusKey")
+        self.lbl_version.setToolTip("Build version (last commit / newest file date)")
+        h.addWidget(self.lbl_version)
         return w
 
     def _restyle_sensor_chip(self, kind: str, text: str) -> None:

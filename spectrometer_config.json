@@ -17,14 +17,14 @@
   "demo_soft_knee": 0.85,
   "demo_spec_max_nm": 780.0,
   "demo_spec_min_nm": 380.0,
-  "demo_spectrum": "LED White Warm",
-  "exposure_ms": 1280.0,
-  "fast_preview_enabled": false,
+  "demo_spectrum": "Neon (Ne)",
+  "exposure_ms": 1000.0,
+  "fast_preview_enabled": true,
   "fast_preview_n_short": 10,
   "fast_preview_short_pct": 9,
   "filter_baseline_frames": 16,
   "filter_display_smoothing": 0,
-  "frames_to_average": 1,
+  "frames_to_average": 3,
   "fusion_change_sigma": 5.0,
   "fusion_emit_hz": 40.0,
   "fusion_emit_max_hz": 60.0,
@@ -98,11 +98,11 @@
   "peak_savgol_order": 3,
   "peak_savgol_window": 11,
   "radiometric_calibration_factor": 0.0,
-  "reference_library": "Cadmium (Cd)",
+  "reference_library": "None",
   "response_correction_active": {
-    "Demo (virtual)": "yolo"
+    "Demo (virtual)": "test_calib"
   },
-  "selected_backend": "Ocean HDX-UV-VIS",
+  "selected_backend": "Demo (virtual)",
   "show_peaks": false,
   "smoothing_width": 5,
   "spatial_smoothing": false,
@@ -111,5 +111,5 @@
   "theme": "dark",
   "x_max_nm": 1000,
   "x_min_nm": 240,
-  "y_max_adc": 3374
+  "y_max_adc": 48622
 }
