@@ -158,8 +158,28 @@ class BaseSpectrometer(ABC):
 
     @abstractmethod
     def set_integration_time_us(self, microseconds: int) -> None:
-        """Apply new integration time to hardware."""
         ...
+
+    def _wait_interruptible(self, seconds: float, orig_us: int,
+                            step: float = 0.02) -> bool:
+        """Sleep up to `seconds`, but abort early (return False) if the loop
+        should stop/pause OR the requested integration time changed. Lets a long
+        exposure be cancelled the instant the user edits the field / hits the
+        preset, instead of blocking the whole session (e.g. a 30 s frame).
+        Returns True only if the full time elapsed. `orig_us` is the integration
+        time captured at the top of the frame (compare against the live value)."""
+        end = time.monotonic() + max(0.0, seconds)
+        while True:
+            now = time.monotonic()
+            if now >= end:
+                return True
+            if not getattr(self, "_running", True):
+                return False
+            if getattr(self, "is_measurement_paused", False):
+                return False
+            if self.current_integration_time_us != orig_us:
+                return False
+            time.sleep(min(step, end - now))
 
     @property
     def wavelength_array(self) -> np.ndarray:

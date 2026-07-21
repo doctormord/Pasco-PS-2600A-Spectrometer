@@ -215,3 +215,21 @@ def build_response_gain(
         1.0,
     )
     return np.minimum(1.0 / sensitivity, max_gain)
+
+
+def axis_is_monotonic(wl, min_nm: float = 50.0, max_nm: float = 1400.0) -> bool:
+    """True if `wl` is a strictly increasing, plausibly-ranged wavelength axis.
+    A saved calibration polynomial can turn over at the array ends (a degree-3
+    fit through a limited line span), which folds the plotted trace back on
+    itself (duplicate x → 'double y values') and corrupts every wavelength-based
+    calculation. Drivers use this to reject such an axis on load and fall back to
+    the factory/default one."""
+    import numpy as _np
+    wl = _np.asarray(wl, dtype=float)
+    if wl.size < 2:
+        return False
+    if not _np.all(_np.diff(wl) > 0):
+        return False
+    if wl[0] < min_nm or wl[-1] > max_nm:
+        return False
+    return True

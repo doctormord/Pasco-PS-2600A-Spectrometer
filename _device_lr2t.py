@@ -126,6 +126,7 @@ REPORT_ID          = 0x00
 PACKET_SIZE        = 64
 REPORT_SIZE        = PACKET_SIZE + 1
 TIMEOUT_MS         = 300
+LR2T_MAX_CONSEC_ERRORS = 5    # transient read glitches tolerated before giving up
 NUM_PIXELS_IN_PACK = 30
 REMAINING_ERR      = 250
 
@@ -249,6 +250,7 @@ class LasertrackLR2T(BaseSpectrometer):
         # Frames to drop after an integration-time change (stale-frame guard,
         # mirrors the HDX). Loaded from Config in connect().
         self._discard_n            = 1
+        self._consec_errors        = 0
         self._discard_after_change = 0
 
     @staticmethod
@@ -348,10 +350,17 @@ class LasertrackLR2T(BaseSpectrometer):
                 self._wl,
                 poly_wavelength_array(self.wl_poly_coeffs, self.PIXEL_COUNT)
                 + self.wl_offset_nm):
-            self._wl = (poly_wavelength_array(self.wl_poly_coeffs, self.PIXEL_COUNT)
-                        + self.wl_offset_nm)
-            self.WL_MIN_NM = float(self._wl[0])
-            self.WL_MAX_NM = float(self._wl[-1])
+            from calibration_utils import axis_is_monotonic
+            cand = (poly_wavelength_array(self.wl_poly_coeffs, self.PIXEL_COUNT)
+                    + self.wl_offset_nm)
+            if axis_is_monotonic(cand):
+                self._wl = cand
+                self.WL_MIN_NM = float(self._wl[0])
+                self.WL_MAX_NM = float(self._wl[-1])
+            else:
+                print("[LR-2T] IGNORED lr2t_wl_poly_coeffs — non-monotonic axis "
+                      "(turns over / out of range). Re-run the wavelength wizard "
+                      "or clear the key in config.json.")
 
         # Resolve per-device integration bounds from config (fall back to the
         # hardware constants). Exposed so the GUI / web server size the exposure
@@ -480,6 +489,22 @@ class LasertrackLR2T(BaseSpectrometer):
         report[1:1 + len(buf)] = buf
         with self._lock:
             self._dev.write(bytes(report))
+
+    def _flush_input(self) -> None:
+        """Drain stale HID input reports (non-blocking). After a delayed or
+        aborted frame read — e.g. when a busy GUI thread starves this
+        acquisition thread on a laptop — leftover packets would otherwise
+        desync every following frame (correct opcode, wrong data → the baseline
+        appears to jump). Draining resynchronises the stream."""
+        if self._dev is None:
+            return
+        try:
+            for _ in range(4096):            # generous cap (> one frame of packets)
+                data = self._dev.read(REPORT_SIZE, 0)   # 0 ms = non-blocking
+                if not data:
+                    break
+        except Exception:
+            pass
 
     def _read(self, expected: int) -> bytearray:
         data = self._dev.read(REPORT_SIZE, TIMEOUT_MS)
@@ -653,24 +678,30 @@ class LasertrackLR2T(BaseSpectrometer):
 
                 self._cmd_trigger()
 
-                # Wait the FULL programmed integration (the old 85% heuristic
-                # returned under-integrated frames after a change), then poll for
-                # completion WITHOUT re-triggering — a re-trigger restarts the
-                # exposure, so on a long exposure a frame never completed cleanly.
-                time.sleep(max(0.01, t_this / 1_000_000.0))
+                # Wait the FULL programmed integration, but abort the instant the
+                # user changes the exposure (a 30 s frame must not block the
+                # session). On abort, restart the loop → re-program the new value.
+                if not self._wait_interruptible(max(0.01, t_this / 1_000_000.0),
+                                                t_long):
+                    self._flush_input()
+                    last_hw_us = -1
+                    continue
                 n_frames = 0
                 poll_deadline = time.monotonic() + max(0.2,
                                                        min(3.0, t_this / 1_000_000.0 * 0.3))
                 while time.monotonic() < poll_deadline:
+                    if self.current_integration_time_us != t_long:
+                        break                      # exposure changed → drop this frame
                     _, n_frames = self._cmd_get_status()
                     if n_frames > 0:
                         break
                     time.sleep(0.005)
                 if n_frames == 0:
-                    continue   # not ready within deadline → retry (re-triggers)
+                    continue   # not ready / exposure changed → retry (re-programs)
 
                 pixel_array = self._cmd_get_frame(frame_num=0)
                 self._cmd_clear_memory()
+                self._consec_errors = 0        # a clean frame → resynced
 
                 # Drop stale frame(s) after an exposure change before any
                 # processing / auto-exposure / forwarding.
@@ -740,8 +771,22 @@ class LasertrackLR2T(BaseSpectrometer):
                                   FRAME_STANDARD, 1.0)
 
             except Exception as exc:
-                if self._running:
-                    print(f"[LR-2T] Error: {exc}")
+                if not self._running:
+                    break
+                # A transient read glitch (host stall from GUI/USB contention on
+                # a laptop) must NOT tear the connection down or emit a desynced
+                # frame. Flush stale packets, force a clean SET_EXP+TRIGGER next
+                # round, and retry. Only give up after several in a row.
+                self._consec_errors += 1
+                self._flush_input()
+                last_hw_us = -1
+                if self._consec_errors >= LR2T_MAX_CONSEC_ERRORS:
+                    print(f"[LR-2T] Error (giving up after "
+                          f"{self._consec_errors}): {exc}")
                     if self.on_connection_lost:
                         self.on_connection_lost()
-                break
+                    break
+                print(f"[LR-2T] transient read glitch "
+                      f"{self._consec_errors}/{LR2T_MAX_CONSEC_ERRORS}: {exc}")
+                time.sleep(0.01)
+                continue

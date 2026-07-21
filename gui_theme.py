@@ -75,6 +75,7 @@ def build_stylesheet(p) -> str:
 * {{ font-family: {FONT_SANS}; color: {p.FG1}; font-size: 13px; }}
 QMainWindow, QWidget#central, QWidget#sidebar {{ background: {p.BG0}; }}
 QWidget#sidebar {{ background: {p.BG1}; border-left: 1px solid {p.BORDER1}; }}
+QWidget#sidebarInner {{ background: {p.BG1}; border: none; }}
 
 QWidget#titlebar {{
     background: {p.BG1};
@@ -209,7 +210,7 @@ QPushButton#deviceSelect {{
 QPushButton#goBtn {{
     background: {p.ACCENT};
     color: {p.ACCENT_BTN_FG};
-    border: none;
+    border: 1px solid transparent;
     border-radius: 9px;
     font-weight: 700;
     font-size: 13px;
@@ -294,6 +295,19 @@ QAbstractSpinBox {{
     min-height: 24px;
     selection-background-color: {p.ACCENT_GLOW};
 }}
+QLineEdit {{
+    background: {p.BG2};
+    border: 1px solid {p.BORDER1};
+    border-radius: 5px;
+    color: {p.FG1};
+    font-family: {FONT_MONO};
+    font-size: 12px;
+    padding: 4px 8px;
+    min-height: 22px;
+    selection-background-color: {p.ACCENT_GLOW};
+}}
+QLineEdit:focus {{ border-color: {p.ACCENT}; }}
+QLineEdit:disabled {{ color: {p.FG4}; }}
 QAbstractSpinBox:hover    {{ border-color: {p.BORDER2}; }}
 QAbstractSpinBox:disabled {{ color: {p.FG4}; }}
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
@@ -383,6 +397,20 @@ QLabel#sensorChip {{
 }}
 
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: {p.BG1}; }}
+QSlider::groove:horizontal {{
+    height: 4px; background: {p.BORDER2}; border-radius: 2px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {p.ACCENT}; border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    width: 14px; height: 14px; margin: -6px 0;
+    background: {p.ACCENT}; border: 2px solid {p.BG0}; border-radius: 7px;
+}}
+QSlider::handle:horizontal:hover {{ background: {p.ACCENT_HOVER}; }}
+QSlider::handle:horizontal:disabled {{ background: {p.BORDER2}; }}
+QSlider::sub-page:horizontal:disabled {{ background: {p.BORDER1}; }}
+
 QScrollBar:vertical {{ background: {p.BG1}; width: 10px; margin: 0; border: none; }}
 QScrollBar::handle:vertical {{ background: {p.BORDER2}; border-radius: 4px;
                                min-height: 30px; }}

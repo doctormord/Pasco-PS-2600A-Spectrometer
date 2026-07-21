@@ -330,20 +330,19 @@ class FilterTab(QWidget):
         if self._last_result is None:
             QMessageBox.information(self, "Filter report", "Nothing to export yet.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save filter report", "filter_report.pdf",
-            "PDF document (*.pdf);;PNG image (*.png)")
-        if not path:
-            return
+        import export_paths
+        meta = self.report_meta_provider() if callable(self.report_meta_provider) else None
+        emeta = export_paths.meta_from_report(meta)
+        path, path_err = export_paths.export_path("filter_report", "pdf", emeta)
         try:
-            meta = self.report_meta_provider() if callable(self.report_meta_provider) else None
             _write_report_matplotlib(path, self._last_result, meta=meta)
-            self.lbl_state.setText(f"Saved {os.path.basename(path)}")
+            self.lbl_state.setText(f"Saved {os.path.basename(path)}"
+                                   + (f"  ⚠ {path_err}" if path_err else ""))
         except ImportError:
             # matplotlib not available → graph PNG via pyqtgraph + metrics CSV.
             try:
-                png = os.path.splitext(path)[0] + ".png"
-                csv = os.path.splitext(path)[0] + "_metrics.csv"
+                png, _ = export_paths.export_path("filter_report", "png", emeta)
+                csv, _ = export_paths.export_path("filter_metrics", "csv", emeta)
                 _export_plot_png(self.plot, png)
                 _write_metrics_csv(csv, self._last_result)
                 QMessageBox.information(
@@ -361,16 +360,14 @@ class FilterTab(QWidget):
         if self._last_result is None:
             QMessageBox.information(self, "Filter CSV", "Nothing to export yet.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save filter metrics (CSV)", "filter_metrics.csv",
-            "CSV file (*.csv)")
-        if not path:
-            return
-        if not path.lower().endswith(".csv"):
-            path += ".csv"
+        import export_paths
+        meta = self.report_meta_provider() if callable(self.report_meta_provider) else None
+        path, path_err = export_paths.export_path(
+            "filter_metrics", "csv", export_paths.meta_from_report(meta))
         try:
             _write_metrics_csv(path, self._last_result)
-            self.lbl_state.setText(f"Saved {os.path.basename(path)}")
+            self.lbl_state.setText(f"Saved {os.path.basename(path)}"
+                                   + (f"  ⚠ {path_err}" if path_err else ""))
         except Exception as e:
             QMessageBox.warning(self, "Filter CSV", f"Export failed:\n{e}")
 

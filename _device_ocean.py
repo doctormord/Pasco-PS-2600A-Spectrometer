@@ -222,6 +222,7 @@ CFG_MAX_ITIME_US        = "ocean_max_integration_us";     DEF_MAX_ITIME_US      
 CFG_SPECTRUM_COMMAND    = "ocean_spectrum_command";       DEF_SPECTRUM_COMMAND   = "metadata"
 CFG_USB_TIMEOUT_MS      = "ocean_usb_timeout_ms";         DEF_USB_TIMEOUT_MS     = 15_000
 CFG_FLUSH_TIMEOUT_MS    = "ocean_flush_timeout_ms";       DEF_FLUSH_TIMEOUT_MS   = 50
+HDX_MAX_CONSEC_ERRORS   = 5    # transient read glitches tolerated before giving up
 CFG_LOOP_SLEEP_FACTOR   = "ocean_loop_sleep_factor";      DEF_LOOP_SLEEP_FACTOR  = 0.5
 CFG_LOOP_SLEEP_MIN_S    = "ocean_loop_sleep_min_s";       DEF_LOOP_SLEEP_MIN_S   = 0.005
 CFG_LOOP_SLEEP_MAX_S    = "ocean_loop_sleep_max_s";       DEF_LOOP_SLEEP_MAX_S   = 0.20
@@ -381,6 +382,7 @@ class OceanHDX(BaseSpectrometer):
         # Optional override polynomial (e.g. fit from emission lines).
         self.wl_poly_coeffs: list[float] | None = None
         self._session_calibrated: bool = False
+        self._consec_errors: int = 0
 
     # ── Config snapshot ─────────────────────────────────────────────────────
 
@@ -609,7 +611,24 @@ class OceanHDX(BaseSpectrometer):
         else:
             coeffs = self._wl_coeffs or self.wl_poly_coeffs
         if coeffs:
-            self._wl_base = poly_wavelength_array(coeffs, self._n_pixels)
+            base = poly_wavelength_array(coeffs, self._n_pixels)
+            # Reject a non-monotonic axis (a turned-over saved poly folds the
+            # trace back on itself). Fall back to the other source, then linear.
+            from calibration_utils import axis_is_monotonic
+            if not axis_is_monotonic(base):
+                alt = (self._wl_coeffs if coeffs is self.wl_poly_coeffs
+                       else self.wl_poly_coeffs)
+                if alt and axis_is_monotonic(poly_wavelength_array(alt, self._n_pixels)):
+                    print("[HDX] IGNORED non-monotonic wavelength coeffs; using "
+                          "the other source.")
+                    base = poly_wavelength_array(alt, self._n_pixels)
+                else:
+                    lo = float(Config.get(CFG_WL_FALLBACK_MIN, DEF_WL_FALLBACK_MIN))
+                    hi = float(Config.get(CFG_WL_FALLBACK_MAX, DEF_WL_FALLBACK_MAX))
+                    print("[HDX] IGNORED non-monotonic wavelength coeffs; using "
+                          "the linear fallback axis.")
+                    base = np.linspace(lo, hi, self._n_pixels)
+            self._wl_base = base
         else:
             lo = float(Config.get(CFG_WL_FALLBACK_MIN, DEF_WL_FALLBACK_MIN))
             hi = float(Config.get(CFG_WL_FALLBACK_MAX, DEF_WL_FALLBACK_MAX))
@@ -932,6 +951,7 @@ class OceanHDX(BaseSpectrometer):
 
                 # ── Read one spectrum ───────────────────────────────────
                 raw = self._read_spectrum(self._spectrum_msg)
+                self._consec_errors = 0        # a clean read → resynced
 
                 # Pixel-count drift safety net (firmware quirk)
                 if len(raw) != self._n_pixels:
@@ -1042,19 +1062,37 @@ class OceanHDX(BaseSpectrometer):
                 # fast. FP therefore uses a small FIXED yield; device frame
                 # production sets the real cadence.
                 if fp:
-                    time.sleep(self._fp_loop_sleep_s)
+                    self._wait_interruptible(self._fp_loop_sleep_s, t_long)
                 else:
                     itime_s = t_this / 1_000_000.0
-                    time.sleep(max(self._loop_sleep_min,
-                                   min(self._loop_sleep_max,
-                                       itime_s * self._loop_sleep_factor)))
+                    self._wait_interruptible(
+                        max(self._loop_sleep_min,
+                            min(self._loop_sleep_max,
+                                itime_s * self._loop_sleep_factor)),
+                        t_long)
 
             except Exception as exc:
-                if self._running:
-                    print(f"[HDX] Error: {exc}")
+                if not self._running:
+                    break
+                # Transient read glitch (host stall from GUI/USB contention on a
+                # laptop): the IN pipe is already flushed before each GET, so no
+                # frame is corrupted — just drain and retry rather than tearing
+                # the connection down. Give up only after several in a row.
+                self._consec_errors += 1
+                try:
+                    self._flush_pipeline()
+                except Exception:
+                    pass
+                if self._consec_errors >= HDX_MAX_CONSEC_ERRORS:
+                    print(f"[HDX] Error (giving up after "
+                          f"{self._consec_errors}): {exc}")
                     if self.on_connection_lost:
                         self.on_connection_lost()
-                break
+                    break
+                print(f"[HDX] transient read glitch "
+                      f"{self._consec_errors}/{HDX_MAX_CONSEC_ERRORS}: {exc}")
+                time.sleep(0.01)
+                continue
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

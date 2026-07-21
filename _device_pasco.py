@@ -254,6 +254,15 @@ if _IS_WINDOWS:
         wintypes.ULONG, ctypes.POINTER(wintypes.ULONG), ctypes.c_void_p]
     winusb.WinUsb_ReadPipe.restype = wintypes.BOOL
 
+    # Without argtypes, ctypes passes the argument as a 32-bit int, so a 64-bit
+    # HANDLE overflows ("int too long to convert") and the device handle is never
+    # closed — which then leaves the PASCO claimed ("Access denied / device in
+    # use, error 5") on the next launch. Declare the signatures explicitly.
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype  = wintypes.BOOL
+    winusb.WinUsb_Free.argtypes   = [ctypes.c_void_p]
+    winusb.WinUsb_Free.restype    = wintypes.BOOL
+
     _g_usb_handle    = None
     _g_device_handle = None
 
@@ -372,6 +381,9 @@ else:
 # 3. SPECTROMETERACQUISITION — PASCO HARDWARE THREAD
 # ══════════════════════════════════════════════════════════════════════════
 
+PASCO_MAX_CONSEC_ERRORS = 5   # transient read stalls tolerated before giving up
+
+
 class SpectrometerAcquisition(threading.Thread):
     """
     Background thread for continuous PASCO PS-2600A acquisition.
@@ -464,6 +476,7 @@ class SpectrometerAcquisition(threading.Thread):
         # so each frame is genuinely exposed at the requested time with no
         # one-cycle lag.
         last_hw_us = -1
+        consec_errors = 0
 
         while self.is_thread_running:
             if self.is_measurement_paused:
@@ -492,10 +505,22 @@ class SpectrometerAcquisition(threading.Thread):
 
             result = self._acquire_one_frame(t_this)
             if result is None:
-                if self.on_connection_lost:
-                    self.on_connection_lost()
-                break
+                if not self.is_thread_running:
+                    break
+                # Transient stall (host contention from a busy GUI thread on a
+                # laptop): re-arm the exposure and retry rather than dropping the
+                # connection. A fresh status-poll on the next frame resyncs.
+                # Give up only after several failures in a row.
+                consec_errors += 1
+                last_hw_us = -1
+                if consec_errors >= PASCO_MAX_CONSEC_ERRORS:
+                    if self.on_connection_lost:
+                        self.on_connection_lost()
+                    break
+                time.sleep(0.01)
+                continue
             pixels, ob_mean = result
+            consec_errors = 0
 
             forward = True
 
@@ -663,11 +688,24 @@ class PascoPS2600A(BaseSpectrometer):
             from app_config import Config
             coeffs = Config.get("pasco_wl_poly_coeffs", None)
             if coeffs:
-                self._wl = poly_wavelength_array(list(coeffs), PASCO_PIXEL_COUNT)
-                self.WL_MIN_NM = float(self._wl[0])
-                self.WL_MAX_NM = float(self._wl[-1])
-                print(f"[PASCO] Wavelength calibration loaded from config "
-                      f"({self.WL_MIN_NM:.1f}-{self.WL_MAX_NM:.1f} nm)")
+                from calibration_utils import axis_is_monotonic
+                cand = poly_wavelength_array(list(coeffs), PASCO_PIXEL_COUNT)
+                if axis_is_monotonic(cand):
+                    self._wl = cand
+                    self.WL_MIN_NM = float(self._wl[0])
+                    self.WL_MAX_NM = float(self._wl[-1])
+                    print(f"[PASCO] Wavelength calibration loaded from config "
+                          f"({self.WL_MIN_NM:.1f}-{self.WL_MAX_NM:.1f} nm)")
+                else:
+                    # Bad (non-monotonic / out-of-range) saved poly would fold the
+                    # trace back on itself. Ignore it and keep the factory axis.
+                    self._wl = PASCO_WAVELENGTH_ARRAY.copy()
+                    self.WL_MIN_NM = float(self._wl[0])
+                    self.WL_MAX_NM = float(self._wl[-1])
+                    print("[PASCO] IGNORED pasco_wl_poly_coeffs — the axis is "
+                          "non-monotonic (turns over / out of range). Using the "
+                          "factory axis. Re-run the wavelength wizard, or clear "
+                          "the key in config.json.")
         except Exception as e:
             print(f"[PASCO] wl coeff load skipped: {e}")
         # Do NOT reset current_integration_time_us here — the GUI sets it

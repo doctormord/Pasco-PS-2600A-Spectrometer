@@ -84,6 +84,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Measure against known lines (e.g. Ne 640.2 nm) and adjust.
     "lr2t_wl_offset_nm": 0.0,
 
+    # ── Time-lapse heatmap ────────────────────────────────────────────────
+    "heatmap_buffer_size": 100,          # rolling history length (frames), step 10
+    "heatmap_measure_interval_ms": 0,    # 0 = every frame; else log one frame per N ms
+    "heatmap_autosave_enabled": False,
+    "heatmap_autosave_dir": "",          # "" = current working directory
+    "heatmap_autosave_fsync_s": 20,      # periodic fsync interval (crash safety)
+
+    # ── Central export location + filename composition (all tabs/saves) ──
+    "export_dir": "",                    # "" = program folder
+    "export_filename_template": "{kind}_{datetime}",
+
     # ── Out-of-spec shading (per device) ──────────────────────────────────
     # Wavelength range (nm) the manufacturer actually guarantees. The sensor
     # still returns data outside it; the GUI and web UI shade those edges in

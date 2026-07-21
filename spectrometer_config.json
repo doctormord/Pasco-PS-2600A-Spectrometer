@@ -18,13 +18,15 @@
   "demo_spec_max_nm": 780.0,
   "demo_spec_min_nm": 380.0,
   "demo_spectrum": "Neon (Ne)",
-  "exposure_ms": 1000.0,
-  "fast_preview_enabled": true,
+  "export_dir": "",
+  "export_filename_template": "{device}_{datetime}_{n:05}",
+  "exposure_ms": 73.33,
+  "fast_preview_enabled": false,
   "fast_preview_n_short": 10,
   "fast_preview_short_pct": 9,
   "filter_baseline_frames": 16,
   "filter_display_smoothing": 0,
-  "frames_to_average": 3,
+  "frames_to_average": 1,
   "fusion_change_sigma": 5.0,
   "fusion_emit_hz": 40.0,
   "fusion_emit_max_hz": 60.0,
@@ -35,6 +37,11 @@
   "fusion_noise_floor": 8.0,
   "fusion_noise_gain": 0.5,
   "fusion_smoothing": 0.96,
+  "heatmap_autosave_dir": "",
+  "heatmap_autosave_enabled": false,
+  "heatmap_autosave_fsync_s": 20,
+  "heatmap_buffer_size": 1000,
+  "heatmap_measure_interval_ms": 0,
   "hot_pixel_filter": false,
   "lr2t_discard_frames_after_itime": 1,
   "lr2t_flip_pixels": false,
@@ -86,10 +93,10 @@
   "pasco_spec_max_nm": 950,
   "pasco_spec_min_nm": 390,
   "pasco_wl_poly_coeffs": [
-    161.67939803062174,
-    0.16817207688727176,
-    9.640737831437264e-05,
-    -2.5296163743291538e-08
+    75.45192816,
+    0.345838363,
+    -2.33680103e-05,
+    1.22593755e-09
   ],
   "peak_max_count": 3,
   "peak_min_distance_px": 40,
@@ -102,7 +109,7 @@
   "response_correction_active": {
     "Demo (virtual)": "test_calib"
   },
-  "selected_backend": "Demo (virtual)",
+  "selected_backend": "Ocean HDX-UV-VIS",
   "show_peaks": false,
   "smoothing_width": 5,
   "spatial_smoothing": false,
@@ -110,6 +117,6 @@
   "spectral_response_compensation": true,
   "theme": "dark",
   "x_max_nm": 1000,
-  "x_min_nm": 240,
-  "y_max_adc": 48622
+  "x_min_nm": 300,
+  "y_max_adc": 50575
 }

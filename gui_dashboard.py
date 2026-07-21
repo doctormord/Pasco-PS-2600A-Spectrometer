@@ -38,7 +38,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox,
-    QTabWidget, QFrame, QScrollArea, QToolTip, QFileDialog,
+    QTabWidget, QFrame, QScrollArea, QToolTip, QFileDialog, QCheckBox, QSlider,
+    QLineEdit,
 )
 import pyqtgraph as pg
 
@@ -85,6 +86,8 @@ from spectrometer_core import (
 import device_manager as dm
 from fusion import SpectrumFusion, DEFAULTS as FUSION_DEFAULTS
 import processing
+from autosave import HeatmapAutosaveWriter
+import export_paths
 
 
 # Shorthand
@@ -134,6 +137,19 @@ def _load_two_column_csv(path: str):
     y = np.asarray(ys, dtype=float)
     order = np.argsort(x)                   # np.interp needs ascending x
     return x[order], y[order]
+
+
+def _hm_scrub_advance(active: bool, index: int, size: int) -> int:
+    """After one ring-buffer push (np.roll(1, axis=1) + insert at column 0),
+    return the new 'frames behind live' index that keeps pointing at the SAME
+    absolute frame. Rolling shifts every existing column from i to i+1, so
+    advancing the tracked index by 1 keeps it aimed at that frame — DVR-style
+    rewind: scrub back, recording continues, the frame on screen doesn't drift.
+    Clamped at size-1 (the frame ages out of the buffer, we stay on the oldest
+    still available rather than jumping to unrelated data). Inactive → 0 (live)."""
+    if not active:
+        return 0
+    return min(index + 1, max(size - 1, 0))
 
 
 class DashboardWindow(QMainWindow):
@@ -197,7 +213,30 @@ class DashboardWindow(QMainWindow):
         # Heatmap setup
         self.heatmap_linear_waves = np.linspace(
             self.active_wavelengths[0], self.active_wavelengths[-1], self.active_pixel_count)
-        self.heatmap_buffer = np.zeros((self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+        # Rolling time-lapse buffer. Length is user-configurable (steps of 10);
+        # measurement cadence can be decoupled from the frame rate for long runs.
+        self.heatmap_size = max(10, (int(Config.get("heatmap_buffer_size", HEATMAP_HISTORY_SIZE)) // 10) * 10)
+        self._heatmap_measure_ms = max(0, int(Config.get("heatmap_measure_interval_ms", 0)))
+        self._heatmap_filled = 0                 # valid columns written so far
+        self._heatmap_last_push = 0.0            # monotonic time of last logged frame
+        self._current_fps = 0.0                  # for the buffer-span estimate
+        self._autosave_writer = None             # HeatmapAutosaveWriter | None
+        self.heatmap_buffer = np.zeros((self.active_pixel_count, self.heatmap_size))
+        # Parallel per-column timestamp buffer (monotonic seconds), rolled the
+        # same way as heatmap_buffer, for the "T-x.xs ago" scrub readout.
+        self.heatmap_times = np.full(self.heatmap_size, np.nan)
+        # Rewind/scrub state. index is "frames behind live" (0 = live/newest).
+        # While active, the index is advanced by 1 on every push (see
+        # _hm_scrub_advance) so it keeps pointing at the SAME absolute frame as
+        # the ring buffer keeps rolling underneath — a DVR-style rewind rather
+        # than a fixed slot that would silently start showing different data.
+        self._hm_scrub_active = False
+        self._hm_scrub_index = 0
+        # "Peek": pinned at frame 0 (= newest) while otherwise idle/live — lets
+        # you keep the current spectrum visible in this panel without leaving
+        # live mode. Toggled by clicking Live while already live; any real
+        # scrub (dragging the slider, or explicitly going live) clears it.
+        self._hm_peek = False
 
         # Initialise device registry (discovers available backends)
         dm.init_registry()
@@ -270,6 +309,7 @@ class DashboardWindow(QMainWindow):
 
         # Apply initial enabled/disabled state
         self.control_widget.setEnabled(False)
+        self.header_controls.setEnabled(False)
         self._install_tooltips()
         self._sync_peak_measure_buttons()
 
@@ -383,17 +423,20 @@ class DashboardWindow(QMainWindow):
 
         h.addStretch(1)
 
-        # Live readout
-        self.readout_pix = self._make_readout("PIXEL",      "—")
-        self.readout_wl  = self._make_readout("WAVELENGTH", "—", unit="nm", accent=True)
-        self.readout_int = self._make_readout("INTENSITY",  "—", unit="ADC")
+        # Live readout. Fixed min widths sized for the worst case (INTENSITY up
+        # to 5 digits + "ADC") so the row doesn't shift as values change digit
+        # count — e.g. 0 -> 20000 used to widen the box and push WAVELENGTH left.
+        self.readout_pix = self._make_readout("PIXEL",      "—", min_w=64)
+        self.readout_wl  = self._make_readout("WAVELENGTH", "—", unit="nm", accent=True, min_w=88)
+        self.readout_int = self._make_readout("INTENSITY",  "—", unit="ADC", min_w=92)
         h.addWidget(self.readout_pix); h.addSpacing(18)
         h.addWidget(self.readout_wl);  h.addSpacing(18)
         h.addWidget(self.readout_int)
         return w
 
-    def _make_readout(self, label, value, unit="", accent=False) -> QWidget:
+    def _make_readout(self, label, value, unit="", accent=False, min_w=76) -> QWidget:
         w = QWidget()
+        w.setMinimumWidth(min_w)
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0); v.setSpacing(2)
         lbl = QLabel(label); lbl.setObjectName("readoutLbl")
@@ -544,7 +587,7 @@ class DashboardWindow(QMainWindow):
 
         self.mouse_proxy = pg.SignalProxy(
             self.plot_canvas.scene().sigMouseMoved,
-            rateLimit=60, slot=self.handle_mouse_movement)
+            rateLimit=30, slot=self.handle_mouse_movement)
 
         # Wrap the scope plot with an overlay toolbar above it.
         scope_tab = QWidget()
@@ -560,7 +603,7 @@ class DashboardWindow(QMainWindow):
         self._style_plot(self.heatmap_canvas, "Wavelength", "nm", "Frame history", "")
         self.heatmap_canvas.setXRange(
             Config.get("x_min_nm", 380), Config.get("x_max_nm", 1050), padding=0)
-        self.heatmap_canvas.setYRange(0, HEATMAP_HISTORY_SIZE, padding=0)
+        self.heatmap_canvas.setYRange(0, self.heatmap_size, padding=0)
 
         self.image_item = pg.ImageItem()
         self.image_item.setLookupTable(pg.colormap.get("inferno").getLookupTable())
@@ -574,8 +617,150 @@ class DashboardWindow(QMainWindow):
         self.heatmap_canvas.addItem(self.heatmap_cursor_hline, ignoreBounds=True)
         self.heatmap_mouse_proxy = pg.SignalProxy(
             self.heatmap_canvas.scene().sigMouseMoved,
-            rateLimit=60, slot=self.handle_heatmap_mouse_movement)
-        self.tabs.addTab(self.heatmap_canvas, "Time-Lapse Heatmap")
+            rateLimit=30, slot=self.handle_heatmap_mouse_movement)
+
+        # Controls row — one line, same look as the scope overlay bar:
+        # Clear far left, buffer/rate/span in the middle, autosave far right.
+        self.heatmap_tab = QWidget()
+        _hmv = QVBoxLayout(self.heatmap_tab)
+        _hmv.setContentsMargins(0, 0, 0, 0); _hmv.setSpacing(0)
+
+        _bar_w = QWidget(); _bar_w.setObjectName("scopeOverlayBar")
+        _bar = QHBoxLayout(_bar_w)
+        _bar.setContentsMargins(10, 6, 10, 6); _bar.setSpacing(8)
+
+        self.btn_hm_clear = QPushButton("⟲  Clear")
+        self.btn_hm_clear.setObjectName("ghostBtn")
+        self.btn_hm_clear.setToolTip("Empty the time-lapse buffer and start over.")
+        self.btn_hm_clear.clicked.connect(self.clear_heatmap)
+        _bar.addWidget(self.btn_hm_clear)
+        _bar.addWidget(make_vsep())
+
+        _bar.addWidget(QLabel("Buffer"))
+        self.spin_hm_size = self._spin_int(self.heatmap_size, 10, 100000, 10, 80)
+        self.spin_hm_size.valueChanged.connect(self.set_heatmap_size)
+        _bar.addWidget(self.spin_hm_size)
+        _bar.addWidget(QLabel("frames"))
+
+        _bar.addSpacing(6)
+        _bar.addWidget(QLabel("Log every"))
+        self.spin_hm_rate = self._spin_int(self._heatmap_measure_ms, 0, 3_600_000, 10, 80)
+        self.spin_hm_rate.setToolTip("0 = every frame. Otherwise log one frame per "
+                                     "N ms (decouples the time-lapse from the frame "
+                                     "rate for long runs). The live scope is unaffected.")
+        self.spin_hm_rate.valueChanged.connect(self._on_heatmap_rate)
+        _bar.addWidget(self.spin_hm_rate)
+        _bar.addWidget(QLabel("ms"))
+
+        self.lbl_hm_span = QLabel("Span —")
+        self.lbl_hm_span.setObjectName("readoutLbl")
+        self.lbl_hm_span.setToolTip("Approximate time the buffer spans = frames × "
+                                    "the effective interval (the larger of 'Log "
+                                    "every' and the current frame period).")
+        _bar.addWidget(self.lbl_hm_span)
+
+        _bar.addStretch(1)
+
+        self.chk_hm_autosave = QCheckBox("Autosave to disk")
+        self.chk_hm_autosave.setToolTip(
+            "Stream every logged frame to a CSV file as it's captured (survives "
+            "a crash — flushed every few frames, fsynced periodically). "
+            "Independent of the buffer above, so a long run is captured in full "
+            "even though only the last N frames are shown on screen.")
+        self.chk_hm_autosave.setChecked(bool(Config.get("heatmap_autosave_enabled", False)))
+        self.chk_hm_autosave.toggled.connect(self._on_autosave_toggled)
+        _bar.addWidget(self.chk_hm_autosave)
+
+        self.lbl_hm_autosave = QLabel("")
+        self.lbl_hm_autosave.setObjectName("readoutLbl")
+        _bar.addWidget(self.lbl_hm_autosave)
+
+        _hmv.addWidget(_bar_w)
+
+        # ── Rewind / scrub bar ──
+        _scrub_w = QWidget(); _scrub_w.setObjectName("scopeOverlayBar")
+        _sbar = QHBoxLayout(_scrub_w)
+        _sbar.setContentsMargins(10, 6, 10, 6); _sbar.setSpacing(8)
+
+        self.btn_hm_live = QPushButton("●  Live")
+        self.btn_hm_live.setToolTip(
+            "Click while live to pin the current spectrum here without leaving "
+            "live mode (click again to unpin). While scrubbing history, click "
+            "to return to live.")
+        self.btn_hm_live.clicked.connect(self._hm_on_live_clicked)
+        _sbar.addWidget(self.btn_hm_live)
+
+        self.btn_hm_export_frame = QPushButton("Export frame")
+        self.btn_hm_export_frame.setToolTip(
+            "Save just the currently viewed frame as a CSV (wavelength, "
+            "intensity) — instead of exporting the whole buffer. Available "
+            "while paused/peeking at a specific frame.")
+        self.btn_hm_export_frame.clicked.connect(self._hm_export_frame_csv)
+        self.btn_hm_export_frame.setEnabled(False)
+        _sbar.addWidget(self.btn_hm_export_frame)
+        self._hm_style_export_button(False)
+
+        self.slider_hm_scrub = QSlider(Qt.Orientation.Horizontal)
+        self.slider_hm_scrub.setRange(0, 0)
+        self.slider_hm_scrub.setValue(0)
+        self.slider_hm_scrub.setToolTip(
+            "Rewind through the time-lapse buffer. Recording continues in the "
+            "background while you look at a past frame — drag back to 'Live' "
+            "(or click the button) to resume following in real time.")
+        self.slider_hm_scrub.valueChanged.connect(self._hm_on_scrub)
+        self.slider_hm_scrub.sliderReleased.connect(
+            lambda: self.slider_hm_scrub.setMaximum(max(0, self._heatmap_filled - 1)))
+        _sbar.addWidget(self.slider_hm_scrub, 1)
+
+        self.lbl_hm_scrub = QLabel("● LIVE")
+        self.lbl_hm_scrub.setObjectName("readoutLbl")
+        # Fixed width reserved for the longest status string so the slider's
+        # right edge stays put (no "jumping" as the frame text changes length).
+        self.lbl_hm_scrub.setFixedWidth(180)
+        _sbar.addWidget(self.lbl_hm_scrub)
+        _hmv.addWidget(_scrub_w)
+        self._hm_style_live_button("live")
+
+        # Spectrum of the scrubbed frame — only shown while rewound; the live
+        # scope already covers the "Live" case, so this stays hidden then.
+        self.plot_hm_scrub = pg.PlotWidget()
+        self._style_plot(self.plot_hm_scrub, "Wavelength", "nm", "Intensity", "ADC")
+        self.plot_hm_scrub.setFixedHeight(160)
+        self.curve_hm_scrub = self.plot_hm_scrub.plot(
+            pen=pg.mkPen(QColor(T().ACCENT), width=1.5))
+        # Same wavelength axis as the heatmap image below (setXLink keeps pan/
+        # zoom in lockstep).
+        self.plot_hm_scrub.setXLink(self.heatmap_canvas)
+        # Keep the bottom axis's tick marks + grid (so this plot still shows
+        # gridlines at the round wavelengths, e.g. 400/500/600) but hide its
+        # tick NUMBERS — the heatmap's axis below already labels them, and once
+        # both plots' left-axis gutters are pinned to the same width (below),
+        # the numbers would just duplicate. (showAxis(False) would have hidden
+        # the grid too, which was the actual missing-gridlines bug — this way
+        # only the label text goes, not the ticks.)
+        bottom_axis = self.plot_hm_scrub.getPlotItem().getAxis("bottom")
+        bottom_axis.setStyle(showValues=False)
+        bottom_axis.setHeight(6)
+        # Pin BOTH plots' left-axis gutter to the same fixed pixel width. Without
+        # this, pyqtgraph sizes each axis to its own tick-label text (5-digit
+        # "30000" above vs 3-digit "900" below), which shifts the two viewboxes'
+        # left edges relative to each other by those few pixels — the "1px
+        # Versatz" between the crosshair up top and the boundary below, and the
+        # left border not lining up either. A shared fixed width makes the two
+        # plotted areas start at the exact same x, so pan/zoom stays pixel-exact.
+        for _plot in (self.plot_hm_scrub, self.heatmap_canvas):
+            _plot.getPlotItem().getAxis("left").setWidth(58)
+        scrub_pen = pg.mkPen(QColor(T().ACCENT), style=Qt.PenStyle.DashLine, width=1)
+        self.scrub_cursor_vline = pg.InfiniteLine(angle=90, movable=False, pen=scrub_pen)
+        self.plot_hm_scrub.addItem(self.scrub_cursor_vline, ignoreBounds=True)
+        self.scrub_mouse_proxy = pg.SignalProxy(
+            self.plot_hm_scrub.scene().sigMouseMoved,
+            rateLimit=30, slot=self.handle_scrub_mouse_movement)
+        self.plot_hm_scrub.setVisible(False)
+        _hmv.addWidget(self.plot_hm_scrub)
+
+        _hmv.addWidget(self.heatmap_canvas, 1)
+        self.tabs.addTab(self.heatmap_tab, "Time-Lapse Heatmap")
 
         # ── Color tab ──
         self.cie_tab = CIETab()
@@ -674,21 +859,10 @@ class DashboardWindow(QMainWindow):
         ol = QVBoxLayout(outer)
         ol.setContentsMargins(0, 0, 0, 0); ol.setSpacing(0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        ol.addWidget(scroll, 1)
-
-        self.control_widget = QWidget()
-        self.control_widget.setObjectName("sidebar")
-        scroll.setWidget(self.control_widget)
-        v = QVBoxLayout(self.control_widget)
-        v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
-
-        # ─── GO hero ───
-        hero = QWidget(); hero.setObjectName("sidebar")
-        hl = QVBoxLayout(hero)
-        hl.setContentsMargins(14, 14, 14, 14); hl.setSpacing(10)
+        # ── Fixed header (does NOT scroll) ──
+        header = QWidget(); header.setObjectName("sidebarInner")
+        hl = QVBoxLayout(header)
+        hl.setContentsMargins(14, 14, 14, 8); hl.setSpacing(8)
 
         self.button_pause = QPushButton("▶  START")
         self.button_pause.setObjectName("goBtnPaused")
@@ -696,15 +870,44 @@ class DashboardWindow(QMainWindow):
         self.button_pause.clicked.connect(self.toggle_measurement_pause)
         hl.addWidget(self.button_pause)
 
-        stats = QHBoxLayout(); stats.setSpacing(6)
-        self.stat_fps  = make_stat_cell("Frames / s", "—", "Hz")
-        self.stat_exp  = make_stat_cell("Exposure",   "—", "ms")
-        self.stat_dark = make_stat_cell("Dark lvl",   "—", "ADC")
-        for s in (self.stat_fps, self.stat_exp, self.stat_dark):
-            stats.addWidget(s)
-        hl.addLayout(stats)
-        v.addWidget(hero)
-        v.addWidget(make_hsep())
+        # Export row — takes the place of the old stat chips (Frames/s moves to
+        # the status bar; Exposure/Dark are already there).
+        self.button_save_csv  = self._make_save_button("Save CSV", "csv")
+        self.button_save_csv.clicked.connect(self.export_data_csv)
+        self.button_save_png  = self._make_save_button("Save PNG", "png")
+        self.button_save_png.clicked.connect(self.export_plot_png)
+        self.button_copy_clip = self._make_save_button("Copy", "copy")
+        self.button_copy_clip.setToolTip("Copy the current spectrum to the clipboard")
+        self.button_copy_clip.clicked.connect(self.copy_spectrum_to_clipboard)
+        save_row = QHBoxLayout(); save_row.setSpacing(6)
+        for b in (self.button_save_csv, self.button_save_png, self.button_copy_clip):
+            save_row.addWidget(b)
+        hl.addLayout(save_row)
+
+        # Fixed acquisition controls (stay visible while everything else scrolls).
+        self.header_controls = QWidget(); self.header_controls.setObjectName("sidebarInner")
+        self._fixed_acq = QVBoxLayout(self.header_controls)
+        self._fixed_acq.setContentsMargins(0, 4, 0, 0); self._fixed_acq.setSpacing(2)
+        hl.addWidget(self.header_controls)
+
+        ol.addWidget(header)
+        ol.addWidget(make_hsep())
+
+        # ── Scrolling controls ──
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Always reserve the scrollbar's width (even when content fits) so
+        # opening a section that needs scrolling doesn't shift every row left —
+        # the width is constant whether or not the bar is actually needed.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        ol.addWidget(scroll, 1)
+
+        self.control_widget = QWidget()
+        self.control_widget.setObjectName("sidebarInner")
+        scroll.setWidget(self.control_widget)
+        v = QVBoxLayout(self.control_widget)
+        v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
 
         # ─── Acquisition ───
         self.spinbox_averaging = self._spin_int(
@@ -791,21 +994,27 @@ class DashboardWindow(QMainWindow):
         if idx >= 0:
             self.combo_reference.setCurrentIndex(idx)
 
-        v.addLayout(self._section("Acquisition · 04", [
-            ("Exposure",          "ms", [self.button_exposure_reset, self.spinbox_exposure]),
-            ("Auto exposure",       None, self.button_auto_exposure),
-            ("Frames to average",   None, self.spinbox_averaging),
-            ("Fast preview",        None, self.button_fast_preview),
-            ("Short frame",         "%",  self.spinbox_fp_short_pct),
-            ("Reference library", None, self.combo_reference),
-        ]))
+        # Fixed (non-scrolling) acquisition controls, in the header.
+        for _lbl, _sub, _ctl in [
+            ("Exposure",      "ms", [self.button_exposure_reset, self.spinbox_exposure]),
+            ("Auto exposure", None, self.button_auto_exposure),
+            ("Fast preview",  None, self.button_fast_preview),
+            ("Short frame",   "%",  self.spinbox_fp_short_pct),
+        ]:
+            self._fixed_acq.addWidget(make_row(_lbl, _ctl, sub=_sub))
 
-        v.addLayout(self._section("Smoothing · 05", [
+        # Scrolling sections start here (collapsible).
+        _sec_acquisition = self._collapsible("Acquisition", [
+            ("Frames to average", None, self.spinbox_averaging),
+            ("Reference library", None, self.combo_reference),
+        ])
+
+        _sec_smoothing = self._collapsible("Smoothing", [
             ("Enable smoothing",   None, self.button_fusion),
             ("Smoothing",       "%",  self.spinbox_fusion_smoothing),
             ("Peak sensitivity", None, self.spinbox_fusion_sigma),
             ("Output rate",     None, self.spinbox_fusion_rate),
-        ]))
+        ], collapsed=True)
 
         # ─── Display ───
         self.spinbox_x_min = self._spin_int(Config.get("x_min_nm", 380), 100, 1500, 10, 72)
@@ -835,11 +1044,11 @@ class DashboardWindow(QMainWindow):
             "Snap Y max to the current frame peak\n(also disables Auto-scale Y)")
         self.button_y_snap.clicked.connect(self._snap_y_to_peak)
 
-        v.addLayout(self._section("Display · 03", [
+        _sec_display = self._collapsible("Display", [
             ("Wavelength range", "nm", [self.spinbox_x_min, self.spinbox_x_max]),
             ("Auto-scale Y",     None, self.button_auto_y_axis),
             ("Y max",            "ADC", [self.button_y_snap, self.spinbox_y_max]),
-        ]))
+        ])
 
         # ─── Processing ───
         self.button_dark_correct = ToggleSwitch(self.is_dark_correction_enabled)
@@ -907,7 +1116,7 @@ class DashboardWindow(QMainWindow):
         self.button_calibrate = QPushButton("Calibration…")
         self.button_calibrate.clicked.connect(self.open_calibration_dialog)
 
-        v.addLayout(self._section("Processing · 06", [
+        _sec_processing = self._collapsible("Processing", [
             ("Dark correction",       None,  self.button_dark_correct),
             ("Dark mode",             None,  self.combo_dark_mode),
             ("Bias offset",          "ADC",  self.spinbox_dark_bias),
@@ -918,7 +1127,7 @@ class DashboardWindow(QMainWindow):
             ("Spatial width",         "px",  self.spinbox_spatial_width),
             ("Response correction",   None,  [self.combo_response, self.button_response_delete]),
             ("Calibrate device",      None,  self.button_calibrate),
-        ]))
+        ])
 
         # ─── Peak detection ───
         self.spinbox_sg_window = self._spin_int(
@@ -945,31 +1154,21 @@ class DashboardWindow(QMainWindow):
             Config.get("peak_max_count", 3), 1, 12, 1, 60)
         self.spinbox_peak_count.valueChanged.connect(self._on_peak_param_changed)
 
-        v.addLayout(self._section("Peak detection · 05", [
+        _sec_peaks = self._collapsible("Peak detection", [
             ("Savitzky-Golay window", "px", self.spinbox_sg_window),
             ("Savitzky-Golay order",  None, self.spinbox_sg_order),
             ("Prominence min",       "ADC", self.spinbox_prominence),
             ("Min peak distance",     "px", self.spinbox_min_dist),
             ("Max peak count",        None, self.spinbox_peak_count),
-        ]))
+        ], collapsed=True)
 
-        # ─── Export ───
-        export_w = QWidget()
-        ex_v = QVBoxLayout(export_w)
-        ex_v.setContentsMargins(14, 14, 14, 18); ex_v.setSpacing(8)
-        hdr = QLabel("EXPORT"); hdr.setObjectName("sectionHeader")
-        ex_v.addWidget(hdr)
-        row = QHBoxLayout(); row.setSpacing(6)
-        self.button_save_csv = QPushButton("Save CSV")
-        self.button_save_csv.clicked.connect(self.export_data_csv)
-        self.button_save_png = QPushButton("Save PNG")
-        self.button_save_png.clicked.connect(self.export_plot_png)
-        row.addWidget(self.button_save_csv); row.addWidget(self.button_save_png)
-        ex_v.addLayout(row)
-        self.button_copy_clip = QPushButton("Copy spectrum to clipboard")
-        self.button_copy_clip.clicked.connect(self.copy_spectrum_to_clipboard)
-        ex_v.addWidget(self.button_copy_clip)
-        v.addWidget(export_w)
+        _sec_data = self._build_data_section()
+
+        # Display, Acquisition, Smoothing, Processing, Peak detection, Data.
+        for _sec in (_sec_display, _sec_acquisition, _sec_smoothing,
+                    _sec_processing, _sec_peaks, _sec_data):
+            v.addLayout(_sec)
+
         v.addStretch(1)
 
         self.apply_dark_mode()
@@ -990,10 +1189,146 @@ class DashboardWindow(QMainWindow):
             v.addWidget(make_row(label, control, sub=sub))
         v.addSpacing(6)
         v.addWidget(make_hsep())
-        w = QWidget(); w.setObjectName("sidebar"); w.setLayout(v)
+        w = QWidget(); w.setObjectName("sidebarInner"); w.setLayout(v)
         outer = QVBoxLayout(); outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(w)
         return outer
+
+    def _build_data_section(self):
+        """Central export settings: directory (applies to every save in every
+        tab — CSV, PNG, reports, autosave) plus the filename template."""
+        box = QWidget(); box.setObjectName("sidebarInner")
+        bl = QVBoxLayout(box); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(0)
+        hdr = QPushButton(); hdr.setObjectName("sectionHeader")
+        hdr.setCheckable(True); hdr.setChecked(True)
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr.setStyleSheet("QPushButton { text-align:left; border:none; "
+                          "background:transparent; padding:12px 14px 4px 14px; }")
+        hdr.setText("▾  DATA")
+        content = QWidget(); content.setObjectName("sidebarInner")
+        cv = QVBoxLayout(content); cv.setContentsMargins(14, 0, 14, 12); cv.setSpacing(6)
+
+        self.btn_export_dir = QPushButton("Choose export folder…")
+        self.btn_export_dir.clicked.connect(self._choose_export_dir)
+        cv.addWidget(self.btn_export_dir)
+
+        self.lbl_export_status = QLabel()
+        self.lbl_export_status.setObjectName("readoutLbl")
+        self.lbl_export_status.setWordWrap(True)
+        cv.addWidget(self.lbl_export_status)
+
+        _fn_lbl = QLabel("Filename"); _fn_lbl.setObjectName("rowLbl")
+        cv.addWidget(_fn_lbl)
+        self.edit_export_template = QLineEdit(
+            Config.get("export_filename_template", export_paths.DEFAULT_TEMPLATE))
+        self.edit_export_template.setToolTip(export_paths.TOKEN_HELP)
+        # Live "debug" preview on every keystroke; persist on commit.
+        self.edit_export_template.textChanged.connect(self._on_export_template_live)
+        self.edit_export_template.editingFinished.connect(self._on_export_template)
+        cv.addWidget(self.edit_export_template)
+
+        tok = QLabel(export_paths.TOKEN_HELP)
+        tok.setObjectName("readoutLbl"); tok.setWordWrap(True)
+        cv.addWidget(tok)
+
+        self.lbl_export_preview = QLabel()
+        self.lbl_export_preview.setObjectName("readoutLbl"); self.lbl_export_preview.setWordWrap(True)
+        cv.addWidget(self.lbl_export_preview)
+
+        bl.addWidget(hdr); bl.addWidget(content); bl.addWidget(make_hsep())
+        content.setVisible(True)
+        hdr.toggled.connect(lambda c: (content.setVisible(c),
+                                       hdr.setText(("▾  " if c else "▸  ") + "DATA")))
+        self._refresh_export_status()
+        outer = QVBoxLayout(); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
+        return outer
+
+    def _choose_export_dir(self) -> None:
+        cur = export_paths.configured_dir()
+        d = QFileDialog.getExistingDirectory(self, "Export folder", cur)
+        if d:
+            Config.set("export_dir", d)
+            self._refresh_export_status()
+
+    def _on_export_template(self) -> None:
+        Config.set("export_filename_template",
+                   self.edit_export_template.text().strip()
+                   or export_paths.DEFAULT_TEMPLATE)
+        self._refresh_export_status()
+
+    def _on_export_template_live(self, text: str) -> None:
+        """Preview the exact filename for whatever is currently typed (a live
+        'debug' of the template) without committing it to config until the edit
+        finishes."""
+        tmpl = text.strip() or export_paths.DEFAULT_TEMPLATE
+        try:
+            saved = Config.get("export_filename_template", export_paths.DEFAULT_TEMPLATE)
+            Config.set("export_filename_template", tmpl)
+            preview = export_paths.build_filename("spectrum", "csv", self.export_meta())
+            Config.set("export_filename_template", saved)   # don't persist while typing
+            self.lbl_export_preview.setText(f"e.g. {preview}")
+        except Exception:
+            self.lbl_export_preview.setText("")
+
+    def _refresh_export_status(self) -> None:
+        """Show the effective export folder (and any fallback error) + a live
+        filename preview."""
+        d, err = export_paths.ensure_export_dir()
+        self.lbl_export_status.setText(("⚠ " + err) if err else f"Folder: {d}")
+        try:
+            preview = export_paths.build_filename("spectrum", "csv", self.export_meta())
+            self.lbl_export_preview.setText(f"e.g. {preview}")
+        except Exception:
+            self.lbl_export_preview.setText("")
+
+    def _collapsible(self, title, rows, collapsed=False):
+        """Titled section whose body can be folded away to shorten the sidebar
+        scroll. Header click toggles; returns a layout (like _section)."""
+        box = QWidget(); box.setObjectName("sidebarInner")
+        bl = QVBoxLayout(box); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(0)
+        hdr = QPushButton(); hdr.setObjectName("sectionHeader")
+        hdr.setCheckable(True); hdr.setChecked(not collapsed)
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr.setStyleSheet(
+            "QPushButton { text-align:left; border:none; background:transparent; "
+            "padding:12px 14px 4px 14px; }")
+
+        def _fmt(open_):
+            return ("▾  " if open_ else "▸  ") + title.upper()
+        hdr.setText(_fmt(not collapsed))
+
+        content = QWidget(); content.setObjectName("sidebarInner")
+        cv = QVBoxLayout(content); cv.setContentsMargins(14, 0, 14, 12); cv.setSpacing(2)
+        for label, sub, control in rows:
+            cv.addWidget(make_row(label, control, sub=sub))
+        content.setVisible(not collapsed)
+
+        def _toggle(checked):
+            content.setVisible(checked); hdr.setText(_fmt(checked))
+        hdr.toggled.connect(_toggle)
+
+        bl.addWidget(hdr); bl.addWidget(content); bl.addWidget(make_hsep())
+        outer = QVBoxLayout(); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
+        return outer
+
+    def _make_save_button(self, text, kind):
+        """Flat, subtly tinted export button for the fixed header."""
+        colors = {   # fg, border, bg, hover-bg
+            "csv":  ("#cbb96a", "#5a5230", "rgba(203,185,106,0.10)", "rgba(203,185,106,0.20)"),
+            "png":  ("#b49ad6", "#4c4066", "rgba(180,154,214,0.10)", "rgba(180,154,214,0.20)"),
+            "copy": ("#8fc79a", "#3c5a42", "rgba(143,199,154,0.10)", "rgba(143,199,154,0.20)"),
+        }
+        fg, br, bg, bgh = colors.get(kind, colors["csv"])
+        b = QPushButton(text)
+        b.setFixedHeight(30)
+        b.setStyleSheet(
+            f"QPushButton {{ color:{fg}; border:1px solid {br}; background:{bg}; "
+            f"border-radius:6px; padding:4px 8px; font-size:12px; }}"
+            f"QPushButton:hover {{ background:{bgh}; }}"
+            f"QPushButton:disabled {{ color:#666; border-color:#333; background:transparent; }}")
+        return b
 
     # ──────────────── STATUS BAR ────────────────
     def _build_statusbar(self) -> QWidget:
@@ -1011,6 +1346,7 @@ class DashboardWindow(QMainWindow):
             wl.addWidget(kl); wl.addWidget(vl)
             return wrap, vl
 
+        wrap0, self.status_fps         = kv("Frames / s", "—")
         wrap1, self.status_integration = kv("Integration", "—")
         wrap2, self.status_dark        = kv("Dark", "—")
         wrap3, self.status_bias        = kv("Bias",
@@ -1018,7 +1354,7 @@ class DashboardWindow(QMainWindow):
         wrap4, self.status_rate        = kv("Rate",
             f"{Config.get('dark_rate_adc_per_s', DEFAULT_DARK_RATE_ADC_PER_SEC):.2f} ADC/s")
         wrap5, self.status_conn        = kv("Status", "Disconnected")
-        for wrap in (wrap1, wrap2, wrap3, wrap4, wrap5):
+        for wrap in (wrap0, wrap1, wrap2, wrap3, wrap4, wrap5):
             h.addWidget(wrap); h.addWidget(make_vsep())
         h.addStretch(1)
 
@@ -1245,7 +1581,11 @@ class DashboardWindow(QMainWindow):
                 self._pixels_pre_response    = np.zeros(self.active_pixel_count)
                 # Rebuild heatmap buffer for new pixel count
                 self.heatmap_buffer = np.zeros(
-                    (self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+                    (self.active_pixel_count, self.heatmap_size))
+                self.heatmap_times = np.full(self.heatmap_size, np.nan)
+                self._heatmap_filled = 0
+                self._hm_go_live()
+                self.slider_hm_scrub.setRange(0, 0)
                 self.heatmap_linear_waves = np.linspace(
                     self.active_wavelengths[0], self.active_wavelengths[-1],
                     self.active_pixel_count)
@@ -1288,6 +1628,7 @@ class DashboardWindow(QMainWindow):
             self.combo_backend.setEnabled(False)
             self.button_scan.setEnabled(False)
             self.control_widget.setEnabled(True)
+            self.header_controls.setEnabled(True)
             self._update_spec_overlay()
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", str(e))
@@ -1310,6 +1651,7 @@ class DashboardWindow(QMainWindow):
         self.combo_backend.setEnabled(True)
         self.button_scan.setEnabled(True)
         self.control_widget.setEnabled(False)
+        self.header_controls.setEnabled(False)
         self._is_paused = False
         self._set_pause_button_state(False)
         self.button_pause.setEnabled(False)
@@ -1376,6 +1718,11 @@ class DashboardWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════
     # MOUSE → live readout
     # ════════════════════════════════════════════════════════════
+    def export_meta(self) -> dict:
+        """Token fields for export_paths (device / serial / wavelength span)."""
+        return export_paths.meta_from_report(self.report_meta(),
+                                             getattr(self, "active_wavelengths", None))
+
     def report_meta(self) -> dict:
         """Acquisition parameters stamped onto colour/filter reports. Missing
         values are dropped by the renderer."""
@@ -1400,6 +1747,13 @@ class DashboardWindow(QMainWindow):
             return
         view_pt = self.plot_canvas.getPlotItem().vb.mapSceneToView(pos)
         idx = (np.abs(self.active_wavelengths - view_pt.x())).argmin()
+        # Moving an InfiniteLine forces a full ViewBox repaint; at 30 Hz over a
+        # big curve on a laptop iGPU that starves the acquisition thread (GIL/
+        # CPU) and glitches the LR-2T. Skip the repaint when the nearest pixel
+        # hasn't changed (mouse still within one pixel column).
+        if idx == getattr(self, "_last_cursor_idx", -1):
+            return
+        self._last_cursor_idx = idx
         sx, sy = self.active_wavelengths[idx], self.current_averaged_pixels[idx]
         self.cursor_vline.setPos(sx); self.cursor_hline.setPos(sy)
         self._set_readout(self.readout_pix, str(idx))
@@ -1412,15 +1766,42 @@ class DashboardWindow(QMainWindow):
             return
         view_pt = self.heatmap_canvas.getPlotItem().vb.mapSceneToView(pos)
         lin_idx = (np.abs(self.heatmap_linear_waves - view_pt.x())).argmin()
+        frame_index = int(np.clip(round(view_pt.y()), 0, self.heatmap_size - 1))
+        key = (lin_idx, frame_index)
+        if key == getattr(self, "_last_hm_cursor", None):
+            return
+        self._last_hm_cursor = key
         sx = self.heatmap_linear_waves[lin_idx]
         hw_pixel = (np.abs(self.active_wavelengths - sx)).argmin()
-        frame_index = int(np.clip(round(view_pt.y()), 0, HEATMAP_HISTORY_SIZE - 1))
         intensity = self.heatmap_buffer[lin_idx, frame_index]
         self.heatmap_cursor_vline.setPos(sx)
         self.heatmap_cursor_hline.setPos(frame_index)
+        self.scrub_cursor_vline.setPos(sx)     # keep both crosshairs in lockstep
         self._set_readout(self.readout_pix, f"~{hw_pixel}")
         self._set_readout(self.readout_wl,  f"{sx:.1f}")
         self._set_readout(self.readout_int, f"{intensity:.0f}")
+
+    def handle_scrub_mouse_movement(self, ev) -> None:
+        """Hovering the scrubbed-frame spectrum (top) sweeps the SAME vertical
+        crosshair across the heatmap image (bottom) too — the two plots share
+        the wavelength axis (setXLink), so a scene x maps to the same
+        wavelength in both."""
+        pos = ev[0]
+        if not self.plot_hm_scrub.sceneBoundingRect().contains(pos):
+            return
+        view_pt = self.plot_hm_scrub.getPlotItem().vb.mapSceneToView(pos)
+        lin_idx = (np.abs(self.heatmap_linear_waves - view_pt.x())).argmin()
+        if lin_idx == getattr(self, "_last_scrub_cursor", -1):
+            return
+        self._last_scrub_cursor = lin_idx
+        sx = self.heatmap_linear_waves[lin_idx]
+        self.scrub_cursor_vline.setPos(sx)
+        self.heatmap_cursor_vline.setPos(sx)
+        y = self.curve_hm_scrub.yData[lin_idx] if self.curve_hm_scrub.yData is not None else 0.0
+        hw_pixel = (np.abs(self.active_wavelengths - sx)).argmin()
+        self._set_readout(self.readout_pix, f"~{hw_pixel}")
+        self._set_readout(self.readout_wl,  f"{sx:.1f}")
+        self._set_readout(self.readout_int, f"{y:.0f}")
 
     # ════════════════════════════════════════════════════════════
     # CONTROL HANDLERS
@@ -1973,14 +2354,10 @@ class DashboardWindow(QMainWindow):
         if ob <= 0.0:
             self.status_dark.setText("— ADC")
             self.status_integration.setText("— ms")
-            update_stat_cell(self.stat_dark, "—")
-            update_stat_cell(self.stat_exp, f"{integration_ms:.0f}")
             self._restyle_sensor_chip("neutral", "Sensor: —")
             return
         self.status_dark.setText(f"{ob:.2f} ADC")
         self.status_integration.setText(f"{integration_ms:.1f} ms")
-        update_stat_cell(self.stat_dark, f"{ob:.1f}")
-        update_stat_cell(self.stat_exp,  f"{integration_ms:.0f}")
 
         thermal_part = ob - (DEFAULT_DARK_RATE_ADC_PER_SEC * integration_ms / 1000.0)
         delta = thermal_part - OB_TEMP_REFERENCE_ADC
@@ -1992,20 +2369,257 @@ class DashboardWindow(QMainWindow):
             self._restyle_sensor_chip("danger", f"Sensor: {delta:+.1f} ADC · warm")
 
     # ════════════════════════════════════════════════════════════
+    # TIME-LAPSE HEATMAP
+    # ════════════════════════════════════════════════════════════
+    def _update_heatmap_span(self) -> None:
+        """Show the wall-clock time the buffer spans = frames × effective
+        interval. The effective interval is the LARGER of 'Log every' and the
+        current frame period — exposure is not subtracted from the log interval;
+        if a frame takes longer than the interval, every frame is logged (you
+        can't log a frame that hasn't been acquired yet)."""
+        if not hasattr(self, "lbl_hm_span"):
+            return
+        frame_period = (1.0 / self._current_fps) if self._current_fps > 0 else 0.0
+        eff = max(self._heatmap_measure_ms / 1000.0, frame_period)
+        if eff <= 0.0:
+            self.lbl_hm_span.setText("Span —")
+            return
+        secs = self.heatmap_size * eff
+        if secs < 90:
+            txt = f"{secs:.0f} s"
+        elif secs < 5400:
+            txt = f"{secs / 60:.1f} min"
+        else:
+            txt = f"{secs / 3600:.1f} h"
+        self.lbl_hm_span.setText(f"Span ≈ {txt}")
+
+    # ── Autosave (streams every logged frame to disk, independent of the
+    # on-screen ring buffer, so a long run isn't limited to its size) ──
+    def _on_autosave_toggled(self, checked: bool) -> None:
+        Config.set("heatmap_autosave_enabled", bool(checked))
+        if checked:
+            self._start_autosave()
+        else:
+            self._stop_autosave()
+
+    def _start_autosave(self) -> None:
+        self._stop_autosave()
+        path, path_err = export_paths.export_path("timelapse_autosave", "csv",
+                                                  self.export_meta())
+        try:
+            self._autosave_writer = HeatmapAutosaveWriter(
+                path, self.heatmap_linear_waves,
+                fsync_interval_s=Config.get("heatmap_autosave_fsync_s", 20))
+            self.lbl_hm_autosave.setText(f"→ {os.path.basename(path)}")
+            if path_err and hasattr(self, "lbl_export_status"):
+                self.lbl_export_status.setText(f"⚠ {path_err}")
+        except OSError as e:
+            self._autosave_writer = None
+            self.chk_hm_autosave.setChecked(False)
+            QMessageBox.warning(self, "Autosave failed",
+                                f"Could not open the autosave file:\n{e}")
+
+    def _stop_autosave(self) -> None:
+        if self._autosave_writer is not None:
+            self._autosave_writer.close()
+            self._autosave_writer = None
+        self.lbl_hm_autosave.setText("")
+
+    # ── Rewind / scrub ──
+    # Shared box metrics so the Live/Export buttons render exactly the same
+    # height as the Buffer spinbox field. The field renders 33px (its up/down
+    # subcontrols bump it past the plain box formula), so min-height 27 + 2px
+    # padding + 1px border ⇒ 33 to match.
+    _HM_BTN_BOX = ("border-radius:5px; padding:2px 12px; min-height:27px; "
+                   "font-size:12px; font-weight:500;")
+
+    def _hm_style_live_button(self, mode: str) -> None:
+        """mode: 'live' (green, idle) or 'active' (red — peeking at the live
+        frame or scrubbing history). The frame-export button always mirrors
+        this: exportable exactly when a specific frame is on screen."""
+        if mode == "live":
+            fg, br, bg, bgh = "#8fc79a", "#3c5a42", "rgba(143,199,154,0.10)", "rgba(143,199,154,0.20)"
+        else:
+            fg, br, bg, bgh = "#e0958c", "#6b3e38", "rgba(224,149,140,0.12)", "rgba(224,149,140,0.22)"
+        self.btn_hm_live.setStyleSheet(
+            f"QPushButton {{ color:{fg}; border:1px solid {br}; background:{bg}; "
+            f"{self._HM_BTN_BOX} }}"
+            f"QPushButton:hover {{ background:{bgh}; }}")
+        self._hm_style_export_button(mode == "active")
+
+    def _hm_style_export_button(self, enabled: bool) -> None:
+        """Purple-tinted (matches Save PNG) when a specific frame is on screen
+        and exportable; muted/disabled while idle-live."""
+        self.btn_hm_export_frame.setEnabled(enabled)
+        if enabled:
+            fg, br, bg, bgh = "#b49ad6", "#4c4066", "rgba(180,154,214,0.10)", "rgba(180,154,214,0.20)"
+            self.btn_hm_export_frame.setStyleSheet(
+                f"QPushButton {{ color:{fg}; border:1px solid {br}; background:{bg}; "
+                f"{self._HM_BTN_BOX} }}"
+                f"QPushButton:hover {{ background:{bgh}; }}")
+        else:
+            # Same box metrics, muted disabled colours (so it stays the same
+            # height as the field/Live button rather than falling back to the
+            # taller global QPushButton style).
+            self.btn_hm_export_frame.setStyleSheet(
+                f"QPushButton {{ color:#5c6270; border:1px solid #2f333c; "
+                f"background:transparent; {self._HM_BTN_BOX} }}")
+
+    def _hm_export_frame_csv(self) -> None:
+        """Export ONLY the currently viewed (scrubbed/peeked) frame, not the
+        whole buffer — a single (wavelength, intensity) CSV, same convention
+        as the regular single-spectrum export."""
+        if not (self._hm_scrub_active or self._hm_peek):
+            return
+        index = self._hm_scrub_index if self._hm_scrub_active else 0
+        if self._heatmap_filled == 0 or index >= self.heatmap_buffer.shape[1]:
+            return
+        index = min(index, self._heatmap_filled - 1)
+        spec = self.heatmap_buffer[:, index]
+        meta = self.export_meta()
+        filename, path_err = export_paths.export_path(f"frame{index}", "csv", meta)
+        try:
+            with open(filename, "w", newline="") as f:
+                w = csv.writer(f, delimiter=";")
+                age = self.heatmap_times[index]
+                age_s = (f"{time.monotonic() - age:.1f}" if np.isfinite(age) else "unknown")
+                w.writerow([f"# Time-lapse frame {index}"])
+                w.writerow([f"# Seconds before export"] if age_s == "unknown"
+                          else [f"# Seconds before export;{age_s}"])
+                w.writerow(["Wavelength_nm", "ADC_Counts"])
+                for wl, v in zip(self.heatmap_linear_waves, spec):
+                    w.writerow([f"{wl:.2f}", round(float(v), 2)])
+            self._note_export_saved(filename, path_err)
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+
+    def _hm_on_live_clicked(self) -> None:
+        if self._hm_scrub_active:
+            # Was rewound into history — Live always means "back to live".
+            self._hm_go_live()
+        else:
+            # Already idle/live — toggle the pinned peek at the current frame.
+            self._hm_peek = not self._hm_peek
+            if self._hm_peek:
+                self._hm_scrub_render(0)
+                self._hm_style_live_button("active")
+            else:
+                self.plot_hm_scrub.setVisible(False)
+                self.lbl_hm_scrub.setText("● LIVE")
+                self._hm_style_live_button("live")
+
+    def _hm_on_scrub(self, value: int) -> None:
+        """User dragged the slider (or code moved it programmatically for the
+        DVR-follow behaviour, which blocks this signal — see the push handler)."""
+        if value <= 0:
+            self._hm_go_live()
+            return
+        self._hm_peek = False          # a real historical scrub supersedes peek
+        self._hm_scrub_active = True
+        self._hm_scrub_index = value
+        self._hm_scrub_render(value)
+        self._hm_style_live_button("active")
+
+    def _hm_go_live(self) -> None:
+        self._hm_scrub_active = False
+        self._hm_scrub_index = 0
+        self._hm_peek = False
+        self.slider_hm_scrub.blockSignals(True)
+        self.slider_hm_scrub.setValue(0)
+        self.slider_hm_scrub.blockSignals(False)
+        self.plot_hm_scrub.setVisible(False)
+        self.lbl_hm_scrub.setText("● LIVE")
+        self._hm_style_live_button("live")
+
+    def _hm_scrub_render(self, index: int) -> None:
+        if index >= self.heatmap_buffer.shape[1] or self._heatmap_filled == 0:
+            return
+        index = min(index, self._heatmap_filled - 1)
+        spec = self.heatmap_buffer[:, index]
+        self.curve_hm_scrub.setData(self.heatmap_linear_waves, spec)
+        self.plot_hm_scrub.setVisible(True)
+        t = self.heatmap_times[index]
+        if np.isfinite(t):
+            elapsed = time.monotonic() - t
+            age_txt = (f"{elapsed:.1f}s ago" if elapsed < 90
+                       else f"{elapsed/60:.1f} min ago")
+        else:
+            age_txt = "unknown age"
+        if self._hm_peek and index == 0:
+            self.lbl_hm_scrub.setText(f"●  Frame 0 (live) · {age_txt}")
+        else:
+            frame_txt = "oldest" if index >= self._heatmap_filled - 1 else f"frame {index}"
+            self.lbl_hm_scrub.setText(f"⏸ T-{age_txt} · {frame_txt}")
+        # Mirror the position on the heatmap image with the existing cursor line.
+        self.heatmap_cursor_hline.setPos(index)
+
+    def set_heatmap_size(self, n: int) -> None:
+        """Resize the rolling time-lapse buffer (snapped to 10-frame steps).
+        Reallocates and clears (per the agreed behaviour) and persists."""
+        n = max(10, (int(n) // 10) * 10)
+        self.heatmap_size = n
+        Config.set("heatmap_buffer_size", n)
+        self.heatmap_buffer = np.zeros((self.active_pixel_count, n))
+        self.heatmap_times = np.full(n, np.nan)
+        self._heatmap_filled = 0
+        self._hm_go_live()
+        self.slider_hm_scrub.setRange(0, 0)
+        self.heatmap_canvas.setYRange(0, n, padding=0)
+        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
+        self._update_heatmap_span()
+
+    def _on_heatmap_rate(self, ms: int) -> None:
+        self._heatmap_measure_ms = max(0, int(ms))
+        Config.set("heatmap_measure_interval_ms", self._heatmap_measure_ms)
+        self._update_heatmap_span()
+
+    def clear_heatmap(self) -> None:
+        """Empty the time-lapse buffer and start over."""
+        self.heatmap_buffer[:] = 0.0
+        self.heatmap_times[:] = np.nan
+        self._heatmap_filled = 0
+        self._heatmap_last_push = 0.0
+        self._hm_go_live()
+        self.slider_hm_scrub.setRange(0, 0)
+        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
+
+    # ════════════════════════════════════════════════════════════
     # EXPORT
     # ════════════════════════════════════════════════════════════
     def export_data_csv(self) -> None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        is_heatmap = (self.tabs.currentWidget() is self.heatmap_canvas)
-        prefix = "heatmap_data" if is_heatmap else "spectrum_data"
-        filename = f"{prefix}_{ts}.csv"
+        is_heatmap = (self.tabs.currentWidget() is self.heatmap_tab)
+        kind = "heatmap" if is_heatmap else "spectrum"
+        filename, path_err = export_paths.export_path(kind, "csv", self.export_meta())
+        frame_indices = None
+        if is_heatmap:
+            # Choose scope so a long logging session isn't dumped by accident.
+            box = QMessageBox(self)
+            box.setWindowTitle("Export time-lapse")
+            box.setIcon(QMessageBox.Icon.Question)
+            filled = self._heatmap_filled
+            box.setText(f"Export which part of the time-lapse? "
+                        f"({filled} frame(s) in the buffer)")
+            b_vis = box.addButton("Visible window", QMessageBox.ButtonRole.AcceptRole)
+            b_all = box.addButton("Full buffer", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked not in (b_vis, b_all):
+                return
+            if clicked is b_vis:
+                (_x, (y0, y1)) = self.heatmap_canvas.getViewBox().viewRange()
+                lo = max(0, int(np.floor(min(y0, y1))))
+                hi = min(filled, int(np.ceil(max(y0, y1))))
+                frame_indices = list(range(lo, hi))
+            else:
+                frame_indices = list(range(filled))
         try:
             with open(filename, "w", newline="") as f:
                 w = csv.writer(f, delimiter=";")
                 if is_heatmap:
                     w.writerow(["Time_Frame"] +
                                [f"{wl:.2f}" for wl in self.heatmap_linear_waves])
-                    for fi in range(HEATMAP_HISTORY_SIZE):
+                    for fi in frame_indices:
                         w.writerow([fi] +
                                    [round(v, 2) for v in self.heatmap_buffer[:, fi]])
                 else:
@@ -2021,23 +2635,38 @@ class DashboardWindow(QMainWindow):
                     for i, (wl, v) in enumerate(
                             zip(self.active_wavelengths, self.current_averaged_pixels)):
                         w.writerow([i, round(wl, 2), round(v, 2)])
-            QMessageBox.information(self, "Success", f"Saved:\n{filename}")
+            self._note_export_saved(filename, path_err)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Save CSV failed: {e}")
 
     def export_plot_png(self) -> None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         widget = self.tabs.currentWidget()
-        prefix = {
-            self.plot_canvas:    "spectrum_plot",
-            self.heatmap_canvas: "heatmap_plot",
-        }.get(widget, "cie_plot")
-        filename = f"{prefix}_{ts}.png"
+        if widget is self.heatmap_tab:
+            kind, grab_target = "heatmap", self.heatmap_canvas
+        elif widget is getattr(self, "cie_tab", None):
+            kind, grab_target = "color", widget
+        elif widget is getattr(self, "filter_tab", None):
+            kind, grab_target = "filter", widget
+        else:
+            kind, grab_target = "spectrum", widget
+        filename, path_err = export_paths.export_path(kind + "_plot", "png",
+                                                      self.export_meta())
         try:
-            widget.grab().save(filename, "PNG")
-            QMessageBox.information(self, "Success", f"Saved:\n{filename}")
+            grab_target.grab().save(filename, "PNG")
+            self._note_export_saved(filename, path_err)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Save PNG failed: {e}")
+
+    def _note_export_saved(self, path, path_err=None) -> None:
+        """Consistent 'saved' feedback + surface a fallback-dir warning if the
+        configured export folder couldn't be used."""
+        import os
+        msg = f"Saved:\n{path}"
+        if path_err:
+            msg += f"\n\n⚠ {path_err}"
+            if hasattr(self, "lbl_export_status"):
+                self.lbl_export_status.setText(f"⚠ {path_err}")
+        QMessageBox.information(self, "Saved", msg)
 
     def copy_spectrum_to_clipboard(self) -> None:
         lines = ["Wavelength_nm\tIntensity_ADC"]
@@ -2063,7 +2692,11 @@ class DashboardWindow(QMainWindow):
             self.active_pixel_count = len(self.active_wavelengths)
             self.heatmap_linear_waves = np.linspace(
                 self.active_wavelengths[0], self.active_wavelengths[-1], self.active_pixel_count)
-            self.heatmap_buffer = np.zeros((self.active_pixel_count, HEATMAP_HISTORY_SIZE))
+            self.heatmap_buffer = np.zeros((self.active_pixel_count, self.heatmap_size))
+            self.heatmap_times = np.full(self.heatmap_size, np.nan)
+            self._heatmap_filled = 0
+            self._hm_go_live()
+            self.slider_hm_scrub.setRange(0, 0)
             self._cie_mask = (self.active_wavelengths >= 380) & (self.active_wavelengths <= 780)
             self._rebuild_image_transform()
 
@@ -2090,7 +2723,9 @@ class DashboardWindow(QMainWindow):
                 self._fps_history.append(1.0 / dt)
                 if self._fps_history:
                     fps = float(np.mean(self._fps_history))
-                    update_stat_cell(self.stat_fps, f"{fps:.1f}")
+                    self._current_fps = fps
+                    self.status_fps.setText(f"{fps:.1f} Hz")
+                    self._update_heatmap_span()
                     if self.hardware_thread is not None:
                         self._restyle_live_pill(True, fps)
         self._last_frame_time = now
@@ -2171,13 +2806,47 @@ class DashboardWindow(QMainWindow):
         self._advance_overlays(self.current_averaged_pixels)
         self._redraw_overlays()
 
-        # 5. Heatmap
-        linear_spec = np.interp(self.heatmap_linear_waves,
-                                self.active_wavelengths, self.current_averaged_pixels)
-        self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
-        self.heatmap_buffer[:, 0] = linear_spec
-        self.image_item.setImage(self.heatmap_buffer, autoLevels=False,
-                                 levels=(0, max(10.0, ideal_heatmap_max)))
+        # 5. Heatmap — optional measurement-rate decimation (decouples the
+        # time-lapse cadence from the live frame rate for long runs; the scope
+        # above still updates every frame).
+        now = time.monotonic()
+        interval = self._heatmap_measure_ms / 1000.0
+        if interval <= 0.0 or (now - self._heatmap_last_push) >= interval:
+            self._heatmap_last_push = now
+            linear_spec = np.interp(self.heatmap_linear_waves,
+                                    self.active_wavelengths, self.current_averaged_pixels)
+            self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
+            self.heatmap_buffer[:, 0] = linear_spec
+            self.heatmap_times = np.roll(self.heatmap_times, 1)
+            self.heatmap_times[0] = now
+            self._heatmap_filled = min(self._heatmap_filled + 1, self.heatmap_size)
+            self.image_item.setImage(self.heatmap_buffer, autoLevels=False,
+                                     levels=(0, max(10.0, ideal_heatmap_max)))
+            if self._autosave_writer is not None:
+                self._autosave_writer.write_frame(
+                    datetime.now().isoformat(timespec="milliseconds"), linear_spec)
+            # Keep the rewind slider's range covering the filled history, and —
+            # if paused on a past frame — keep it pinned to that SAME frame as
+            # the buffer keeps rolling underneath (see _hm_scrub_advance).
+            # IMPORTANT: skip all of this while the user has the handle pressed.
+            # Changing setMaximum() mid-drag changes the pixel->value mapping
+            # under their cursor (same mouse position now means a different
+            # value), which is exactly what made the slider "jump" while
+            # dragging. Their own drag already renders the right frame in real
+            # time via _hm_on_scrub; we just resume housekeeping on release.
+            if not self.slider_hm_scrub.isSliderDown():
+                self.slider_hm_scrub.setMaximum(max(0, self._heatmap_filled - 1))
+                if self._hm_scrub_active:
+                    new_idx = _hm_scrub_advance(True, self._hm_scrub_index, self.heatmap_size)
+                    self._hm_scrub_index = new_idx
+                    self.slider_hm_scrub.blockSignals(True)
+                    self.slider_hm_scrub.setValue(new_idx)
+                    self.slider_hm_scrub.blockSignals(False)
+                    self._hm_scrub_render(new_idx)
+                elif self._hm_peek:
+                    # Peek stays pinned at "newest" (always column 0 after a
+                    # roll — no index advance needed, unlike a historical scrub).
+                    self._hm_scrub_render(0)
 
         # 6. Cursors
         if self.is_measure_mode_enabled:
@@ -2301,5 +2970,6 @@ class DashboardWindow(QMainWindow):
             "x_max_nm":         int(self.spinbox_x_max.value()),
             "y_max_adc":        int(self.spinbox_y_max.value()),
         })
+        self._stop_autosave()
         self.disconnect_device()
         event.accept()

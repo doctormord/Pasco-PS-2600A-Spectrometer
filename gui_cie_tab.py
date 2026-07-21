@@ -1018,20 +1018,16 @@ class CIETab(QWidget):
         if self._latest is None:
             QMessageBox.information(self, "Colour report", "No spectrum yet.")
             return
-        default = f"color_report.{fmt}"
-        flt = "PDF document (*.pdf)" if fmt == "pdf" else "PNG image (*.png)"
-        path, _ = QFileDialog.getSaveFileName(self, "Save colour / CRI report",
-                                              default, flt)
-        if not path:
-            return
-        if not path.lower().endswith("." + fmt):
-            path += "." + fmt
         wl, inten = self._latest
         meta = self.report_meta_provider() if callable(self.report_meta_provider) else None
+        import export_paths
+        path, path_err = export_paths.export_path(
+            "color_report", fmt, export_paths.meta_from_report(meta, wl))
         try:
             cs.render_color_report(path, wl, inten, fmt=fmt,
                                    lux_calibration=self._calib, meta=meta)
-            self.lbl_export.setText(f"Saved {os.path.basename(path)}")
+            self.lbl_export.setText(f"Saved {os.path.basename(path)}"
+                                    + (f"  ⚠ {path_err}" if path_err else ""))
         except ImportError:
             QMessageBox.warning(self, "Colour report",
                                 "matplotlib is not installed — install it to export "
@@ -1043,13 +1039,11 @@ class CIETab(QWidget):
         if self._latest is None:
             QMessageBox.information(self, "Colour CSV", "No spectrum yet.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save colour metrics (CSV)",
-                                              "color_metrics.csv", "CSV file (*.csv)")
-        if not path:
-            return
-        if not path.lower().endswith(".csv"):
-            path += ".csv"
         wl, inten = self._latest
+        meta = self.report_meta_provider() if callable(self.report_meta_provider) else None
+        import export_paths
+        path, path_err = export_paths.export_path(
+            "color_metrics", "csv", export_paths.meta_from_report(meta, wl))
         try:
             import csv
             rows = cs.color_report_rows(wl, inten, self._calib)
@@ -1057,7 +1051,8 @@ class CIETab(QWidget):
                 wr = csv.writer(fh)
                 wr.writerow(["Metric", "Value"])
                 wr.writerows(rows)
-            self.lbl_export.setText(f"Saved {os.path.basename(path)}")
+            self.lbl_export.setText(f"Saved {os.path.basename(path)}"
+                                    + (f"  ⚠ {path_err}" if path_err else ""))
         except Exception as e:
             QMessageBox.warning(self, "Colour CSV", f"Export failed:\n{e}")
 
