@@ -535,6 +535,7 @@ class Engine:
         self._heatmap_measure_ms = max(0, int(self.cfg.get("heatmap_measure_interval_ms", 0) or 0))
         self._heatmap_last_push = 0.0
         self.heatmap_filled = 0
+        self._autosave_writer = None
         self._reset_heatmap()
 
         # fusion (display smoothing) → _fused_emit
@@ -772,8 +773,9 @@ class Engine:
                 "serial": getattr(b, "serial", None) if b is not None else None}
 
     def close(self) -> None:
-        """Shut down jobs and release the device."""
+        """Shut down jobs and autosave, release the device."""
         self.jobs.shutdown()
+        self.stop_autosave()
         try:
             self.disconnect(owner=None, reason="shutdown")
         except Exception as e:                                   # noqa: BLE001
@@ -1096,6 +1098,42 @@ class Engine:
     def clear_heatmap(self) -> None:
         with self._frame_lock:
             self._reset_heatmap()
+            self._heatmap_last_push = 0.0
+
+    # ── time-lapse autosave (crash-safe CSV of every logged heatmap column) ──
+    def start_autosave(self, meta: dict | None = None) -> dict:
+        """Start writing every pushed heatmap column to a CSV in the export
+        folder (export_paths). Returns {"path", "warning"}. Raises OSError."""
+        import export_paths
+        from autosave import HeatmapAutosaveWriter
+        self.stop_autosave()
+        if meta is None:
+            meta = export_paths.meta_from_report(self.report_meta(), self.wavelength_array)
+        path, path_err = export_paths.export_path("timelapse_autosave", "csv", meta)
+        writer = HeatmapAutosaveWriter(
+            path, self.heatmap_linear_waves,
+            fsync_interval_s=self.cfg.get("heatmap_autosave_fsync_s", 20))
+        self._autosave_writer = writer
+        self.cfg.set("heatmap_autosave_enabled", True)
+        info = {"active": True, "path": path, "warning": path_err}
+        self._emit("autosave", info)
+        return info
+
+    def stop_autosave(self) -> dict:
+        w = getattr(self, "_autosave_writer", None)
+        self._autosave_writer = None
+        if w is not None:
+            try:
+                w.close()
+            except Exception as e:                               # noqa: BLE001
+                print(f"[engine] autosave close: {e!r}")
+            self.cfg.set("heatmap_autosave_enabled", False)
+            self._emit("autosave", {"active": False, "path": w.path})
+        return {"active": False, "path": None if w is None else w.path}
+
+    def autosave_info(self) -> dict:
+        w = getattr(self, "_autosave_writer", None)
+        return {"active": w is not None, "path": None if w is None else w.path}
 
     def _process(self, averaged, ob_mean, integration_us, wl, cfg_get=None,
                  runtime=None) -> dict:
@@ -1195,6 +1233,12 @@ class Engine:
                 self.heatmap_filled = min(self.heatmap_filled + 1,
                                           self.heatmap_buffer.shape[1])
                 pushed, ptime = True, mono
+                aw = self._autosave_writer
+                if aw is not None:
+                    try:
+                        aw.write_frame(datetime.now().isoformat(timespec="milliseconds"), col)
+                    except Exception as e:                       # noqa: BLE001
+                        print(f"[engine] autosave write failed: {e!r}")
 
             # colour metrics (throttled)
             self._frame_counter += 1
@@ -1696,6 +1740,76 @@ class Engine:
                     res["protocol"], res["protocol_message"] = self._write_protocol(wf)
                 ctx.job.result = res
         return self.jobs.submit("calibration", run, p, owner)
+
+    def submit_derivation(self, params: dict, *, owner: str) -> Job:
+        """Derive the relative profile of a NEW optics configuration from a
+        KNOWN v2 profile (same diffuse source, both optics) — the desktop
+        wizard's derivation, with its user steps as waiting_for_user:
+        mount known optics → (cover/uncover) → swap optics → (cover/uncover)
+        → compute → save (activated only if plausible)."""
+        import calibration_workflow as cw
+        b = self._require_backend()
+        p = dict(params or {})
+        wf_cfg = cw.WorkflowConfig.from_config()
+        if p.get("frames"):
+            wf_cfg.n_frames = max(2, int(p["frames"]))
+        try:
+            dw = cw.DerivationWorkflow(b, self.device_name,
+                                       known_profile_id=str(p.get("known_profile_id", "")),
+                                       optics=dict(p.get("optics") or {}), cfg=wf_cfg)
+        except KeyError:
+            raise NotFound(f"Profile '{p.get('known_profile_id')}' not found.")
+        except ValueError as e:
+            raise Unprocessable(str(e))
+
+        def pair(ctx: JobContext, which: str):
+            if dw.needs_user_cover:
+                ctx.wait_for_user("Block the light path / cover the source. The dark "
+                                  "spectrum is captured next.", action="cover")
+            ctx.progress(message=f"dark ({which} optics)", step=f"dark_{which}")
+            dw.capture_dark_for(which)
+            if dw.needs_user_cover:
+                ctx.wait_for_user("Release the light path / uncover the source. The "
+                                  "light spectrum is captured next.", action="uncover")
+            ctx.progress(message=f"light ({which} optics)", step=f"light_{which}")
+            dw.capture_light_for(which)
+
+        def run(ctx: JobContext):
+            res: dict = {"status": "failed", "profile_ids": []}
+            ctx.progress(0.05, "setting the integration time", step="integration")
+            us = (None if p.get("integration_ms") in (None, "auto")
+                  else int(float(p["integration_ms"]) * 1000))
+            res["integration_us"] = int(dw.set_integration(us))
+            ctx.wait_for_user("Mount the KNOWN optics on the diffuse, extended source, "
+                              "then continue.", action="mount_known")
+            ctx.progress(0.2, "capturing with the known optics", step="known")
+            pair(ctx, "known")
+            ctx.wait_for_user("Mount the NEW optics on the same diffuse, extended source "
+                              "(same position, same lamp), then continue.",
+                              action="swap_optics")
+            ctx.progress(0.55, "capturing with the new optics", step="new")
+            pair(ctx, "new")
+            ctx.progress(0.85, "computing", step="compute")
+            try:
+                r = dw.compute()
+            except ValueError as e:
+                res["error"] = str(e)
+                return res
+            res["valid_segments_nm"] = json_safe(r.get("segments_nm"))
+            res["plausibility"] = json_safe(dw.plausibility)
+            res["warnings"] = list(dw.warnings)
+            if not dw.plausible and not p.get("allow_implausible"):
+                res["status"] = "not_saved_implausible"
+                return res
+            saved = dw.save(allow_implausible=not dw.plausible)
+            res["profile_ids"] = [saved["id"]]
+            if dw.plausible and p.get("activate", True):
+                calprof.set_active_selection(dw.backend_name, saved["id"])
+                res["activated"] = saved["id"]
+            res["status"] = "saved" if dw.plausible else "saved_implausible"
+            self.rebuild_calibration()
+            return res
+        return self.jobs.submit("derivation", run, p, owner)
 
     def _write_protocol(self, wf) -> tuple[list[str], str]:
         try:

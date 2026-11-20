@@ -84,7 +84,6 @@ from spectrometer_core import (
 import device_manager as dm
 import processing
 from engine import Engine, LOCAL, ControlBusy, EngineError, NeedsConfirmation
-from autosave import HeatmapAutosaveWriter
 import export_paths
 
 
@@ -227,7 +226,6 @@ class DashboardWindow(QMainWindow):
         # interval) lives in the engine; see the heatmap_* properties below.
         self._heatmap_measure_ms = max(0, int(Config.get("heatmap_measure_interval_ms", 0)))
         self._current_fps = 0.0                  # for the buffer-span estimate
-        self._autosave_writer = None             # HeatmapAutosaveWriter | None
         # Rewind/scrub state. index is "frames behind live" (0 = live/newest).
         # While active, the index is advanced by 1 on every push (see
         # _hm_scrub_advance) so it keeps pointing at the SAME absolute frame as
@@ -256,6 +254,8 @@ class DashboardWindow(QMainWindow):
 
         # Apply initial theme
         self.apply_theme(Config.get("theme", "dark"))
+        # Remote access: start the server if it was on when the app closed.
+        QTimer.singleShot(0, self.remote_panel.autostart_if_enabled)
 
     # ════════════════════════════════════════════════════════════
     # Engine-backed state (read-through properties)
@@ -1214,7 +1214,31 @@ class DashboardWindow(QMainWindow):
         self.button_calibrate = QPushButton("Calibration…")
         self.button_calibrate.clicked.connect(self.open_calibration_dialog)
 
+        # Display unit without a v2 profile (counts / counts/s) and the
+        # irradiance unit of absolute profiles (same config keys as the web UI).
+        self.combo_display_unit = QComboBox()
+        self.combo_display_unit.addItem("counts", "counts")
+        self.combo_display_unit.addItem("counts/s", "counts_per_s")
+        self.combo_display_unit.setCurrentIndex(
+            max(0, self.combo_display_unit.findData(Config.get("display_unit", "counts"))))
+        self.combo_display_unit.setToolTip(
+            "Y unit when no calibration profile is active: raw counts or the\n"
+            "integration-time independent count rate (dark subtracted).")
+        self.combo_display_unit.currentIndexChanged.connect(
+            lambda _i: self._cfg({"display_unit": self.combo_display_unit.currentData()}))
+        self.combo_irradiance_unit = QComboBox()
+        for code in ("uW/cm2/nm", "W/m2/nm", "mW/m2/nm"):
+            self.combo_irradiance_unit.addItem(processing.unit_label(code), code)
+        self.combo_irradiance_unit.setCurrentIndex(
+            max(0, self.combo_irradiance_unit.findData(Config.get("irradiance_unit", "uW/cm2/nm"))))
+        self.combo_irradiance_unit.setToolTip(
+            "Output unit of ABSOLUTE calibration profiles (spectral irradiance).")
+        self.combo_irradiance_unit.currentIndexChanged.connect(
+            lambda _i: self._cfg({"irradiance_unit": self.combo_irradiance_unit.currentData()}))
+
         _sec_processing = self._collapsible("Processing", [
+            ("Display unit",          None,  self.combo_display_unit),
+            ("Irradiance unit",       None,  self.combo_irradiance_unit),
             ("Dark correction",       None,  self.button_dark_correct),
             ("Dark mode",             None,  self.combo_dark_mode),
             ("Stored dark",           None,  self.button_capture_dark),
@@ -1263,10 +1287,12 @@ class DashboardWindow(QMainWindow):
         ], collapsed=True)
 
         _sec_data = self._build_data_section()
+        _sec_remote = self._build_remote_section()
 
-        # Display, Acquisition, Smoothing, Processing, Peak detection, Data.
+        # Display, Acquisition, Smoothing, Processing, Peak detection, Data,
+        # Remote access.
         for _sec in (_sec_display, _sec_acquisition, _sec_smoothing,
-                    _sec_processing, _sec_peaks, _sec_data):
+                    _sec_processing, _sec_peaks, _sec_data, _sec_remote):
             v.addLayout(_sec)
 
         v.addStretch(1)
@@ -1340,6 +1366,34 @@ class DashboardWindow(QMainWindow):
         hdr.toggled.connect(lambda c: (content.setVisible(c),
                                        hdr.setText(("▾  " if c else "▸  ") + "DATA")))
         self._refresh_export_status()
+        outer = QVBoxLayout(); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
+        return outer
+
+    def _build_remote_section(self):
+        """'Remote access': REST API / web UI / MCP server of this app
+        (gui_remote.RemotePanel over server_runner.ServerRunner)."""
+        from gui_remote import RemotePanel
+        box = QWidget(); box.setObjectName("sidebarInner")
+        bl = QVBoxLayout(box); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(0)
+        hdr = QPushButton(); hdr.setObjectName("sectionHeader")
+        hdr.setCheckable(True)
+        open_ = bool(Config.get("remote_enabled", False))
+        hdr.setChecked(open_)
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hdr.setStyleSheet("QPushButton { text-align:left; border:none; "
+                          "background:transparent; padding:12px 14px 4px 14px; }")
+        content = QWidget(); content.setObjectName("sidebarInner")
+        cv = QVBoxLayout(content); cv.setContentsMargins(14, 0, 14, 12); cv.setSpacing(2)
+        self.remote_panel = RemotePanel(self.engine, content)
+        cv.addWidget(self.remote_panel)
+
+        def _fmt(o):
+            return ("▾  " if o else "▸  ") + "REMOTE ACCESS"
+        hdr.setText(_fmt(open_))
+        content.setVisible(open_)
+        hdr.toggled.connect(lambda c: (content.setVisible(c), hdr.setText(_fmt(c))))
+        bl.addWidget(hdr); bl.addWidget(content); bl.addWidget(make_hsep())
         outer = QVBoxLayout(); outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(box)
         return outer
@@ -1457,6 +1511,22 @@ class DashboardWindow(QMainWindow):
         for wrap in (wrap0, wrap1, wrap2, wrap3, wrap4, wrap5):
             h.addWidget(wrap); h.addWidget(make_vsep())
         h.addStretch(1)
+
+        # Remote control indicator (visible while a remote client / job holds
+        # control; local controls are locked meanwhile).
+        self.status_remote = QLabel("")
+        self.status_remote.setObjectName("statusVal")
+        self.status_remote.setMaximumWidth(420)
+        self.status_remote.setVisible(False)
+        h.addWidget(self.status_remote)
+        self.button_remote_cancel = QPushButton("Cancel remote")
+        self.button_remote_cancel.setObjectName("dangerBtn")
+        self.button_remote_cancel.setFixedHeight(24)
+        self.button_remote_cancel.setToolTip(
+            "Cancel the running remote job / revoke the remote control lease")
+        self.button_remote_cancel.clicked.connect(self.cancel_remote_control)
+        self.button_remote_cancel.setVisible(False)
+        h.addWidget(self.button_remote_cancel)
 
         self.chip_sensor_temp = QLabel("Sensor: —")
         self.chip_sensor_temp.setObjectName("sensorChip")
@@ -1768,6 +1838,8 @@ class DashboardWindow(QMainWindow):
                 self._on_control_changed(ev.data or {})
             elif k == "job":
                 self._on_job_event(ev.data or {})
+            elif k == "autosave":
+                self._show_autosave(ev.data or {})
         except Exception as e:                                   # noqa: BLE001
             print(f"[gui] engine event {k} failed: {e!r}")
 
@@ -1800,6 +1872,32 @@ class DashboardWindow(QMainWindow):
             self.is_despeckle_enabled = bool(cfg["hot_pixel_filter"])
         if "spatial_smoothing" in cfg:
             self.is_spatial_smoothing_enabled = bool(cfg["spatial_smoothing"])
+        for key, combo in (("display_unit", "combo_display_unit"),
+                           ("irradiance_unit", "combo_irradiance_unit"),
+                           ("dark_mode", "combo_dark_mode")):
+            if key in cfg and hasattr(self, combo):
+                w = getattr(self, combo)
+                i = w.findData(cfg[key])
+                if i >= 0 and i != w.currentIndex():
+                    w.blockSignals(True)
+                    w.setCurrentIndex(i)
+                    w.blockSignals(False)
+        if "dark_mode" in cfg:
+            self.dark_correction_mode = cfg["dark_mode"]
+        if "heatmap_buffer_size" in cfg and hasattr(self, "spin_hm_size"):
+            self.spin_hm_size.blockSignals(True)
+            self.spin_hm_size.setValue(int(cfg["heatmap_buffer_size"]))
+            self.spin_hm_size.blockSignals(False)
+            self._hm_go_live()
+            self.slider_hm_scrub.setRange(0, 0)
+            self.heatmap_canvas.setYRange(0, self.heatmap_size, padding=0)
+            self._update_heatmap_span()
+        if "heatmap_measure_interval_ms" in cfg and hasattr(self, "spin_hm_rate"):
+            self._heatmap_measure_ms = int(cfg["heatmap_measure_interval_ms"])
+            self.spin_hm_rate.blockSignals(True)
+            self.spin_hm_rate.setValue(self._heatmap_measure_ms)
+            self.spin_hm_rate.blockSignals(False)
+            self._update_heatmap_span()
 
     def _on_control_changed(self, info: dict) -> None:
         owner = info.get("owner")
@@ -2690,27 +2788,33 @@ class DashboardWindow(QMainWindow):
             self._stop_autosave()
 
     def _start_autosave(self) -> None:
-        self._stop_autosave()
-        path, path_err = export_paths.export_path("timelapse_autosave", "csv",
-                                                  self.export_meta())
+        """Time-lapse autosave runs in the engine (same writer for desktop,
+        web and API); this only starts it and shows the file."""
         try:
-            self._autosave_writer = HeatmapAutosaveWriter(
-                path, self.heatmap_linear_waves,
-                fsync_interval_s=Config.get("heatmap_autosave_fsync_s", 20))
-            self.lbl_hm_autosave.setText(f"→ {os.path.basename(path)}")
-            if path_err and hasattr(self, "lbl_export_status"):
-                self.lbl_export_status.setText(f"⚠ {path_err}")
+            info = self.engine.start_autosave(self.export_meta())
         except OSError as e:
-            self._autosave_writer = None
+            self.chk_hm_autosave.blockSignals(True)
             self.chk_hm_autosave.setChecked(False)
+            self.chk_hm_autosave.blockSignals(False)
             QMessageBox.warning(self, "Autosave failed",
                                 f"Could not open the autosave file:\n{e}")
+            return
+        self._show_autosave(info)
+        if info.get("warning") and hasattr(self, "lbl_export_status"):
+            self.lbl_export_status.setText(f"⚠ {info['warning']}")
 
     def _stop_autosave(self) -> None:
-        if self._autosave_writer is not None:
-            self._autosave_writer.close()
-            self._autosave_writer = None
-        self.lbl_hm_autosave.setText("")
+        self.engine.stop_autosave()
+        self._show_autosave({"active": False})
+
+    def _show_autosave(self, info: dict) -> None:
+        active = bool(info.get("active"))
+        if self.chk_hm_autosave.isChecked() != active:
+            self.chk_hm_autosave.blockSignals(True)
+            self.chk_hm_autosave.setChecked(active)
+            self.chk_hm_autosave.blockSignals(False)
+        self.lbl_hm_autosave.setText(
+            f"→ {os.path.basename(info['path'])}" if active and info.get("path") else "")
 
     # ── Rewind / scrub ──
     # Shared box metrics so the Live/Export buttons render exactly the same
@@ -3064,9 +3168,6 @@ class DashboardWindow(QMainWindow):
         if ev.heatmap_pushed:
             self.image_item.setImage(self.heatmap_buffer, autoLevels=False,
                                      levels=(0, max(10.0, ideal_heatmap_max)))
-            if self._autosave_writer is not None and ev.heatmap_column is not None:
-                self._autosave_writer.write_frame(
-                    datetime.now().isoformat(timespec="milliseconds"), ev.heatmap_column)
             # Keep the rewind slider's range covering the filled history, and —
             # if paused on a past frame — keep it pinned to that SAME frame as
             # the buffer keeps rolling underneath (see _hm_scrub_advance).
@@ -3169,6 +3270,8 @@ class DashboardWindow(QMainWindow):
         self.spectrum_fill.update()
         self.cie_tab.apply_theme()
         self.filter_tab.apply_theme()
+        if hasattr(self, "remote_panel"):
+            self.remote_panel.restyle()
 
         # Refresh live pill + sensor chip with new palette colors
         self._restyle_live_pill(
@@ -3203,10 +3306,9 @@ class DashboardWindow(QMainWindow):
             "y_max_adc":        int(self.spinbox_y_max.value()),
         })
         self._stop_autosave()
-        runner = getattr(self, "_server_runner", None)
-        if runner is not None:
+        if hasattr(self, "remote_panel"):
             try:
-                runner.stop()
+                self.remote_panel.shutdown()
             except Exception as e:                               # noqa: BLE001
                 print(f"[gui] stopping the remote server: {e!r}")
         self._unsub_engine()

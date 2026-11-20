@@ -239,7 +239,11 @@ class Hub:
             self._schedule(self.broadcast, {"type": "config", "config": ev.data})
         elif ev.kind == "connection":
             self._schedule(self.broadcast, {"type": "status", **json_safe(ev.data)})
-        elif ev.kind in ("job", "control", "calibration"):
+        elif ev.kind in ("job", "control", "calibration", "autosave", "axis"):
+            if ev.kind == "axis":
+                self._schedule(self.broadcast, {"type": "axis", "data": {
+                    "n": int(len(ev.data["wavelengths"]))}})
+                return
             self._schedule(self.broadcast, {"type": ev.kind, "data": json_safe(ev.data)})
 
     async def _send_frame(self) -> None:
@@ -325,6 +329,14 @@ def create_app(engine: Engine, settings: ServerSettings | None = None) -> FastAP
     return app
 
 
+def _app_version() -> str:
+    try:
+        from version import app_version
+        return str(app_version())
+    except Exception:                                            # noqa: BLE001
+        return "unknown"
+
+
 def _auto_connect(engine: Engine) -> None:
     names = engine.list_backends()
     default_backend = names[0] if names else None
@@ -374,6 +386,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
             "heatmap_size": int(engine.heatmap_buffer.shape[1]),
             "token_required": settings.require_token,
             "control": engine.control_info(),
+            "int_bounds_us": list(engine.int_bounds_us()),
+            "autosave": engine.autosave_info(),
+            "version": _app_version(),
         }
 
     @app.get("/api/references", tags=["legacy"])
@@ -510,47 +525,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
         return engine.cfg.all()
 
     # ── calibration (legacy) ──────────────────────────────────────────────
-    def _profile_item(p, dev, serial, fp):
-        st = calprof.profile_status(p, dev, serial, fp, engine.nl_active())
-        return {"value": p["id"], "label": calprof.profile_label(p),
-                "state": st["state"], "message": st["message"],
-                "type": p.get("type"), "version": p.get("version"),
-                "created": p.get("created"),
-                "valid_range_nm": p.get("valid_range_nm"),
-                "valid_segments_nm": p.get("valid_segments_nm"),
-                "plausible": not calprof.is_implausible(p),
-                "unit": p.get("unit")}
-
-    def profiles_payload(include_old: bool) -> dict:
-        dev, serial, fp = engine.calibration_context()
-        has_default = getattr(engine.acquisition, "RESPONSE_TABLE", None) is not None
-        items = [{"value": calprof.SEL_NONE, "label": calprof.SEL_NONE,
-                  "state": "builtin", "message": "", "type": None, "version": None,
-                  "created": None, "valid_range_nm": None, "unit": "counts"}]
-        if has_default:
-            items.append({"value": calprof.SEL_DEVICE_DEFAULT,
-                          "label": calprof.SEL_DEVICE_DEFAULT, "state": "builtin",
-                          "message": "", "type": None, "version": None,
-                          "created": None, "valid_range_nm": None, "unit": None})
-        profs = (calprof.profiles_for_device(dev, serial, fp, nl_active=engine.nl_active(),
-                                             include_old=include_old) if dev else [])
-        items += [_profile_item(p, dev, serial, fp) for p in profs]
-        others = calprof.profiles_other_units(dev, serial) if dev else []
-        sel = calprof.active_selection(dev) if dev else calprof.SEL_NONE
-        return json_safe({
-            "device": dev, "serial": serial, "fingerprint": fp,
-            "selection": sel, "selection_label": calprof.selection_label(sel),
-            "status": engine.calibration_status(), "items": items,
-            "profiles": calprof.list_profiles(dev) if dev else [],
-            "other_units": [{"id": p["id"], "label": calprof.profile_label(p),
-                             "serial": (p.get("device") or {}).get("serial")}
-                            for p in others],
-        })
-    app.state.profiles_payload = profiles_payload
-
     @app.get("/api/calibration/profiles", tags=["legacy"])
     async def api_calibration_profiles(include_old: int = 0):
-        return profiles_payload(bool(include_old))
+        return profiles_payload(engine, bool(include_old), raw=True)
 
     @app.get("/api/calibration/status", tags=["legacy"])
     async def api_calibration_status():
@@ -740,6 +717,50 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
 # ══════════════════════════════════════════════════════════════════════════
 #  Shared helpers (legacy + v1)
 # ══════════════════════════════════════════════════════════════════════════
+
+def _profile_item(engine: Engine, p: dict, dev, serial, fp) -> dict:
+    st = calprof.profile_status(p, dev, serial, fp, engine.nl_active())
+    return {"value": p["id"], "label": calprof.profile_label(p),
+            "state": st["state"], "message": st["message"],
+            "type": p.get("type"), "version": p.get("version"),
+            "created": p.get("created"),
+            "valid_range_nm": p.get("valid_range_nm"),
+            "valid_segments_nm": p.get("valid_segments_nm"),
+            "plausible": not calprof.is_implausible(p),
+            "unit": p.get("unit")}
+
+
+def profiles_payload(engine: Engine, include_old: bool = False, *, raw: bool = False) -> dict:
+    """Selectable response-correction options of the active device (None /
+    Device default / saved profiles of THIS unit) plus copy candidates of
+    other units. raw=True adds the legacy 'profiles' field (/api only)."""
+    dev, serial, fp = engine.calibration_context()
+    has_default = getattr(engine.acquisition, "RESPONSE_TABLE", None) is not None
+    items = [{"value": calprof.SEL_NONE, "label": calprof.SEL_NONE,
+              "state": "builtin", "message": "", "type": None, "version": None,
+              "created": None, "valid_range_nm": None, "unit": "counts"}]
+    if has_default:
+        items.append({"value": calprof.SEL_DEVICE_DEFAULT,
+                      "label": calprof.SEL_DEVICE_DEFAULT, "state": "builtin",
+                      "message": "", "type": None, "version": None,
+                      "created": None, "valid_range_nm": None, "unit": None})
+    profs = (calprof.profiles_for_device(dev, serial, fp, nl_active=engine.nl_active(),
+                                         include_old=include_old) if dev else [])
+    items += [_profile_item(engine, p, dev, serial, fp) for p in profs]
+    others = calprof.profiles_other_units(dev, serial) if dev else []
+    sel = calprof.active_selection(dev) if dev else calprof.SEL_NONE
+    out = {
+        "device": dev, "serial": serial, "fingerprint": fp,
+        "selection": sel, "selection_label": calprof.selection_label(sel),
+        "status": engine.calibration_status(), "items": items,
+        "other_units": [{"id": p["id"], "label": calprof.profile_label(p),
+                         "serial": (p.get("device") or {}).get("serial")}
+                        for p in others],
+    }
+    if raw:
+        out["profiles"] = calprof.list_profiles(dev) if dev else []
+    return json_safe(out)
+
 
 def import_profile_payload(payload: dict) -> dict:
     tmp = None
