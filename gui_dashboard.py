@@ -165,7 +165,13 @@ class DashboardWindow(QMainWindow):
         self.engine = engine if engine is not None else Engine()
         self._bridge = _EngineBridge()
         self._bridge.event.connect(self._on_engine_event)
-        self._unsub_engine = self.engine.subscribe(self._bridge.event.emit)
+        # Frames are coalesced: only the newest pending frame is rendered,
+        # so a fast stream can never pile up in the Qt event queue.
+        import threading as _th
+        self._frame_gate = _th.Lock()
+        self._pending_frame = None
+        self._frame_queued = False
+        self._unsub_engine = self.engine.subscribe(self._from_engine)
         self._remote_locked = False
         self.setWindowTitle("Spectrum Analyzer — PS-2600A")
         # Initial size from the available screen area (≤ 90 %, at most the
@@ -1815,12 +1821,26 @@ class DashboardWindow(QMainWindow):
             self.slider_hm_scrub.setRange(0, 0)
             self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
 
-    # ── engine events (GUI thread) ───────────────────────────────────────
+    # ── engine events ────────────────────────────────────────────────────
+    def _from_engine(self, ev) -> None:
+        """Engine thread → Qt signal (frames coalesced)."""
+        if ev.kind == "frame":
+            with self._frame_gate:
+                self._pending_frame = ev
+                if self._frame_queued:
+                    return
+                self._frame_queued = True
+        self._bridge.event.emit(ev)
+
     def _on_engine_event(self, ev) -> None:
         k = ev.kind
         try:
             if k == "frame":
-                self._render_frame(ev.data)
+                with self._frame_gate:
+                    latest = self._pending_frame or ev
+                    self._pending_frame = None
+                    self._frame_queued = False
+                self._render_frame(latest.data)
             elif k == "connection":
                 if ev.data.get("connected"):
                     self._on_connected_ui()

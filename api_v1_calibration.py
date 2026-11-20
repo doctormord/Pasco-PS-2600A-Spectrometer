@@ -93,7 +93,8 @@ def register(router: APIRouter, ctx: V1Context) -> None:
 
     @router.post("/calibration/profiles/import", tags=["calibration"], dependencies=auth,
                  summary="Import a profile (body = profile JSON as exported)")
-    async def import_profile(body: dict):
+    async def import_profile(body: dict, request: Request):
+        engine.check_control(ctx.owner(request))
         try:
             p = await asyncio.to_thread(import_profile_payload, body)
         except (ValueError, KeyError, TypeError, AttributeError, OSError) as e:

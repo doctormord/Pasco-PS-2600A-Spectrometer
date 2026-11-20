@@ -93,7 +93,8 @@ Je Gerät durchführen (Spalten: Demo, PASCO, LR-2T, HDX; "n/a" wenn nicht vorha
 - [ ] Overlays: Freeze, Differenz, Peak-Hold, Persistenz, Referenzspektrum
 - [ ] Color-Tabs: Overview (CCT, Duv, xy, CRI, Lux), CIE 1931, Rendering, TM-30/CQS (mit `colour-science`); Werte stabil und plausibel; Aktualisierung ohne Ruckeln
 - [ ] Filter-Tab: Basislinie setzen, Transmission, Kennwerte
-- [ ] Exporte: Spektrum-CSV, PNG, Farbbericht (PDF/PNG/CSV), Filterbericht; Dateinamen nach Vorlage (`export_filename_template`), Zielordner (`export_dir`)
+- [ ] Exporte: Spektrum-CSV, PNG, Farbbericht (PDF/PNG/CSV), Filterbericht; Dateinamen nach Vorlage (`export_filename_template`), Zielordner (`export_dir`; im Web nur bei aktivem Token änderbar, sonst Meldung „Not settable remotely“)
+- [ ] Sicherheit: `GET /api/config` und WS-hello enthalten kein `remote_token`; `POST /api/config {"remote_lan": true}` ergibt 403; Aufruf aus einer fremden Webseite (anderer Origin) wird abgewiesen
 - [ ] Theme-Wechsel (dunkel/hell): alle Bereiche inklusive Remote-Panel und Dialoge umgestellt, keine weißen Flächen
 - [ ] Fenstergeometrie: Größe und Position werden gemerkt; keine Größenänderung beim Wechsel von Tabs, Meldungen oder Statuszeile
 

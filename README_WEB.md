@@ -149,6 +149,16 @@ reports (the report endpoints need `matplotlib`). Files that the *server*
 writes (autosave, saved reports, calibration protocols) go to its export folder
 (`export_dir`); browser downloads go to the browser's download folder.
 
+**Protected settings** — remote clients can never read the API token
+(`remote_token` is removed from `/api/config` and the WebSocket `hello`) and can
+never change the server's security settings or data-file locations
+(`remote_*`, `calibration_profiles_file`, `reference_sources_file`,
+`dark_spectra_file`, `heatmap_autosave_dir` → HTTP 403). `export_dir` (a path on
+the server) can be changed remotely only while token protection is active
+(LAN, or *Require token locally*). Requests from a browser page of another
+origin and, on a 127.0.0.1 bind, requests with a foreign `Host` header (DNS
+rebinding) are refused.
+
 ---
 
 ## HTTP / WebSocket API

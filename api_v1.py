@@ -250,6 +250,15 @@ def add_v1_routes(app: FastAPI, engine: Engine, settings: ServerSettings,
                                       body.wait, body.timeout_s)
 
     # ── jobs ──────────────────────────────────────────────────────────────
+    def _own_job(job_id: str, request: Request) -> None:
+        """Only the client that started a job may confirm its user steps or
+        cancel it remotely (the desktop can always cancel)."""
+        j = engine.jobs.get(job_id)
+        owner = client_owner(request)
+        if j.owner != owner:
+            raise ApiError(409, "control_busy",
+                           f"Job '{job_id}' belongs to '{j.owner}'.",
+                           {"owner": j.owner, "job_id": job_id})
     @r.get("/jobs", response_model=list[M.JobBrief], tags=["jobs"])
     async def jobs(active: bool = False):
         js = engine.jobs.active() if active else engine.jobs.list()
@@ -263,13 +272,15 @@ def add_v1_routes(app: FastAPI, engine: Engine, settings: ServerSettings,
         return json_safe(j.to_dict())
 
     @r.post("/jobs/{job_id}/cancel", response_model=M.Job, tags=["jobs"], dependencies=auth)
-    async def cancel(job_id: str):
+    async def cancel(job_id: str, request: Request):
+        _own_job(job_id, request)
         j = engine.jobs.cancel(job_id)
         return json_safe(j.to_dict())
 
     @r.post("/jobs/{job_id}/continue", response_model=M.Job, tags=["jobs"], dependencies=auth,
             summary="Confirm a user step (cover / uncover …) of a waiting job")
-    async def cont(job_id: str):
+    async def cont(job_id: str, request: Request):
+        _own_job(job_id, request)
         j = engine.jobs.continue_job(job_id)
         await asyncio.sleep(0.05)
         return json_safe(j.to_dict())
@@ -339,6 +350,7 @@ def add_v1_routes(app: FastAPI, engine: Engine, settings: ServerSettings,
             mod = importlib.import_module(name)
         except ImportError as e:
             if getattr(e, "name", None) == name:
+                print(f"[api] optional API group '{name}' not available — skipped")
                 continue
             raise
         mod.register(r, ctx)

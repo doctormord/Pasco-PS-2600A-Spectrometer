@@ -143,6 +143,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="do not auto-connect the first device on start")
     p.add_argument("--backend", default=None, help="backend to auto-connect (e.g. 'Demo (virtual)')")
     p.add_argument("--log-level", default="warning")
+    p.add_argument("--reload", action="store_true",
+                   help=argparse.SUPPRESS)   # accepted for old web_server.py calls; ignored
     return p
 
 

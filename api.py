@@ -112,7 +112,60 @@ def token_ok(settings: ServerSettings, presented: str | None) -> bool:
         return True
     if not settings.token or not presented:
         return False
-    return hmac.compare_digest(str(settings.token), str(presented))
+    return hmac.compare_digest(str(settings.token).encode("utf-8"),
+                               str(presented).encode("utf-8"))
+
+
+# ── Config exposed to / writable by remote clients (review K1/K2) ─────────
+# Never sent to any client.
+SECRET_KEYS = frozenset({"remote_token"})
+# Never writable remotely: server security settings and data-file locations.
+REMOTE_FORBIDDEN_KEYS = frozenset({
+    "remote_token", "remote_lan", "remote_port", "remote_enabled",
+    "remote_require_token_local", "calibration_profiles_file",
+    "reference_sources_file", "dark_spectra_file", "heatmap_autosave_dir",
+})
+# Writable remotely only when token protection is active (server paths).
+REMOTE_TOKEN_ONLY_KEYS = frozenset({"export_dir"})
+
+
+def public_config(cfg) -> dict:
+    """Config for clients, without secrets."""
+    return {k: v for k, v in cfg.all().items() if k not in SECRET_KEYS}
+
+
+def check_remote_config(settings: "ServerSettings", payload: dict) -> None:
+    """Raise PermissionError for keys a remote client must not set."""
+    bad = sorted(k for k in payload if k in REMOTE_FORBIDDEN_KEYS)
+    if not settings.require_token:
+        bad += sorted(k for k in payload if k in REMOTE_TOKEN_ONLY_KEYS)
+    if bad:
+        raise PermissionError("Not settable remotely: " + ", ".join(bad))
+
+
+def origin_ok(settings: "ServerSettings", headers) -> bool:
+    """Cross-site protection: a browser Origin must be this server (same
+    host:port) or loopback. Requests without Origin (scripts, MCP) pass."""
+    origin = headers.get("origin")
+    if not origin:
+        return True
+    from urllib.parse import urlsplit
+    try:
+        o = urlsplit(origin)
+    except ValueError:
+        return False
+    host_hdr = (headers.get("host") or "").lower()
+    if o.netloc.lower() == host_hdr:
+        return True
+    return (o.hostname or "") in LOOPBACK_HOSTS and str(o.port or "") == str(settings.port)
+
+
+def host_ok(settings: "ServerSettings", headers) -> bool:
+    """DNS-rebinding guard for loopback binds: Host must be a loopback name."""
+    if settings.lan:
+        return True
+    host = (headers.get("host") or "").rsplit(":", 1)[0].strip("[]").lower()
+    return host in LOOPBACK_HOSTS or host in ("testserver", "")
 
 
 class ApiError(Exception):
@@ -217,24 +270,25 @@ class Hub:
             self._unsub()
             self._unsub = None
 
-    def _schedule(self, coro_fn, *args) -> None:
+    def _schedule(self, coro_fn, *args) -> bool:
         loop = self.loop
         if loop is None or not self.clients or loop.is_closed():
-            return
+            return False
         try:
             asyncio.run_coroutine_threadsafe(coro_fn(*args), loop)
+            return True
         except RuntimeError:
-            pass
+            return False
 
     def _on_event(self, ev: EngineEvent) -> None:
         if ev.kind == "frame":
-            if self._frame_pending:          # coalesce: slow clients never queue up
-                return
-            self._frame_pending = True
-            if self.loop is None or not self.clients:
-                self._frame_pending = False
-                return
-            self._schedule(self._send_frame)
+            with self.lock:                  # coalesce: slow clients never queue up
+                if self._frame_pending:
+                    return
+                self._frame_pending = True
+            if not self._schedule(self._send_frame):
+                with self.lock:
+                    self._frame_pending = False
         elif ev.kind == "config":
             self._schedule(self.broadcast, {"type": "config", "config": ev.data})
         elif ev.kind == "connection":
@@ -247,7 +301,8 @@ class Hub:
             self._schedule(self.broadcast, {"type": ev.kind, "data": json_safe(ev.data)})
 
     async def _send_frame(self) -> None:
-        self._frame_pending = False
+        with self.lock:
+            self._frame_pending = False
         try:
             payload = build_frame_payload(self.engine)
         except Exception as e:                                   # noqa: BLE001
@@ -303,6 +358,20 @@ def create_app(engine: Engine, settings: ServerSettings | None = None) -> FastAP
     app.state.engine = engine
     app.state.settings = settings
     app.state.hub = hub
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next):
+        # DNS rebinding (loopback bind) and cross-site requests from a browser
+        # page of another origin (CSRF) are refused.
+        if not host_ok(settings, request.headers):
+            return JSONResponse(status_code=400, content={"error": {
+                "code": "bad_host", "message": "Invalid Host header.", "details": None}})
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not origin_ok(
+                settings, request.headers):
+            return JSONResponse(status_code=403, content={"error": {
+                "code": "forbidden_origin", "message": "Cross-origin request refused.",
+                "details": None}})
+        return await call_next(request)
 
     def require_token(request: Request) -> None:
         if not token_ok(settings, _bearer(request.headers, request.query_params.get("token"))):
@@ -514,15 +583,19 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
 
     @app.get("/api/config", tags=["legacy"])
     async def api_config_get():
-        return engine.cfg.all()
+        return public_config(engine.cfg)
 
     @app.post("/api/config", tags=["legacy"], dependencies=auth)
     async def api_config_set(payload: dict):
         try:
-            engine.configure(payload, owner=WEB)
+            check_remote_config(settings, payload)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        try:
+            await asyncio.to_thread(engine.configure, payload, owner=WEB)
         except EngineError as e:
             raise legacy_err(e)
-        return engine.cfg.all()
+        return public_config(engine.cfg)
 
     # ── calibration (legacy) ──────────────────────────────────────────────
     @app.get("/api/calibration/profiles", tags=["legacy"])
@@ -536,8 +609,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
     @app.post("/api/calibration/select", tags=["legacy"], dependencies=auth)
     async def api_calibration_select(payload: dict):
         try:
-            res = engine.select_profile(str(payload.get("selection", calprof.SEL_NONE)),
-                                        confirm=bool(payload.get("confirm")), owner=WEB)
+            res = await asyncio.to_thread(
+                engine.select_profile, str(payload.get("selection", calprof.SEL_NONE)),
+                confirm=bool(payload.get("confirm")), owner=WEB)
         except NeedsConfirmation as e:
             return JSONResponse(status_code=409, content=e.details)
         except EngineError as e:
@@ -570,6 +644,10 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
 
     @app.post("/api/calibration/profile/copy", tags=["legacy"], dependencies=auth)
     async def api_calibration_profile_copy(payload: dict):
+        try:
+            engine.check_control(WEB)
+        except EngineError as e:
+            raise legacy_err(e)
         dev, serial, _fp = engine.calibration_context()
         pid = str(payload.get("id", "")).strip()
         if not dev or not pid:
@@ -594,6 +672,10 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
 
     @app.post("/api/calibration/profile/import", tags=["legacy"], dependencies=auth)
     async def api_calibration_profile_import(payload: dict):
+        try:
+            engine.check_control(WEB)
+        except EngineError as e:
+            raise legacy_err(e)
         try:
             p = import_profile_payload(payload)
         except (ValueError, KeyError, TypeError, AttributeError) as e:
@@ -631,6 +713,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
     # ── WebSocket ─────────────────────────────────────────────────────────
     @app.websocket("/ws/stream")
     async def ws_stream(ws: WebSocket):
+        if not origin_ok(settings, ws.headers) or not host_ok(settings, ws.headers):
+            await ws.close(code=1008)                # cross-site WebSocket hijacking
+            return
         await ws.accept()
         hub.loop = asyncio.get_running_loop()
         authorized = token_ok(settings, _bearer(ws.headers, ws.query_params.get("token")))
@@ -650,7 +735,7 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
                 "backend": engine.connected_backend_name or backend,
                 "backends": list(engine.list_backends()),
                 "devices": list(devices),
-                "config": json_safe(engine.cfg.all()),
+                "config": json_safe(public_config(engine.cfg)),
                 "wavelengths_full": [round(float(w), 2) for w in engine.wavelength_array[::4]],
                 "token_required": settings.require_token,
                 "authorized": authorized,
@@ -688,7 +773,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
                     continue
                 try:
                     if t == "set_config":
-                        engine.configure(data.get("payload", {}) or {}, owner=WEB)
+                        payload = data.get("payload", {}) or {}
+                        check_remote_config(settings, payload)
+                        await asyncio.to_thread(engine.configure, payload, owner=WEB)
                     elif t == "pause":
                         engine.set_paused(bool(data.get("paused", False)), owner=WEB)
                     elif t == "connect":
@@ -701,6 +788,9 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
                         await ws.send_text(json.dumps({"type": "status", "connected": False}))
                 except EngineError as e:
                     await ws.send_text(json.dumps({"type": "error", "code": e.code,
+                                                   "message": str(e)}))
+                except PermissionError as e:
+                    await ws.send_text(json.dumps({"type": "error", "code": "forbidden",
                                                    "message": str(e)}))
                 except Exception as e:                           # noqa: BLE001
                     await ws.send_text(json.dumps({"type": "error", "message": str(e)}))

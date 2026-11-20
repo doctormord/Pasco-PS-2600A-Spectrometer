@@ -82,6 +82,7 @@ CONTROL_KEYS = frozenset({
     "hot_pixel_filter", "smoothing_width", "spatial_smoothing",
     "spatial_smoothing_width", "display_unit", "irradiance_unit",
     "radiometric_calibration_factor", "response_correction_active",
+    "heatmap_buffer_size", "heatmap_measure_interval_ms",
     *fusion.DEFAULTS.keys(),
 })
 
@@ -611,7 +612,9 @@ class Engine:
         """Explicit lease (e.g. remote client, or the desktop while the
         calibration dialog is open)."""
         with self._lock:
-            if not force:
+            if not force or (self._control_owner == LOCAL and owner != LOCAL):
+                # force never breaks the desktop's own lease (calibration
+                # wizard drives the device directly meanwhile)
                 self.check_control(owner)
             if force and self._control_job and self._control_owner != owner:
                 self.jobs.cancel(self._control_job)
@@ -621,6 +624,11 @@ class Engine:
 
     def release_control(self, owner: str | None, *, force: bool = False) -> dict:
         with self._lock:
+            if (force and self._lease_owner == LOCAL
+                    and owner is not None and owner != LOCAL):
+                raise ControlBusy("The desktop holds control (calibration dialog); "
+                                  "it cannot be revoked remotely.",
+                                  details=self.control_info())
             if force or owner == self._lease_owner:
                 self._lease_owner = None
                 if self._control_job is None:

@@ -7,7 +7,10 @@
 hiddenimports = [
     # shared core / API (dynamic imports)
     'engine', 'api', 'api_v1', 'api_models', 'api_v1_analysis',
-    'api_v1_calibration', 'server_runner', 'gui_remote', 'gui_help',
+    'api_v1_calibration', 'api_v1_display', 'api_v1_wavelength',
+    'server_runner', 'gui_remote', 'gui_help', 'version',
+    'wavelength_calibration', 'export_paths', 'autosave', 'calibration_report',
+    'calibration_workflow', 'calibration_capture', 'reference_sources',
     # device backends (registered at runtime)
     '_device_pasco', '_device_demo', '_device_lr2t', '_device_ocean',
     # uvicorn runtime selections

@@ -66,12 +66,14 @@ def register(router: APIRouter, ctx) -> None:
 
     @router.post("/heatmap/clear", tags=["heatmap"], dependencies=auth)
     async def clear(request: Request):
+        engine.check_control(ctx.owner(request))
         engine.clear_heatmap()
         return json_safe(_info())
 
     @router.post("/heatmap/autosave", tags=["heatmap"], dependencies=auth,
                  summary="Start/stop writing every logged column to a CSV on the server")
     async def autosave(body: AutosaveRequest, request: Request):
+        engine.check_control(ctx.owner(request))
         if body.active:
             try:
                 info = await ctx.call(engine.start_autosave)

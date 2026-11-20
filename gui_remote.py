@@ -359,7 +359,8 @@ class RemotePanel(QWidget):
         pct = int(round(float(j.get("progress") or 0.0) * 100))
         text = f"{j.get('kind', '')} {j.get('status', '')} {pct} %"
         if j.get("status") == "waiting_for_user" and j.get("prompt"):
-            text += f" — {j['prompt']}"
+            pr = j["prompt"]
+            text += f" — {pr.get('message', '') if isinstance(pr, dict) else pr}"
         self.lbl_job.set_full_text(text)
 
     def _apply_buttons(self) -> None:
