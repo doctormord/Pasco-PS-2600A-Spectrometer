@@ -224,10 +224,15 @@ def test_dark_store_per_device_and_itime():
 
 def _legacy_file(tmp_path, isolated_config):
     src = os.path.join(ROOT, "calibration_profiles.json")
+    legacy = None
     if os.path.exists(src):
         with open(src, encoding="utf-8") as f:
             legacy = json.load(f)
-    else:  # repo without the sample file
+        # A working copy whose sample file was already migrated to schema 2
+        # (by running the app) is no legacy file any more.
+        if not isinstance(legacy, dict) or "schema" in legacy or "profiles" in legacy:
+            legacy = None
+    if legacy is None:  # repo without the (legacy) sample file
         legacy = {"Demo (virtual)": {"test_calib": {
             "table": [[340.0, 0.5], [600.0, 1.0], [850.0, 0.4]],
             "created": "2026-01-01 10:00:00", "wl_min_nm": 340.0, "wl_max_nm": 850.0}}}

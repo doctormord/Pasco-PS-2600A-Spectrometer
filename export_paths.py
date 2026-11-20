@@ -54,6 +54,67 @@ def ensure_export_dir() -> tuple[str, str | None]:
         return program_dir(), f"Export folder '{d}' unusable ({e}); using program folder."
 
 
+CALIBRATION_SUBDIR = "calibration"
+APP_DATA_NAME = "PS-2600A"
+
+
+def user_data_dir() -> str:
+    """Per-user application data directory (never the program folder):
+    %LOCALAPPDATA%\\PS-2600A on Windows, ~/Library/Application Support/PS-2600A
+    on macOS, $XDG_DATA_HOME/PS-2600A (or ~/.local/share/PS-2600A) elsewhere."""
+    import sys
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") \
+            or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, APP_DATA_NAME)
+
+
+def _is_inside(path: str, root: str) -> bool:
+    try:
+        p = os.path.normcase(os.path.realpath(path))
+        r = os.path.normcase(os.path.realpath(root))
+        return os.path.commonpath([p, r]) == r
+    except ValueError:                       # different drives on Windows
+        return False
+
+
+def _usable_dir(d: str) -> bool:
+    try:
+        os.makedirs(d, exist_ok=True)
+        return os.path.isdir(d) and os.access(d, os.W_OK)
+    except OSError:
+        return False
+
+
+def calibration_protocol_dir() -> tuple[str, str | None]:
+    """Directory for calibration protocols (PDF/CSV). Returns (dir, note).
+
+    <export_dir>/calibration when an export directory is configured, usable and
+    not inside the program folder; otherwise <user data dir>/calibration.
+    Never the program / repository folder. `note` explains a fallback."""
+    configured = (Config.get("export_dir", "") or "").strip()
+    note = None
+    if configured:
+        if _is_inside(configured, program_dir()):
+            note = (f"Export folder '{configured}' lies inside the program folder; "
+                    f"calibration protocols are stored in the user data folder.")
+        else:
+            d = os.path.join(configured, CALIBRATION_SUBDIR)
+            if _usable_dir(d):
+                return d, None
+            note = (f"Export folder '{configured}' unusable; calibration protocols "
+                    f"are stored in the user data folder.")
+    d = os.path.join(user_data_dir(), CALIBRATION_SUBDIR)
+    if not _usable_dir(d):
+        raise OSError(f"Neither the export folder nor '{d}' is writable.")
+    return d, note
+
+
 _ILLEGAL = re.compile(r"[^A-Za-z0-9._-]+")
 _REPEAT = re.compile(r"[_-]{2,}")
 

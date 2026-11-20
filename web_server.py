@@ -378,6 +378,7 @@ def _build_frame_payload(downsample: int = 1) -> dict:
         "unit_label": processing.unit_label(unit),
         "calibration": calib_status,
         "valid_range_nm": calib_status.get("valid_range_nm"),
+        "valid_segments_nm": calib_status.get("valid_segments_nm"),
         "dark_source": state.current_dark_source,
         "ob_mean": round(state.latest_ob_mean, 3),
         # Device-aware dark readout. PASCO has real optical-black pixels, so the
@@ -887,6 +888,8 @@ def _profile_item(p: dict, dev: str, serial, fp) -> dict:
             "type": p.get("type"), "version": p.get("version"),
             "created": p.get("created"),
             "valid_range_nm": p.get("valid_range_nm"),
+            "valid_segments_nm": p.get("valid_segments_nm"),
+            "plausible": not calprof.is_implausible(p),
             "unit": p.get("unit")}
 
 
@@ -1095,6 +1098,12 @@ async def api_export_csv(tab: str = "spectrum"):
             vr = st.get("valid_range_nm")
             if vr:
                 buf.write(f"# Valid range (nm);{float(vr[0]):.1f}–{float(vr[1]):.1f}\n")
+            segs = st.get("valid_segments_nm")
+            if segs:
+                buf.write("# Valid segments (nm);" + ", ".join(
+                    f"{float(a):.1f}–{float(b):.1f}" for a, b in segs) + "\n")
+            if st.get("implausible"):
+                buf.write("# Plausibility;FAILED (saved on request)\n")
         col = "ADC_Counts" if unit == "counts" else f"Value_{unit}"
         buf.write(f"Pixel_ID;Wavelength_nm;{col}\n")
         for i, (wl, v) in enumerate(zip(state.wavelength_array, state.current_pixels)):

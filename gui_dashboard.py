@@ -156,7 +156,13 @@ class DashboardWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spectrum Analyzer — PS-2600A")
-        self.resize(1480, 900)
+        # Initial size from the available screen area (≤ 90 %, at most the
+        # former 1480×900), centred; a remembered geometry is clamped to the
+        # current screen. The minimum fits 1366×768.
+        from gui_layout import place_window, schedule_fix_onscreen
+        place_window(self, None, Config.get("main_window_geometry", None),
+                     min_w=1000, min_h=600, max_w=1480, max_h=900)
+        self._fix_onscreen_once = schedule_fix_onscreen
 
         # ── runtime state ──
         # --- DYNAMIC ARRAYS ---
@@ -293,7 +299,16 @@ class DashboardWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         central.setObjectName("central")
-        self.setCentralWidget(central)
+        # The full UI needs ≈ 1270×820 logical px; on smaller screens (1366×768,
+        # 1920×1080 at 150 %) it scrolls inside the window instead of forcing
+        # the window beyond the available screen area.
+        main_scroll = QScrollArea()
+        main_scroll.setObjectName("mainScroll")
+        main_scroll.setWidgetResizable(True)
+        main_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        main_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        main_scroll.setWidget(central)
+        self.setCentralWidget(main_scroll)
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -528,6 +543,8 @@ class DashboardWindow(QMainWindow):
         # Grey bands outside the valid range of the active calibration profile
         # (pixels there are masked = NaN, plan §2.4).
         _cal_brush = pg.mkBrush(128, 128, 128, 40)
+        self._calib_brush = _cal_brush
+        self._calib_gap_regions = []
         self.calib_region_lo = pg.LinearRegionItem(
             values=(-1e9, -1e9), movable=False, brush=_cal_brush, pen=pg.mkPen(None))
         self.calib_region_hi = pg.LinearRegionItem(
@@ -2338,9 +2355,13 @@ class DashboardWindow(QMainWindow):
                 txt = ""
             else:
                 txt = st.get("label", "")
-                if st.get("valid_range_nm"):
+                if st.get("valid_segments_nm"):
+                    txt += f"\nvalid {calprof.format_segments(st['valid_segments_nm'], 3)}"
+                elif st.get("valid_range_nm"):
                     lo, hi = st["valid_range_nm"]
                     txt += f"\nvalid {lo:.0f}–{hi:.0f} nm"
+                if st.get("implausible"):
+                    txt += "\n⚠ profile failed the plausibility check"
                 if st.get("message"):
                     txt += f"\n{st['message']}"
                 if self.calib_runtime.active_v2 and st.get("dark_source"):
@@ -2352,7 +2373,7 @@ class DashboardWindow(QMainWindow):
             color = {"wl_changed": T().WARN, "nl_changed": T().WARN,
                      "other_device": T().WARN,
                      "missing": T().WARN, "error": T().WARN}.get(st.get("state"))
-            if st.get("dark_warning"):
+            if st.get("dark_warning") or st.get("implausible"):
                 color = T().WARN
             self.label_calib_status.setStyleSheet(
                 f"color: {color}; font-size: 10px;" if color else "font-size: 10px;")
@@ -2375,6 +2396,18 @@ class DashboardWindow(QMainWindow):
             self.calib_region_hi.setRegion((float(vr[1]), vx1 + pad))
         self.calib_region_lo.setVisible(show)
         self.calib_region_hi.setVisible(show)
+        # Masked gaps INSIDE the outer valid range (segmented profiles).
+        for reg in self._calib_gap_regions:
+            self.plot_canvas.removeItem(reg)
+        self._calib_gap_regions = []
+        segs = st.get("valid_segments_nm") if show else None
+        if segs and len(segs) > 1:
+            for (_a, b), (c, _d) in zip(segs[:-1], segs[1:]):
+                reg = pg.LinearRegionItem(values=(float(b), float(c)), movable=False,
+                                          brush=self._calib_brush, pen=pg.mkPen(None))
+                reg.setZValue(self.calib_region_lo.zValue())
+                self.plot_canvas.addItem(reg, ignoreBounds=True)
+                self._calib_gap_regions.append(reg)
 
     def _apply_unit_to_axis(self, unit: str) -> None:
         if unit == self._shown_unit:
@@ -2860,6 +2893,12 @@ class DashboardWindow(QMainWindow):
                             vr = st.get("valid_range_nm")
                             if vr:
                                 w.writerow(["# Valid range (nm)", f"{vr[0]:.1f}–{vr[1]:.1f}"])
+                            segs = st.get("valid_segments_nm")
+                            if segs:
+                                w.writerow(["# Valid segments (nm)", ", ".join(
+                                    f"{a:.1f}–{b:.1f}" for a, b in segs)])
+                            if st.get("implausible"):
+                                w.writerow(["# Plausibility", "FAILED (saved on request)"])
                         w.writerow(["Pixel_ID", "Wavelength_nm", f"Value_{unit}"])
                         for i, (wl, v) in enumerate(
                                 zip(self.active_wavelengths, self.current_averaged_pixels)):
@@ -3188,10 +3227,9 @@ class DashboardWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════
     def apply_theme(self, mode: str) -> None:
         palette = LightPalette if mode == "light" else DarkPalette
-        set_active_palette(palette)
-        # Rebuild stylesheets with current palette (FONT constants already in place)
-        QApplication.instance().setStyleSheet(
-            build_stylesheet(palette))
+        # Palette + stylesheet from the same tokens, so widgets that read the
+        # QPalette (item views, viewports, disabled text) match the stylesheet.
+        theme.apply_app_theme(QApplication.instance(), palette)
         Config.set("theme", mode)
 
         # Toggle segmented buttons
@@ -3239,8 +3277,19 @@ class DashboardWindow(QMainWindow):
             child.update()
 
     # ════════════════════════════════════════════════════════════
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        fix = getattr(self, "_fix_onscreen_once", None)
+        if fix is not None:
+            self._fix_onscreen_once = None
+            fix(self)
+
     def closeEvent(self, event) -> None:
         # Save anything that isn't already saved-on-change
+        from gui_layout import geometry_to_config
+        geo = geometry_to_config(self)
+        if geo is not None:
+            Config.set("main_window_geometry", geo, save=False)
         Config.update({
             "exposure_ms":      float(self.spinbox_exposure.value()),
             "frames_to_average": int(self.spinbox_averaging.value()),

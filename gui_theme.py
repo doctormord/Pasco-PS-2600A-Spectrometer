@@ -15,7 +15,7 @@ import numpy as np
 
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (
-    QColor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient,
+    QColor, QPainter, QPainterPath, QPen, QBrush, QLinearGradient, QPalette,
 )
 from PyQt6.QtWidgets import (
     QPushButton, QWidget, QLabel, QFrame, QHBoxLayout, QVBoxLayout,
@@ -29,10 +29,10 @@ import pyqtgraph as pg
 class DarkPalette:
     BG0 = "#21242b"; BG1 = "#282b33"; BG2 = "#2e3139"; BG3 = "#363943"
     BORDER1 = "#3a3e49"; BORDER2 = "#484c58"
-    FG1 = "#eef0f3"; FG2 = "#b9bcc4"; FG3 = "#80848e"; FG4 = "#5a5d66"
+    FG1 = "#eef0f3"; FG2 = "#b9bcc4"; FG3 = "#979aa2"; FG4 = "#5a5d66"
     ACCENT = "#5ee0d6"; ACCENT_GLOW = "#5ee0d659"
     ACCENT_BTN_FG = "#143733"; ACCENT_HOVER = "#6ee9df"
-    DANGER = "#e36b5c"; DANGER_BORDER = "#623630"; DANGER_BG_HOVER = "#3a221d"
+    DANGER = "#e67c6e"; DANGER_BORDER = "#623630"; DANGER_BG_HOVER = "#3a221d"
     WARN = "#d8b46a"; WARN_BG = "#3a2f1c"; WARN_BORDER = "#5a4928"
     OK = "#7bd3a5"; OK_BG = "#1f3a2c"; OK_BORDER = "#2e5740"
     MEASURE_A = "#cba6f7"; MEASURE_B = "#d8b46a"
@@ -41,12 +41,12 @@ class DarkPalette:
 class LightPalette:
     BG0 = "#f4f5f7"; BG1 = "#ffffff"; BG2 = "#eef0f3"; BG3 = "#e3e6ea"
     BORDER1 = "#d8dce1"; BORDER2 = "#b9bfc7"
-    FG1 = "#1a1d24"; FG2 = "#3a3f48"; FG3 = "#6c7280"; FG4 = "#9aa0a8"
-    ACCENT = "#0d9488"; ACCENT_GLOW = "#0d948859"
+    FG1 = "#1a1d24"; FG2 = "#3a3f48"; FG3 = "#666c79"; FG4 = "#9aa0a8"
+    ACCENT = "#0b796f"; ACCENT_GLOW = "#0d948859"
     ACCENT_BTN_FG = "#ffffff"; ACCENT_HOVER = "#0fa89b"
     DANGER = "#c0392b"; DANGER_BORDER = "#e3b3ab"; DANGER_BG_HOVER = "#fce8e4"
-    WARN = "#a07816"; WARN_BG = "#fbf2dd"; WARN_BORDER = "#e8d39f"
-    OK = "#15803d"; OK_BG = "#dcf5e7"; OK_BORDER = "#a4dfba"
+    WARN = "#886613"; WARN_BG = "#fbf2dd"; WARN_BORDER = "#e8d39f"
+    OK = "#147c3b"; OK_BG = "#dcf5e7"; OK_BORDER = "#a4dfba"
     MEASURE_A = "#7c3aed"; MEASURE_B = "#b45309"
 
 
@@ -377,6 +377,7 @@ QTabBar::tab {{
     border-bottom: 2px solid transparent;
 }}
 QTabBar::tab:hover     {{ color: {p.FG1}; }}
+QTabBar::tab:disabled  {{ color: {p.FG4}; }}
 QTabBar::tab:selected  {{ color: {p.FG1};
                           border-bottom: 2px solid {p.ACCENT}; }}
 
@@ -425,7 +426,189 @@ QToolTip {{
     font-size: 12px;
 }}
 QMessageBox {{ background: {p.BG1}; color: {p.FG1}; }}
+
+/* -- Dialogs -- */
+QDialog, QMessageBox, QInputDialog, QFileDialog {{ background: {p.BG1}; color: {p.FG1}; }}
+QWidget#calTabPage {{ background: {p.BG1}; }}
+
+/* -- Item views / text edits (concrete classes only, no generic scroll-area rule) -- */
+QTableView, QTableWidget, QListView, QListWidget, QTreeView, QTreeWidget,
+QPlainTextEdit, QTextEdit, QTextBrowser {{
+    background: {p.BG1};
+    color: {p.FG1};
+    border: 1px solid {p.BORDER1};
+    border-radius: 5px;
+    selection-background-color: {p.ACCENT};
+    selection-color: {p.ACCENT_BTN_FG};
+}}
+QTableView, QTableWidget {{
+    alternate-background-color: {p.BG2};
+    gridline-color: {p.BORDER1};
+}}
+QTableView::item, QTableWidget::item, QListView::item, QListWidget::item,
+QTreeView::item {{ padding: 3px 6px; }}
+/* no 'color' on ::item: it would override per-item foreground colours
+   (status colours); the text colour comes from QPalette.Text */
+QTableView::item:hover, QTableWidget::item:hover, QListView::item:hover,
+QListWidget::item:hover, QTreeView::item:hover {{ background: {p.BG3}; }}
+/* calibration step list: display only, no hover highlight under status colours */
+QListWidget#calStepList::item:hover {{ background: transparent; }}
+QTableView::item:selected, QTableWidget::item:selected, QListView::item:selected,
+QListWidget::item:selected, QTreeView::item:selected {{
+    background: {p.ACCENT};
+    color: {p.ACCENT_BTN_FG};
+}}
+QAbstractItemView:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{
+    background: {p.BG1};
+    color: {p.FG4};
+}}
+QPlainTextEdit, QTextEdit, QTextBrowser {{ font-family: {FONT_MONO}; font-size: 12px; }}
+/* fixed-height result / note panes (gui_layout.FixedTextPane): UI font, no border */
+QTextBrowser#fixedTextPane {{ font-family: {FONT_SANS}; font-size: 13px; border: none;
+                              background: transparent; }}
+
+/* -- Headers -- */
+QHeaderView {{ background: {p.BG2}; border: none; }}
+QHeaderView::section {{
+    background: {p.BG2};
+    color: {p.FG2};
+    border: none;
+    border-right: 1px solid {p.BORDER1};
+    border-bottom: 1px solid {p.BORDER1};
+    padding: 4px 8px;
+    font-weight: 500;
+}}
+QHeaderView::section:horizontal {{ background: {p.BG2}; border-bottom: 1px solid {p.BORDER1}; }}
+QHeaderView::section:vertical {{
+    background: {p.BG2};
+    border-right: 1px solid {p.BORDER1};
+    border-bottom: 1px solid {p.BORDER1};
+}}
+QHeaderView::section:hover {{ background: {p.BG3}; color: {p.FG1}; }}
+QHeaderView::section:checked {{ background: {p.BG3}; color: {p.FG1}; }}
+QTableCornerButton::section {{
+    background: {p.BG2};
+    border: none;
+    border-right: 1px solid {p.BORDER1};
+    border-bottom: 1px solid {p.BORDER1};
+}}
+QAbstractScrollArea::corner {{ background: {p.BG1}; border: none; }}
+
+/* -- Scrollbars (horizontal; vertical base rules above) -- */
+QScrollBar:horizontal {{ background: {p.BG1}; height: 10px; margin: 0; border: none; }}
+QScrollBar::handle:horizontal {{ background: {p.BORDER2}; border-radius: 4px;
+                                 min-width: 30px; }}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{ background: {p.FG4}; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; height: 0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+
+/* -- Splitter -- */
+QSplitter::handle {{ background: {p.BORDER1}; }}
+QSplitter::handle:horizontal {{ width: 2px; }}
+QSplitter::handle:vertical {{ height: 2px; }}
+QSplitter::handle:hover {{ background: {p.ACCENT}; }}
+
+/* -- Check / radio -- */
+QCheckBox, QRadioButton {{ color: {p.FG1}; background: transparent; spacing: 6px; }}
+QCheckBox:disabled, QRadioButton:disabled {{ color: {p.FG4}; background: transparent; }}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 14px; height: 14px;
+    background: {p.BG2};
+    border: 1px solid {p.BORDER2};
+}}
+QCheckBox::indicator {{ border-radius: 3px; }}
+QRadioButton::indicator {{ border-radius: 8px; }}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: {p.ACCENT}; }}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+    background: {p.ACCENT};
+    border: 1px solid {p.ACCENT};
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    background: {p.BG1};
+    border: 1px solid {p.BORDER1};
+}}
+QCheckBox::indicator:checked:disabled, QRadioButton::indicator:checked:disabled {{
+    background: {p.FG4};
+    border: 1px solid {p.FG4};
+}}
+
+/* -- Menus -- */
+QMenu {{
+    background: {p.BG2};
+    color: {p.FG1};
+    border: 1px solid {p.BORDER2};
+    padding: 4px;
+}}
+QMenu::item {{ padding: 5px 22px; background: transparent; color: {p.FG1}; }}
+QMenu::item:selected {{ background: {p.ACCENT}; color: {p.ACCENT_BTN_FG}; }}
+QMenu::item:disabled {{ color: {p.FG4}; background: transparent; }}
+QMenu::separator {{ height: 1px; background: {p.BORDER1}; margin: 4px 6px; }}
+
+/* -- Group box -- */
+QGroupBox {{
+    border: 1px solid {p.BORDER1};
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 8px;
+    background: transparent;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px;
+    color: {p.FG2};
+}}
+
+/* -- Disabled states -- */
+QLabel:disabled {{ color: {p.FG4}; }}
+QComboBox:disabled {{ color: {p.FG4}; background: {p.BG1}; }}
+QComboBox QAbstractItemView::item {{ padding: 3px 6px; }}
+QComboBox QAbstractItemView QScrollBar:vertical {{ background: {p.BG2}; }}
+QComboBox QAbstractItemView QScrollBar:horizontal {{ background: {p.BG2}; }}
 """
+
+
+def contrast_ratio(c1, c2) -> float:
+    """WCAG 2.x contrast ratio (1..21) between two colours (hex str or QColor)."""
+    def lum(c):
+        q = c if isinstance(c, QColor) else QColor(c)
+        ch = []
+        for v in (q.redF(), q.greenF(), q.blueF()):
+            ch.append(v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    l1, l2 = lum(c1), lum(c2)
+    if l1 < l2:
+        l1, l2 = l2, l1
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
+def build_qpalette(p) -> QPalette:
+    """QPalette derived from palette tokens (for widgets the QSS does not reach)."""
+    q = QPalette()
+    R = QPalette.ColorRole
+    G = QPalette.ColorGroup
+    roles = {
+        R.Window: p.BG0, R.WindowText: p.FG1,
+        R.Base: p.BG1, R.AlternateBase: p.BG2,
+        R.Text: p.FG1, R.Button: p.BG2, R.ButtonText: p.FG1,
+        R.ToolTipBase: p.BG2, R.ToolTipText: p.FG1,
+        R.Highlight: p.ACCENT, R.HighlightedText: p.ACCENT_BTN_FG,
+        R.PlaceholderText: p.FG3, R.BrightText: "#ffffff", R.Link: p.ACCENT,
+        R.Mid: p.BORDER2, R.Dark: p.BORDER1, R.Light: p.BG3, R.Shadow: p.BG0,
+    }
+    for role, col in roles.items():
+        q.setColor(role, QColor(col))
+    for role in (R.Text, R.WindowText, R.ButtonText):
+        q.setColor(G.Disabled, role, QColor(p.FG4))
+    return q
+
+
+def apply_app_theme(app, palette) -> None:
+    """Activate palette tokens, QPalette and application stylesheet together."""
+    set_active_palette(palette)
+    app.setPalette(build_qpalette(palette))
+    app.setStyleSheet(build_stylesheet(palette))
 
 
 DARK_STYLESHEET  = build_stylesheet(DarkPalette)

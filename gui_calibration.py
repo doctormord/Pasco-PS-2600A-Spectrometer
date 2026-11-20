@@ -29,13 +29,14 @@ import time
 import numpy as np
 import pyqtgraph as pg
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QLineEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QTabWidget, QWidget, QMessageBox, QFileDialog, QAbstractItemView,
     QCheckBox, QListWidget, QListWidgetItem, QStackedWidget, QDoubleSpinBox,
-    QPlainTextEdit, QFormLayout, QInputDialog, QDialogButtonBox,
+    QFormLayout, QInputDialog, QDialogButtonBox, QSplitter, QSizePolicy,
 )
 
 import calibration_capture as cc
@@ -43,6 +44,11 @@ import calibration_profiles as calprof
 import calibration_workflow as cw
 import reference_sources as rs
 import gui_theme as gt
+import gui_tables as gtab
+from gui_layout import (
+    ElidedLabel, FixedTextPane, scroll_page, place_window, schedule_fix_onscreen,
+    geometry_to_config,
+)
 
 
 def _T():
@@ -141,15 +147,12 @@ class CalibrationDialog(QDialog):
         super().__init__(dashboard)
         self.dash = dashboard
         self.setWindowTitle("Device calibration")
-        self.setMinimumSize(820, 600)
-        # The app stylesheet themes backgrounds by objectName (#central, #sidebar
-        # …); a bare QDialog and its unnamed tab-page QWidgets have none, so they
-        # fall back to the light system palette. Give them a scoped dark
-        # background — selectors are limited to QDialog and #calTabPage so button
-        # / combo / table styling is left untouched.
-        self.setStyleSheet(
-            f"QDialog {{ background-color: {_T().BG1}; }}"
-            f"QWidget#calTabPage {{ background-color: {_T().BG1}; }}")
+        self.setSizeGripEnabled(True)
+        # Styling comes exclusively from the central theme (gui_theme); the
+        # geometry from the screen the main window is on (gui_layout).
+        from app_config import Config
+        place_window(self, dashboard, Config.get("calibration_dialog_geometry", None))
+        self._placed_onscreen = False
 
         # captured data
         self._wl_capture = None          # (wl, inten) of the line lamp
@@ -172,11 +175,17 @@ class CalibrationDialog(QDialog):
         self.tab_wizard = _SpectralWizardTab(self)
         self.tab_profiles = _ProfilesTab(self)
         self.tab_lamps = _LampsTab(self)
-        self.tabs.addTab(self._build_wavelength_tab(), "Wavelength")
-        self.tabs.addTab(self.tab_wizard, "Spectral calibration")
-        self.tabs.addTab(self.tab_profiles, "Profiles")
-        self.tabs.addTab(self.tab_lamps, "Lamps")
-        self.tabs.addTab(self._build_response_tab(), "Response (legacy)")
+        # Every tab page sits in a scroll area: its minimum size can never force
+        # the dialog larger than the window / screen.
+        self._pages = {}
+        for page, title in ((self._build_wavelength_tab(), "Wavelength"),
+                            (self.tab_wizard, "Spectral calibration"),
+                            (self.tab_profiles, "Profiles"),
+                            (self.tab_lamps, "Lamps"),
+                            (self._build_response_tab(), "Response (legacy)")):
+            sa = scroll_page(page)
+            self._pages[id(sa)] = page
+            self.tabs.addTab(sa, title)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, 1)
 
@@ -185,21 +194,43 @@ class CalibrationDialog(QDialog):
         row = QHBoxLayout(); row.addStretch(1); row.addWidget(self.btn_close)
         root.addLayout(row)
 
+    def page_at(self, i: int):
+        """Tab page (inside its scroll area) at index i."""
+        return self._pages.get(id(self.tabs.widget(i)))
+
+    # ── geometry ─────────────────────────────────────────────────────────
+    def showEvent(self, ev):                                 # noqa: N802
+        super().showEvent(ev)
+        if not self._placed_onscreen:
+            self._placed_onscreen = True
+            schedule_fix_onscreen(self)          # once, after the real frame exists
+
+    def _save_geometry(self) -> None:
+        try:
+            g = geometry_to_config(self)
+            if g is not None and self.isVisible():
+                from app_config import Config
+                Config.set("calibration_dialog_geometry", g)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[calib] saving the dialog geometry failed: {e}")
+
     # ── busy handling (a wizard step runs in a worker thread) ────────────
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
         self.btn_close.setEnabled(not busy)
         for i in range(self.tabs.count()):
-            if self.tabs.widget(i) is not self.tab_wizard:
+            if self.page_at(i) is not self.tab_wizard:
                 self.tabs.setTabEnabled(i, not busy)
 
     def done(self, r):
         if self._busy:
             return
+        self._save_geometry()
+        self.tab_wizard.restore_demo_spectrum()
         super().done(r)
 
-    def _on_tab_changed(self, _i):
-        w = self.tabs.currentWidget()
+    def _on_tab_changed(self, i):
+        w = self.page_at(i)
         for t in (self.tab_wizard, self.tab_profiles, self.tab_lamps):
             if w is t and hasattr(t, "refresh"):
                 t.refresh()
@@ -268,45 +299,14 @@ class CalibrationDialog(QDialog):
             lo, hi = default_x
         plot.setXRange(lo, hi, padding=0.02)
 
-    def _style_cal_table(self, table):
-        """Dark-theme the pixel↔λ table. The global stylesheet doesn't reach
-        QTableWidget here, so its viewport and header render bare white in dark
-        mode — style them explicitly from the palette (header sections, corner
-        button, grid, selection and the inline cell editor)."""
-        t = _T()
+    @staticmethod
+    def _style_cal_table(table):
+        """Pixel ↔ λ input table: colours come from the central theme; only
+        behaviour is set here (no row-number column, whole-row selection)."""
         table.setAlternatingRowColors(True)
-        table.setStyleSheet(f"""
-            QTableWidget {{
-                background: {t.BG1};
-                alternate-background-color: {t.BG2};
-                color: {t.FG1};
-                gridline-color: {t.BORDER1};
-                border: 1px solid {t.BORDER1};
-                border-radius: 6px;
-                selection-background-color: {t.BG3};
-                selection-color: {t.FG1};
-            }}
-            QTableWidget::item {{ padding: 2px 6px; }}
-            QTableWidget::item:selected {{ background: {t.BG3}; color: {t.FG1}; }}
-            QTableWidget QLineEdit {{
-                background: {t.BG3}; color: {t.FG1};
-                border: 1px solid {t.ACCENT}; selection-background-color: {t.ACCENT};
-            }}
-            QHeaderView::section {{
-                background: {t.BG2};
-                color: {t.FG3};
-                padding: 4px 8px;
-                border: none;
-                border-bottom: 1px solid {t.BORDER1};
-                border-right: 1px solid {t.BORDER1};
-                font-weight: 500;
-            }}
-            QTableCornerButton::section {{
-                background: {t.BG2};
-                border: none;
-                border-bottom: 1px solid {t.BORDER1};
-            }}
-        """)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setCornerButtonEnabled(False)
 
     # ══════════════════════════════════════════════════════════════════════
     #  WAVELENGTH TAB
@@ -344,6 +344,9 @@ class CalibrationDialog(QDialog):
             "combine several lamps into one full-range fit. Pixel positions are\n"
             "stable across a lamp swap, so mixing lamps in one fit is correct.")
         top.addWidget(self.chk_accum)
+        top.addStretch(1)
+        v.addLayout(top)
+        top = QHBoxLayout()
         top.addStretch(1)
         self.btn_wl_capture = QPushButton("Capture && detect peaks")
         self.btn_wl_capture.clicked.connect(self._wl_capture_clicked)
@@ -389,9 +392,8 @@ class CalibrationDialog(QDialog):
         mid.addLayout(btns)
         v.addLayout(mid, 1)
 
-        self.lbl_wl_result = QLabel("No fit yet.")
-        self.lbl_wl_result.setWordWrap(True)
-        self.lbl_wl_result.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_wl_result = FixedTextPane(4)
+        self.lbl_wl_result.setText("No fit yet.")
         v.addWidget(self.lbl_wl_result)
         return w
 
@@ -437,7 +439,7 @@ class CalibrationDialog(QDialog):
         if float(np.max(inten)) < 1.0:
             self._wl_peaks = None
             self.lbl_wl_result.setText(
-                "<b>Captured signal is ~0.</b> Is the lamp on and the exposure set?")
+                "<b>No signal captured.</b> Check the lamp and the integration time.")
             return
         # detect peaks once; keep them so switching the lamp dropdown can
         # re-assign against the SAME capture without re-measuring.
@@ -488,11 +490,11 @@ class CalibrationDialog(QDialog):
         self.lbl_wl_result.setText(
             f"Detected {len(peaks)} peaks; {verb} of {len(known)} {lamp} "
             f"lines in range{note}. Table now holds {total} line(s). "
-            + ("Switch lamp / recapture with another lamp to add more, then Fit. "
+            + ("Capture further lamps to add lines, then fit. "
                if accum else
-               "Tick 'Add to existing' to combine several lamps (Cd+Hg, then "
-               "Ne/Ar for the red/NIR end) into one full-span fit. ")
-            + "Edit the table if needed, then Fit.")
+               "Enable 'Add to existing' to combine several lamps (e.g. Cd+Hg and "
+               "Ne/Ar for the red/NIR range) into one fit. ")
+            + "Check the assignments, then fit.")
 
     def _wl_clear_clicked(self):
         """Reset the line table and the current capture so the user can start
@@ -587,11 +589,10 @@ class CalibrationDialog(QDialog):
             if max_res > 8.0:
                 reasons.append(f"the max residual is {max_res:.1f} nm")
             self.lbl_wl_result.setText(
-                "<b style='color:#ff6060'>Fit rejected</b> — " + "; ".join(reasons)
-                + ". Almost always a mis-assigned line (wrong lamp, or a stray "
-                "peak matched to the wrong wavelength). The previous axis was "
-                "kept. Fix the table — remove bad rows or pick the right lamp — "
-                "then Fit again.")
+                f"<b style='color:{_T().DANGER}'>Fit rejected</b> — " + "; ".join(reasons)
+                + ". Typical cause: a mis-assigned line (wrong lamp or a peak "
+                "matched to the wrong wavelength). The previous axis is kept. "
+                "Correct the line table, then fit again.")
             self._wl_redraw_plot()
             return
 
@@ -615,14 +616,14 @@ class CalibrationDialog(QDialog):
         warn = ""
         # warn if lines leave large unconstrained spans at either end
         if line_lo - dev_lo > 60 or dev_hi - line_hi > 60:
-            warn = (f"<br><span style='color:#ff8c3c'><b>Coverage warning:</b> "
+            warn = (f"<br><span style='color:{_T().WARN}'><b>Coverage warning:</b> "
                     f"lines span {line_lo:.0f}–{line_hi:.0f} nm but the device "
                     f"covers {dev_lo:.0f}–{dev_hi:.0f} nm. The axis is "
                     f"<b>extrapolated</b> outside the line span — small residuals "
                     f"do not guarantee accuracy there. Add lines from other "
                     f"lamps for full coverage.</span>")
         elif rms > 0.5:
-            warn = (f"<br><span style='color:#ff8c3c'>RMS {rms:.2f} nm is a bit "
+            warn = (f"<br><span style='color:{_T().WARN}'>RMS {rms:.2f} nm is a bit "
                     f"high — check for a mis-assigned line before saving.</span>")
         self.lbl_wl_result.setText(
             f"<b>Fit (degree {self.spn_degree.value()}, {len(nms)} lines):</b> "
@@ -659,9 +660,8 @@ class CalibrationDialog(QDialog):
         if not self.chk_wl_confirm.isChecked():
             QMessageBox.warning(
                 self, "Confirmation required",
-                "Tick 'Back up & confirm' first. Saving overwrites the current "
-                "wavelength calibration in the config — the checkbox makes sure "
-                "a timestamped backup is written before that happens.")
+                "Enable 'Back up & confirm' first. Saving replaces the current "
+                "wavelength calibration; a timestamped backup is written before.")
             return
         dev = self._device_name()
         key = {
@@ -719,7 +719,7 @@ class CalibrationDialog(QDialog):
 
         grid = QGridLayout()
         grid.addWidget(QLabel("<b>Reference</b> (target shape)"), 0, 0)
-        self.lbl_ref = QLabel("none")
+        self.lbl_ref = ElidedLabel("none")
         grid.addWidget(self.lbl_ref, 0, 1, 1, 3)
         b_ref_cap = QPushButton("Capture live"); b_ref_cap.clicked.connect(self._ref_capture)
         b_ref_load = QPushButton("Load CSV…");   b_ref_load.clicked.connect(self._ref_load)
@@ -727,7 +727,7 @@ class CalibrationDialog(QDialog):
         grid.addWidget(b_ref_cap, 1, 0); grid.addWidget(b_ref_load, 1, 1); grid.addWidget(b_ref_save, 1, 2)
 
         grid.addWidget(QLabel("<b>Measurement</b> (device under test)"), 2, 0)
-        self.lbl_meas = QLabel("none")
+        self.lbl_meas = ElidedLabel("none")
         grid.addWidget(self.lbl_meas, 2, 1, 1, 3)
         b_meas_cap = QPushButton("Capture live"); b_meas_cap.clicked.connect(self._meas_capture)
         grid.addWidget(b_meas_cap, 3, 0)
@@ -755,8 +755,7 @@ class CalibrationDialog(QDialog):
         bottom.addWidget(self.btn_save_profile)
         v.addLayout(bottom)
 
-        self.lbl_resp_status = QLabel("")
-        self.lbl_resp_status.setWordWrap(True)
+        self.lbl_resp_status = FixedTextPane(3)
         v.addWidget(self.lbl_resp_status)
         return w
 
@@ -842,7 +841,7 @@ class CalibrationDialog(QDialog):
         warn = info.get("warning")
         if warn:
             self.lbl_resp_status.setText(
-                f"<span style='color:#ff8c3c'><b>Coverage warning:</b> {warn}</span>")
+                f"<span style='color:{_T().WARN}'><b>Coverage warning:</b> {warn}</span>")
             QMessageBox.warning(self, "Banded / narrow source", warn)
         else:
             self.lbl_resp_status.setText(
@@ -970,25 +969,23 @@ class _GenRunner:
             self._advance(box.get("result"), None)
 
 
-def _shade_invalid(plot, wl, valid, max_regions: int = 40):
-    """Grey out the masked wavelength runs (valid == False)."""
+def _shade_masked(plot, wl, segments):
+    """Grey out everything outside the valid segments — including masked gaps
+    INSIDE the outer valid range (they are never reported as valid)."""
     wl = np.asarray(wl, float)
-    valid = np.asarray(valid, bool)
     if wl.size < 2:
         return
     d = float(np.median(np.diff(wl))) / 2.0
-    runs, start = [], None
-    for i, ok in enumerate(valid):
-        if not ok and start is None:
-            start = i
-        if ok and start is not None:
-            runs.append((start, i - 1)); start = None
-    if start is not None:
-        runs.append((start, valid.size - 1))
-    if len(runs) > max_regions:                       # keep the two outer ones
-        runs = [r for r in runs if r[0] == 0 or r[1] == valid.size - 1]
-    for a, b in runs:
-        reg = pg.LinearRegionItem(values=(wl[a] - d, wl[b] + d), movable=False,
+    lo_all, hi_all = float(wl[0]) - d, float(wl[-1]) + d
+    edges, cur = [], lo_all
+    for lo, hi in (segments or []):
+        if lo - d > cur:
+            edges.append((cur, lo - d))
+        cur = max(cur, hi + d)
+    if cur < hi_all:
+        edges.append((cur, hi_all))
+    for a, b in edges:
+        reg = pg.LinearRegionItem(values=(a, b), movable=False,
                                   brush=pg.mkBrush(128, 128, 128, 70),
                                   pen=pg.mkPen(None))
         reg.setZValue(-10)
@@ -1013,7 +1010,21 @@ _LAMP_STEPS = ["Selection", "Wavelength check", "Integration time", "Dark spectr
 _DERIV_STEPS = ["Selection", "Integration time", "Known optics (dark + light)",
                 "New optics (dark + light)", "Compute", "Save"]
 _STATE_TEXT = {"waiting": "waiting", "running": "running", "ok": "OK",
-               "warning": "warning", "error": "ERROR"}
+               "warning": "warning", "error": "ERROR", "failed": "FAILED"}
+# Leading symbol: the state stays recognisable without colour.
+_STATE_MARK = {"waiting": "○", "running": "▶", "ok": "✓", "warning": "!",
+               "error": "✗", "failed": "✗"}
+
+
+def _state_color(state: str) -> str:
+    """Theme token per step state (contrast ≥ 4.5:1 on BG1/BG2, both themes)."""
+    t = _T()
+    return {"error": t.DANGER, "failed": t.DANGER, "warning": t.WARN,
+            "ok": t.OK, "running": t.ACCENT}.get(state, t.FG2)
+
+
+def _span(color_token: str, html: str) -> str:
+    return f"<span style='color:{color_token}'>{html}</span>"
 
 
 class _SpectralWizardTab(QWidget):
@@ -1028,6 +1039,7 @@ class _SpectralWizardTab(QWidget):
         self._wf = None
         self._dw = None
         self._resumed = False
+        self._demo_restore = None            # (backend, previous spectrum name)
         self._step_names: list[str] = []
         self.step_states: dict[int, tuple] = {}
         self.last_error: str | None = None
@@ -1041,12 +1053,18 @@ class _SpectralWizardTab(QWidget):
     def _build(self):
         v = QVBoxLayout(self)
         intro = QLabel(
-            "Fixed sequence, identical for every device: select, wavelength check, "
-            "integration time, dark, calibration spectrum (+ stability), "
-            "integration-time cross check, compute, save. The new profile is "
-            "activated and a protocol (PDF/CSV) is written.")
+            "Fixed sequence for every device. A protocol (PDF/CSV) is written for "
+            "every completed computation.")
         intro.setWordWrap(True)
         v.addWidget(intro)
+
+        # Left column: selection + settings + step list; right: plots. The
+        # splitter keeps both user-resizable; nothing here can widen the window.
+        self.split = QSplitter(Qt.Orientation.Horizontal)
+        self.split.setChildrenCollapsible(False)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 4, 0)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Mode:"))
@@ -1054,69 +1072,86 @@ class _SpectralWizardTab(QWidget):
         self.cmb_mode.addItems(["Calibrate against a reference lamp",
                                 "Derive from other optics"])
         self.cmb_mode.currentIndexChanged.connect(self._mode_changed)
-        top.addWidget(self.cmb_mode)
-        top.addStretch(1)
-        v.addLayout(top)
+        top.addWidget(self.cmb_mode, 1)
+        lv.addLayout(top)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_lamp_form())
         self.stack.addWidget(self._build_deriv_form())
-        v.addWidget(self.stack)
+        lv.addWidget(self.stack)
 
-        g = QHBoxLayout()
-        g.addWidget(QLabel("Integration time:"))
+        g = QGridLayout()
+        g.addWidget(QLabel("Integration time:"), 0, 0)
         self.cmb_itime = QComboBox()
         self.cmb_itime.addItems(["Auto (target level)", "Fixed"])
         self.cmb_itime.currentIndexChanged.connect(self._itime_mode_changed)
-        g.addWidget(self.cmb_itime)
+        g.addWidget(self.cmb_itime, 0, 1)
         self.spn_ms = QDoubleSpinBox()
         self.spn_ms.setRange(0.01, 60000.0); self.spn_ms.setDecimals(2)
         self.spn_ms.setValue(100.0); self.spn_ms.setSuffix(" ms")
         self.spn_ms.setEnabled(False)
-        g.addWidget(self.spn_ms)
-        g.addSpacing(12)
-        g.addWidget(QLabel("Frames per capture:"))
+        g.addWidget(self.spn_ms, 0, 2)
+        g.addWidget(QLabel("Frames per capture:"), 1, 0)
         self.spn_frames = QSpinBox(); self.spn_frames.setRange(2, 1000)
         self.spn_frames.setValue(cw.WorkflowConfig.from_config().n_frames)
-        g.addWidget(self.spn_frames)
-        g.addStretch(1)
-        self.lbl_itime = QLabel("")
-        g.addWidget(self.lbl_itime)
-        v.addLayout(g)
+        g.addWidget(self.spn_frames, 1, 1)
+        self.lbl_itime = ElidedLabel("")
+        g.addWidget(self.lbl_itime, 1, 2)
+        g.setColumnStretch(2, 1)
+        lv.addLayout(g)
+        lv.addStretch(1)
 
-        mid = QHBoxLayout()
         self.lst_steps = QListWidget()
-        self.lst_steps.setMaximumWidth(330)
-        self.lst_steps.setMinimumHeight(170)
-        mid.addWidget(self.lst_steps)
-        plots = QVBoxLayout()
+        self.lst_steps.setObjectName("calStepList")
+        self.lst_steps.setWordWrap(True)
+        self.lst_steps.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.lst_steps.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lst_steps.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.lst_steps.setUniformItemSizes(False)
+        self.lst_steps.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.lst_steps.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.lst_steps.setMinimumHeight(110)
+        self.lst_steps.setMinimumWidth(170)
+        left.setMinimumWidth(300)
+        self.split.addWidget(left)
+        self.split.addWidget(self.lst_steps)
+        plots = QSplitter(Qt.Orientation.Vertical)
+        plots.setChildrenCollapsible(False)
         self.plot_in = pg.PlotWidget()
         self.plot_in.setLabel("bottom", "Wavelength", units="nm")
         self.plot_in.setLabel("left", "normalised")
         self.plot_in.addLegend()
-        self.plot_in.setMinimumHeight(110)
+        self.plot_in.setMinimumHeight(90)
         self.dlg._style_cal_plot(self.plot_in)
         self.plot_out = pg.PlotWidget()
         self.plot_out.setLabel("bottom", "Wavelength", units="nm")
         self.plot_out.setLabel("left", "S / K")
         self.plot_out.addLegend()
-        self.plot_out.setMinimumHeight(110)
+        self.plot_out.setMinimumHeight(90)
         self.dlg._style_cal_plot(self.plot_out)
-        plots.addWidget(self.plot_in, 1)
-        plots.addWidget(self.plot_out, 1)
-        mid.addLayout(plots, 1)
-        v.addLayout(mid, 1)
+        plots.addWidget(self.plot_in)
+        plots.addWidget(self.plot_out)
+        self.split.addWidget(plots)
+        self.split.setStretchFactor(0, 0)
+        self.split.setStretchFactor(1, 0)
+        self.split.setStretchFactor(2, 1)
+        self.split.setSizes([380, 240, 600])
+        v.addWidget(self.split, 1)
 
-        self.lbl_result = QLabel("")
-        self.lbl_result.setWordWrap(True)
-        self.lbl_result.setTextFormat(Qt.TextFormat.RichText)
+        # Fixed-height result / status / protocol area — no layout jumps.
+        self.lbl_result = FixedTextPane(3)
         v.addWidget(self.lbl_result)
-        self.lbl_status = QLabel("Ready.")
-        self.lbl_status.setWordWrap(True)
+        self.lbl_status = ElidedLabel("Ready.")
         v.addWidget(self.lbl_status)
-
         row = QHBoxLayout()
-        row.addStretch(1)
+        row.addWidget(QLabel("Protocol:"))
+        self.lbl_protocol = ElidedLabel("—", mode=Qt.TextElideMode.ElideMiddle)
+        row.addWidget(self.lbl_protocol, 1)
+        self.btn_open_folder = QPushButton("Open folder")
+        self.btn_open_folder.setEnabled(False)
+        self.btn_open_folder.clicked.connect(self._open_protocol_folder)
+        row.addWidget(self.btn_open_folder)
+        row.addSpacing(16)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.setToolTip("Stops after the running step.")
@@ -1130,7 +1165,8 @@ class _SpectralWizardTab(QWidget):
 
     def _build_lamp_form(self) -> QWidget:
         w = QWidget(); f = QFormLayout(w); f.setContentsMargins(0, 0, 0, 0)
-        self.lbl_device = QLabel("")
+        f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.lbl_device = ElidedLabel("")
         f.addRow("Device:", self.lbl_device)
         self.cmb_optics = QComboBox(); self.cmb_optics.setEditable(True)
         self.cmb_optics.lineEdit().setPlaceholderText("Optics configuration name")
@@ -1142,11 +1178,14 @@ class _SpectralWizardTab(QWidget):
         self.cmb_input.currentIndexChanged.connect(self._input_changed)
         f.addRow("Input optic:", self.cmb_input)
         self.cmb_ref = QComboBox()
+        self.cmb_ref.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_ref.setMinimumContentsLength(20)
         self.cmb_ref.currentIndexChanged.connect(self._ref_changed)
         f.addRow("Reference source:", self.cmb_ref)
-        self.lbl_ref_info = QLabel("")
-        self.lbl_ref_info.setWordWrap(True)
-        self.lbl_ref_info.setTextFormat(Qt.TextFormat.RichText)
+        # Space for the source notes is reserved permanently (3 lines), so
+        # showing / hiding a warning never moves the rest of the dialog.
+        self.lbl_ref_info = FixedTextPane(3)
         f.addRow("", self.lbl_ref_info)
         self.cmb_type = QComboBox()
         self.cmb_type.addItems([calprof.TYPE_RELATIVE, calprof.TYPE_ABSOLUTE])
@@ -1160,6 +1199,9 @@ class _SpectralWizardTab(QWidget):
         hint.setWordWrap(True)
         f.addRow(hint)
         self.cmb_known = QComboBox()
+        self.cmb_known.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_known.setMinimumContentsLength(20)
         f.addRow("Known profile:", self.cmb_known)
         self.edit_new_name = QLineEdit()
         self.edit_new_name.setPlaceholderText("Name of the NEW optics configuration")
@@ -1183,8 +1225,8 @@ class _SpectralWizardTab(QWidget):
         fp = _backend_fp(be)
         self.lbl_device.setText(
             f"{name} · S/N {serial or '—'}"
-            + ("" if be is not None else "  (no device connected)")
-            + ("  ⚠ no serial number: profiles are NOT bound to this unit"
+            + ("" if be is not None else " · no device connected")
+            + (" · no serial number: profiles are not bound to this unit"
                if be is not None and not serial else ""))
         cur = self.cmb_optics.currentText()
         profs = calprof.profiles_for_device(name, serial, fp, include_old=True)
@@ -1198,22 +1240,26 @@ class _SpectralWizardTab(QWidget):
             srcs = rs.ReferenceLibrary().list()
         except Exception as e:                                # noqa: BLE001
             srcs = []
-            self.lbl_ref_info.setText(f"<span style='color:#ff6060'>{e}</span>")
+            self.lbl_ref_info.setText(_span(_T().DANGER, str(e)))
         self.cmb_ref.blockSignals(True)
         self.cmb_ref.clear()
         for s in srcs:
-            self.cmb_ref.addItem(f"{s.name} ({s.serial})" if s.serial else s.name, s.id)
+            label = f"{s.name} ({s.serial})" if s.serial else s.name
+            self.cmb_ref.addItem(label, s.id)
+            self.cmb_ref.setItemData(self.cmb_ref.count() - 1, label,
+                                     Qt.ItemDataRole.ToolTipRole)
         i = self.cmb_ref.findData(cur_id) if cur_id is not None else -1
         if i >= 0:
             self.cmb_ref.setCurrentIndex(i)
         self.cmb_ref.blockSignals(False)
         cur_known = self.cmb_known.currentData()
         self.cmb_known.clear()
-        import calibration_workflow as _cw
         for p in calprof.profiles_for_device(name, serial, fp,
                                              nl_active=calprof.device_nl_active(be)):
             # only v2 profiles valid on this unit with the current λ calibration
-            if be is not None and not _cw.derivation_source_ok(p, be, name)[0]:
+            if be is not None and not cw.derivation_source_ok(p, be, name)[0]:
+                continue
+            if calprof.is_implausible(p):          # never derive from a failed profile
                 continue
             self.cmb_known.addItem(calprof.profile_label(p), p["id"])
         i = self.cmb_known.findData(cur_known)
@@ -1249,6 +1295,10 @@ class _SpectralWizardTab(QWidget):
         if not allow_abs and self.cmb_type.currentText() == calprof.TYPE_ABSOLUTE:
             self.cmb_type.setCurrentIndex(0)
 
+    def _backend_is_demo(self, be=None) -> bool:
+        be = self.dlg._backend() if be is None else be
+        return be is not None and callable(getattr(be, "set_spectrum", None))
+
     def _ref_changed(self, *_):
         sid = self.cmb_ref.currentData()
         try:
@@ -1259,19 +1309,22 @@ class _SpectralWizardTab(QWidget):
         if src is None:
             self.lbl_ref_info.setText("")
             return
-        txt = (f"Unit: {src.unit} · valid {_fmt_range(src.valid_min_nm, src.valid_max_nm)}"
-               f" · intended optic: {src.input_optic or 'not specified'}")
+        lines = [f"Unit: {src.unit} · valid {_fmt_range(src.valid_min_nm, src.valid_max_nm)}"
+                 f" · intended optic: {src.input_optic or 'not specified'}"]
         if getattr(src, "builtin", False):
-            txt += ("<br><span style='color:#ff8c3c'><b>Synthetic demo source</b> — "
-                    "only meaningful with the Demo backend, not a real lamp.</span>")
+            if self._backend_is_demo() and src.id in rs.DEMO_SPECTRUM_FOR_SOURCE:
+                lines.append("Synthetic demo source. The Demo backend simulates this "
+                             "lamp for the duration of the run.")
+            else:
+                lines.append(_span(_T().WARN, "<b>Synthetic demo source</b> — valid "
+                                   "only with the Demo backend, not for a real lamp."))
         if not calprof.is_absolute_reference_unit(src.unit):
-            txt += "<br>Relative unit → only relative calibration possible."
+            lines.append("Relative unit: only a relative calibration is possible.")
         inp = self.cmb_input.currentText()
         if src.input_optic and src.input_optic != inp:
-            txt += (f"<br><span style='color:#ff8c3c'><b>Warning:</b> this source "
-                    f"is meant for input optic '{src.input_optic}', but '{inp}' is "
-                    f"selected.</span>")
-        self.lbl_ref_info.setText(txt)
+            lines.append(_span(_T().WARN, f"<b>Warning:</b> source specified for input "
+                               f"optic '{src.input_optic}', selected: '{inp}'."))
+        self.lbl_ref_info.setText("<br>".join(lines))
 
     def _itime_mode_changed(self, *_):
         self.spn_ms.setEnabled(self.cmb_itime.currentIndex() == 1)
@@ -1297,16 +1350,46 @@ class _SpectralWizardTab(QWidget):
         if it is None:
             return
         self.step_states[i] = (state, detail)
-        txt = f"{self._step_names[i]}: {_STATE_TEXT[state]}"
+        txt = f"{_STATE_MARK[state]} {self._step_names[i]}: {_STATE_TEXT[state]}"
         if detail:
             txt += f" – {detail}"
         it.setText(txt)
         it.setToolTip(txt)
-        t = _T()
-        col = {"error": "#ff6060", "warning": "#ff8c3c",
-               "waiting": t.FG3, "running": t.ACCENT}.get(state, t.FG1)
-        from PyQt6.QtGui import QColor
-        it.setForeground(QColor(col))
+        it.setForeground(QColor(_state_color(state)))
+
+    # ── protocol location ────────────────────────────────────────────────
+    def _set_protocol_display(self):
+        if self.protocol_paths:
+            self.lbl_protocol.setText("; ".join(self.protocol_paths))
+            self.btn_open_folder.setEnabled(True)
+        else:
+            self.lbl_protocol.setText(self.protocol_message or "—")
+            self.btn_open_folder.setEnabled(False)
+
+    def _open_protocol_folder(self):
+        if self.protocol_paths:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(
+                os.path.dirname(self.protocol_paths[0])))
+
+    # ── demo backend: simulate the selected demo source during a run ─────
+    def _apply_demo_spectrum(self, be, src) -> str | None:
+        name = rs.DEMO_SPECTRUM_FOR_SOURCE.get(getattr(src, "id", None))
+        if not name or not self._backend_is_demo(be):
+            return None
+        prev = be.set_spectrum(name)
+        if self._demo_restore is None:           # keep the ORIGINAL spectrum
+            self._demo_restore = (be, prev)
+        return name
+
+    def restore_demo_spectrum(self) -> None:
+        if self._demo_restore is None:
+            return
+        be, prev = self._demo_restore
+        self._demo_restore = None
+        try:
+            be.set_spectrum(prev)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[calib] restoring the demo spectrum failed: {e}")
 
     # ── run control ──────────────────────────────────────────────────────
     def _cancel_clicked(self):
@@ -1330,7 +1413,7 @@ class _SpectralWizardTab(QWidget):
             rem = end - time.monotonic()
             if rem <= 0:
                 return
-            self._note = f"Stability check: waiting {rem:.0f} s before the second capture…"
+            self._note = f"Stability check: second capture in {rem:.0f} s…"
             time.sleep(min(0.1, rem))
 
     def _begin(self, gen):
@@ -1340,6 +1423,7 @@ class _SpectralWizardTab(QWidget):
         self.last_status = ""
         self.protocol_paths = []
         self.protocol_message = ""
+        self._set_protocol_display()
         self.dlg.set_busy(True)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
@@ -1356,6 +1440,7 @@ class _SpectralWizardTab(QWidget):
             self.lbl_status.setText(f"Unexpected error: {exc}")
         self.running = False
         self._note = ""
+        self.restore_demo_spectrum()
         if self._resumed:
             self.dlg._restore_pause_after_capture()
             self._resumed = False
@@ -1363,6 +1448,7 @@ class _SpectralWizardTab(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.cmb_mode.setEnabled(True)
+        self._set_protocol_display()
 
     def start(self):
         if self.running:
@@ -1393,6 +1479,11 @@ class _SpectralWizardTab(QWidget):
                             "notes": self.edit_notes.text().strip()},
                     reference=src, cfg=cfg)
                 gen = self._gen_lamp(self._wf, us)
+                demo = self._apply_demo_spectrum(be, src)
+                if demo:
+                    self._wf.warnings.append(
+                        f"Demo backend: simulated source set to '{demo}' "
+                        f"(matching reference '{src.name}') for this run.")
             else:
                 pid = self.cmb_known.currentData()
                 if not pid:
@@ -1423,6 +1514,28 @@ class _SpectralWizardTab(QWidget):
         self.lbl_status.setText(f"Stopped: {e}")
         QMessageBox.critical(self, "Calibration stopped", str(e))
 
+    def _confirm_implausible(self, failures, other_failed=()) -> bool:
+        """Saving a result that failed the plausibility check needs an explicit
+        decision; the default button is 'No'."""
+        failures = list(failures) + [f"{c} check failed" for c in other_failed]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Plausibility check failed")
+        box.setText("The calibration result failed the plausibility check:")
+        box.setInformativeText(
+            "\n".join(f"• {f}" for f in failures)
+            + "\n\nThe calibration source must be smooth and broadband. "
+              "Save the profile anyway? It will be marked as not plausible "
+              "and will not be activated.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return self._exec_box(box) == QMessageBox.StandardButton.Yes
+
+    def _exec_box(self, box):
+        """Separate hook so tests can answer the dialog."""
+        return QMessageBox.StandardButton(box.exec())
+
     def _gen_lamp(self, wf, us):
         step = 0
         try:
@@ -1452,14 +1565,14 @@ class _SpectralWizardTab(QWidget):
             step = 3; self._checkpoint(); self._state(3, "running")
             if wf.needs_user_cover:
                 if not _ask(self, "Dark spectrum",
-                            "Block the light path / cover the lamp now.\n\n"
+                            "Block the light path / cover the lamp.\n\n"
                             "The dark spectra are captured next.", ok_cancel=True):
                     raise _Abort("cancelled at the dark prompt")
             self.lbl_status.setText("Capturing dark spectra…")
             dk = yield wf.capture_darks
             if wf.needs_user_cover:
                 if not _ask(self, "Release the light path",
-                            "Release the light path / uncover the lamp now.\n\n"
+                            "Release the light path / uncover the lamp.\n\n"
                             "The calibration spectrum is captured next.",
                             ok_cancel=True):
                     raise _Abort("cancelled at the release prompt")
@@ -1480,44 +1593,99 @@ class _SpectralWizardTab(QWidget):
             else:
                 self._state(5, "ok" if cx["pass"] else "warning",
                             f"{cx['crosscheck']['p95_pct']:.2f} %")
-            # 7 compute
+            # 7 compute + plausibility
             step = 6; self._checkpoint(); self._state(6, "running")
-            res = yield wf.compute
+            try:
+                res = yield wf.compute
+            except ValueError as e:                       # no valid pixel at all
+                self._state(6, "failed", str(e))
+                self._state(7, "failed", "not saved")
+                self.last_status = "failed"
+                self.lbl_result.setText(_span(_T().DANGER, f"<b>FAILED</b>: {e}"))
+                yield from self._write_protocol(wf)
+                self.lbl_status.setText("Calibration failed: no valid pixels, "
+                                        "no profile saved.")
+                return
             self._show_lamp_result(wf, res)
-            self._state(6, "ok", f"valid {_fmt_range(*res['valid_range_nm'])}")
+            segs = calprof.format_segments(res.get("segments_nm"), 3)
+            if wf.plausible:
+                self._state(6, "ok", f"valid {segs}")
+            else:
+                self._state(6, "failed", "plausibility check failed: "
+                            + "; ".join(wf.plausibility["failures"]))
             # 8 save
             step = 7; self._checkpoint()
-            if any(wf.checks.get(k) is False for k in ("stability_pass", "itime_pass")):
+            activate = True
+            if not wf.plausible:
+                other = [n for k, n in (("stability_pass", "Stability"),
+                                        ("itime_pass", "Integration-time cross"))
+                         if wf.checks.get(k) is False]
+                if not self._confirm_implausible(wf.plausibility["failures"], other):
+                    self._state(7, "failed", "not saved (plausibility check failed)")
+                    self.last_status = "failed"
+                    yield from self._write_protocol(wf)
+                    self.lbl_status.setText("Calibration failed: result not plausible, "
+                                            "no profile saved.")
+                    return
+                activate = False
+            elif any(wf.checks.get(k) is False for k in ("stability_pass", "itime_pass")):
                 if not _ask(self, "Checks failed",
                             "The stability and/or integration-time cross check "
                             "failed.\n\nSave the profile anyway?"):
                     self._state(7, "warning", "not saved (checks failed)")
                     self.last_status = "not_saved"
+                    yield from self._write_protocol(wf)
                     self.lbl_status.setText("Not saved.")
                     return
             self._state(7, "running")
-            saved = yield wf.save
-            calprof.set_active_selection(wf.backend_name, saved[0]["id"])
+            saved = yield (lambda: wf.save(allow_implausible=not activate))
+            if activate:
+                calprof.set_active_selection(wf.backend_name, saved[0]["id"])
             self.dlg.notify_profiles_changed()
-            self._write_protocol(wf)
-            self._state(7, "ok" if self.protocol_paths else "warning",
-                        f"profile {saved[0]['id']} v{saved[0]['version']} saved and active"
-                        + ("" if self.protocol_paths else "; protocol not written"))
-            self.last_status = "saved"
-            self.lbl_status.setText(
-                f"Saved profile {saved[0]['id']} (v{saved[0]['version']}) and activated "
-                f"it. " + (self.protocol_message or ""))
+            yield from self._write_protocol(wf)
+            pid = f"profile {saved[0]['id']} v{saved[0]['version']}"
+            if activate:
+                self._state(7, "ok" if self.protocol_paths else "warning",
+                            f"{pid} saved and active"
+                            + ("" if self.protocol_paths else "; protocol not written"))
+                self.last_status = "saved"
+                self.lbl_status.setText(f"Saved and activated {pid}.")
+            else:
+                self._state(7, "warning", f"{pid} saved as NOT PLAUSIBLE, not activated")
+                self.last_status = "saved_implausible"
+                self.lbl_status.setText(f"Saved {pid} marked as not plausible; "
+                                        f"not activated.")
         except Exception as e:                                # noqa: BLE001
             self._fail_msg(step, e)
 
+    def _result_text(self, res, plausibility, extra=()):
+        t = _T()
+        lines = [f"Valid segments: {calprof.format_segments(res.get('segments_nm'), 4)}"
+                 f" · gain span {res['gain_span']:.1f}×"]
+        if plausibility is not None:
+            m, lim = plausibility["metrics"], plausibility["limits"]
+            verdict = (_span(t.OK, "passed") if plausibility["pass"]
+                       else _span(t.DANGER, "<b>FAILED</b>"))
+            lines.append(
+                f"Plausibility: {verdict} — coverage {m['coverage']*100:.0f} % "
+                f"(≥ {lim['min_coverage']*100:.0f} %), gain span ≤ {lim['max_gain_span']:.0f}×, "
+                f"roughness {m['roughness']*100:.1f} % (≤ {lim['max_roughness']*100:.1f} %), "
+                f"isolated {m['isolated_frac']*100:.0f} % "
+                f"(≤ {lim['max_isolated_frac']*100:.0f} %)")
+            for f in plausibility["failures"]:
+                lines.append(_span(t.DANGER, f"• {f}"))
+        lines.extend(extra)
+        return "<br>".join(lines)
+
     def _show_lamp_result(self, wf, res):
         wl, valid = res["wl"], res["valid"]
+        segs = calprof.valid_segments(wl, valid, 0.0)     # shade every masked gap
         self.plot_in.clear()
         self.plot_in.plot(wl, _norm(res["C_cal"], valid), name="C_cal (norm)",
                           pen=pg.mkPen((120, 180, 255), width=1))
         self.plot_in.plot(wl, _norm(res["E"], valid), name="E_ref (norm)",
                           pen=pg.mkPen((120, 200, 120), width=1))
-        _shade_invalid(self.plot_in, wl, valid)
+        _shade_masked(self.plot_in, wl, segs)
         self.plot_in.autoRange()
         self.plot_out.clear()
         absolute = wf.kind == calprof.TYPE_ABSOLUTE
@@ -1525,45 +1693,49 @@ class _SpectralWizardTab(QWidget):
         self.plot_out.setLabel("left", "K" if absolute else "S")
         self.plot_out.plot(wl, y, name="K" if absolute else "S", connect="finite",
                            pen=pg.mkPen((255, 170, 60), width=2))
-        _shade_invalid(self.plot_out, wl, valid)
+        _shade_masked(self.plot_out, wl, segs)
         self.plot_out.autoRange()
         c = wf.checks
+        t = _T()
 
         def chk(name, pct, ok):
             if pct is None:
                 return f"{name}: skipped"
-            col = "#3cb371" if ok else "#ff6060"
-            return (f"{name}: {pct:.2f} % — <span style='color:{col}'>"
-                    f"{'passed' if ok else 'NOT passed'}</span>")
-        txt = [f"Valid range: {_fmt_range(*res['valid_range_nm'])}"
-               f" · gain span {res['gain_span']:.1f}×",
-               chk("Stability", c.get("stability_pct"), c.get("stability_pass")),
-               chk("Integration cross check", c.get("itime_crosscheck_pct"),
-                   c.get("itime_pass"))]
-        if wf.warnings:
-            txt.append("<span style='color:#ff8c3c'>" + "<br>".join(wf.warnings) + "</span>")
-        self.lbl_result.setText("<br>".join(txt))
+            return (f"{name}: {pct:.2f} % — "
+                    + _span(t.OK if ok else t.DANGER, "passed" if ok else "NOT passed"))
+        extra = [chk("Stability", c.get("stability_pct"), c.get("stability_pass")),
+                 chk("Integration cross check", c.get("itime_crosscheck_pct"),
+                     c.get("itime_pass"))]
+        other = [w for w in wf.warnings if not w.startswith("Plausibility check failed")]
+        if other:
+            extra.append(_span(t.WARN, "<br>".join(other)))
+        self.lbl_result.setText(self._result_text(res, wf.plausibility, extra))
 
     def _write_protocol(self, wf):
+        """Generator fragment: the record is built here (GUI thread), the PDF /
+        CSV are written in the worker thread (matplotlib is slow)."""
         try:
             import calibration_report as crp
         except ImportError as e:
             self.protocol_message = f"Protocol not written (calibration_report: {e})."
             QMessageBox.warning(self, "Protocol", self.protocol_message)
+            self._set_protocol_display()
             return
         try:
             import export_paths
             rec = wf.record()
-            d, err = export_paths.ensure_export_dir()
+            d, note = export_paths.calibration_protocol_dir()
             base = crp.default_protocol_basename(rec)
-            paths = crp.write_protocol(rec, os.path.join(d, base + ".pdf"),
-                                       os.path.join(d, base + ".csv"))
+            pdf, csv_ = os.path.join(d, base + ".pdf"), os.path.join(d, base + ".csv")
+            self.lbl_status.setText("Writing the protocol…")
+            paths = yield (lambda: crp.write_protocol(rec, pdf, csv_))
             self.protocol_paths = list(paths or [])
-            self.protocol_message = ("Protocol: " + ", ".join(self.protocol_paths)
-                                     + (f" ({err})" if err else ""))
+            self.protocol_message = note or ""
         except Exception as e:                                # noqa: BLE001
+            self.protocol_paths = []
             self.protocol_message = f"Protocol not written: {e}"
             QMessageBox.warning(self, "Protocol", self.protocol_message)
+        self._set_protocol_display()
 
     # derivation ----------------------------------------------------------
     def _capture_pair(self, dw, which, cover):
@@ -1571,12 +1743,12 @@ class _SpectralWizardTab(QWidget):
         uncover prompts between them on devices without a shutter. Uses the
         split DerivationWorkflow steps (no capture/rate logic here)."""
         if cover and not _ask(self, "Dark spectrum",
-                              "Block the light path / cover the source now.\n\n"
+                              "Block the light path / cover the source.\n\n"
                               "The dark spectrum is captured next.", ok_cancel=True):
             raise _Abort("cancelled at the dark prompt")
         yield (lambda: dw.capture_dark_for(which))
         if cover and not _ask(self, "Release the light path",
-                              "Release the light path / uncover the source now.\n\n"
+                              "Release the light path / uncover the source.\n\n"
                               "The light spectrum is captured next.", ok_cancel=True):
             raise _Abort("cancelled at the light prompt")
         yield (lambda: dw.capture_light_for(which))
@@ -1595,15 +1767,15 @@ class _SpectralWizardTab(QWidget):
             step = 2; self._checkpoint(); self._state(2, "running")
             QMessageBox.information(
                 self, "Known optics",
-                "Known optics mounted, diffuse extended source.\n\nThe capture of "
-                "the known optics starts after you confirm.")
+                "Mount the known optics on the diffuse, extended source.\n\n"
+                "The capture starts after confirmation.")
             self.lbl_status.setText("Capturing with the known optics…")
             yield from self._capture_pair(dw, "known", cover)
             self._state(2, "ok")
             step = 3; self._checkpoint(); self._state(3, "running")
             if not _ask(self, "Swap optics",
-                        "Swap the optics now: mount the NEW optics on the same "
-                        "diffuse, extended source (same position, same lamp).",
+                        "Mount the NEW optics on the same diffuse, extended source "
+                        "(same position, same lamp).",
                         ok_cancel=True):
                 raise _Abort("cancelled at the optics swap")
             self.lbl_status.setText("Capturing with the new optics…")
@@ -1612,35 +1784,55 @@ class _SpectralWizardTab(QWidget):
             step = 4; self._checkpoint(); self._state(4, "running")
             res = yield dw.compute
             self._show_deriv_result(dw, res)
-            self._state(4, "ok", f"valid {_fmt_range(*res['valid_range_nm'])}")
-            step = 5; self._checkpoint(); self._state(5, "running")
-            p = yield dw.save
-            calprof.set_active_selection(dw.backend_name, p["id"])
+            if dw.plausible:
+                self._state(4, "ok",
+                            f"valid {calprof.format_segments(res.get('segments_nm'), 3)}")
+            else:
+                self._state(4, "failed", "plausibility check failed: "
+                            + "; ".join(dw.plausibility["failures"]))
+            step = 5; self._checkpoint()
+            activate = dw.plausible
+            if not activate and not self._confirm_implausible(dw.plausibility["failures"]):
+                self._state(5, "failed", "not saved (plausibility check failed)")
+                self.last_status = "failed"
+                self.lbl_status.setText("Derivation failed: result not plausible, "
+                                        "no profile saved.")
+                return
+            self._state(5, "running")
+            p = yield (lambda: dw.save(allow_implausible=not activate))
+            if activate:
+                calprof.set_active_selection(dw.backend_name, p["id"])
             self.dlg.notify_profiles_changed()
-            self._state(5, "ok", f"profile {p['id']} v{p['version']} saved and active")
-            self.last_status = "saved"
-            self.lbl_status.setText(f"Saved profile {p['id']} (v{p['version']}) and "
-                                    f"activated it.")
+            pid = f"profile {p['id']} v{p['version']}"
+            if activate:
+                self._state(5, "ok", f"{pid} saved and active")
+                self.last_status = "saved"
+                self.lbl_status.setText(f"Saved and activated {pid}.")
+            else:
+                self._state(5, "warning", f"{pid} saved as NOT PLAUSIBLE, not activated")
+                self.last_status = "saved_implausible"
+                self.lbl_status.setText(f"Saved {pid} marked as not plausible; "
+                                        f"not activated.")
         except Exception as e:                                # noqa: BLE001
             self._fail_msg(step, e)
 
     def _show_deriv_result(self, dw, res):
         wl, valid = res["wl"], res["valid"]
+        segs = calprof.valid_segments(wl, valid, 0.0)     # shade every masked gap
         self.plot_in.clear()
         self.plot_in.plot(wl, _norm(res["C_known"], valid), name="C_known (norm)",
                           pen=pg.mkPen((120, 200, 120), width=1))
         self.plot_in.plot(wl, _norm(res["C_new"], valid), name="C_new (norm)",
                           pen=pg.mkPen((120, 180, 255), width=1))
-        _shade_invalid(self.plot_in, wl, valid)
+        _shade_masked(self.plot_in, wl, segs)
         self.plot_in.autoRange()
         self.plot_out.clear()
         self.plot_out.setLabel("left", "S")
         self.plot_out.plot(wl, res["S"], name="S (new optics)", connect="finite",
                            pen=pg.mkPen((255, 170, 60), width=2))
-        _shade_invalid(self.plot_out, wl, valid)
+        _shade_masked(self.plot_out, wl, segs)
         self.plot_out.autoRange()
-        self.lbl_result.setText(f"Valid range: {_fmt_range(*res['valid_range_nm'])}"
-                                f" · gain span {res['gain_span']:.1f}×")
+        self.lbl_result.setText(self._result_text(res, dw.plausibility))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1648,7 +1840,7 @@ class _SpectralWizardTab(QWidget):
 # ══════════════════════════════════════════════════════════════════════════
 
 class _ProfilesTab(QWidget):
-    COLS = ["Profile", "Status", "Valid range", "Unit"]
+    COLS = ["Profile", "Status", "Valid range", "Unit", "Created"]
 
     def __init__(self, dlg):
         super().__init__()
@@ -1656,7 +1848,7 @@ class _ProfilesTab(QWidget):
         self.dlg = dlg
         v = QVBoxLayout(self)
         top = QHBoxLayout()
-        self.lbl_dev = QLabel("")
+        self.lbl_dev = ElidedLabel("")
         top.addWidget(self.lbl_dev, 1)
         self.chk_all = QCheckBox("All versions")
         self.chk_all.toggled.connect(lambda _=None: self.refresh())
@@ -1664,11 +1856,11 @@ class _ProfilesTab(QWidget):
         v.addLayout(top)
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        dlg._style_cal_table(self.table)
+        gtab.configure_readonly_table(self.table, stretch_col=0,
+                                      sort_col=self.COLS.index("Created"),
+                                      sort_order=Qt.SortOrder.DescendingOrder,
+                                      min_stretch_px=220)
+        self.table.setMinimumHeight(140)
         v.addWidget(self.table, 1)
         row = QHBoxLayout()
         for text, fn in (("Activate", self.activate), ("Export…", self.export),
@@ -1679,8 +1871,7 @@ class _ProfilesTab(QWidget):
             row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
-        self.lbl_status = QLabel("")
-        self.lbl_status.setWordWrap(True)
+        self.lbl_status = ElidedLabel("", mode=Qt.TextElideMode.ElideMiddle)
         v.addWidget(self.lbl_status)
         self.refresh()
 
@@ -1696,23 +1887,28 @@ class _ProfilesTab(QWidget):
         profs = calprof.profiles_for_device(name, serial, fp, nl_active=nl,
                                             include_old=self.chk_all.isChecked())
         active = calprof.active_selection(name)
-        self.table.setRowCount(len(profs))
-        for r, p in enumerate(profs):
+        rows = []
+        for p in profs:
             st = calprof.profile_status(p, name, serial, fp, nl)
             label = calprof.profile_label(p) + ("  [active]" if p.get("id") == active else "")
+            segs = p.get("valid_segments_nm")
             vr = p.get("valid_range_nm") or (None, None)
-            vals = [label, st["state"], _fmt_range(*vr), str(p.get("unit", ""))]
-            for c, t in enumerate(vals):
-                it = QTableWidgetItem(t)
-                it.setToolTip(st["message"] or t)
-                if c == 0:
-                    it.setData(Qt.ItemDataRole.UserRole, p["id"])
-                self.table.setItem(r, c, it)
+            rng = calprof.format_segments(segs, 2) if segs else _fmt_range(*vr)
+            created = str(p.get("created", ""))
+            state = st["state"] + (" · not plausible" if calprof.is_implausible(p) else "")
+            cells = [label, state, rng, str(p.get("unit", "")),
+                     created[:16].replace("T", " ")]
+            tip = "\n".join(x for x in (label, st["message"],
+                                          f"Valid: {calprof.format_segments(segs, 20)}"
+                                          if segs else "") if x)
+            rows.append({"cells": cells,
+                         "sort": [label.lower(), state, (vr[0] or 0.0), cells[3], created],
+                         "tooltip": tip,
+                         "data": {0: {Qt.ItemDataRole.UserRole: p["id"]}}})
+        gtab.fill_table(self.table, rows)
 
     def selected_id(self):
-        r = self.table.currentRow()
-        it = self.table.item(r, 0) if r >= 0 else None
-        return it.data(Qt.ItemDataRole.UserRole) if it else None
+        return gtab.selected_row_data(self.table)
 
     def _need_selection(self):
         pid = self.selected_id()
@@ -1731,6 +1927,13 @@ class _ProfilesTab(QWidget):
         fp = _backend_fp(be)
         nl = calprof.device_nl_active(be)
         st = calprof.profile_status(p, name, serial, fp, nl)
+        if calprof.is_implausible(p):
+            fails = (p.get("plausibility") or {}).get("failures") or []
+            if not _ask(self, "Profile not plausible",
+                        "This profile failed the plausibility check:\n"
+                        + "\n".join(f"• {f}" for f in fails)
+                        + "\n\nActivate it anyway?"):
+                return
         if st["state"] in calprof.CONFIRM_STATES:
             if not _ask(self, "Calibration conditions changed",
                         st["message"].split(" (Applying")[0]
@@ -1861,13 +2064,13 @@ class _LampsTab(QWidget):
         v = QVBoxLayout(self)
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setMaximumHeight(180)
+        # Library order (built-in sources first); no click-sorting so the
+        # built-ins stay on top.
+        gtab.configure_readonly_table(self.table, stretch_col=0, sort_col=None,
+                                      min_stretch_px=200)
+        self.table.setMinimumHeight(110)
+        self.table.setMaximumHeight(200)
         self.table.itemSelectionChanged.connect(self._plot_selected)
-        dlg._style_cal_table(self.table)
         v.addWidget(self.table)
         row = QHBoxLayout()
         b = QPushButton("Import…"); b.clicked.connect(lambda _=False: self.import_clicked())
@@ -1882,8 +2085,7 @@ class _LampsTab(QWidget):
         self.plot.setMinimumHeight(160)
         dlg._style_cal_plot(self.plot)
         v.addWidget(self.plot, 1)
-        self.lbl_status = QLabel("")
-        self.lbl_status.setWordWrap(True)
+        self.lbl_status = ElidedLabel("", mode=Qt.TextElideMode.ElideMiddle)
         v.addWidget(self.lbl_status)
         self.refresh()
 
@@ -1893,23 +2095,20 @@ class _LampsTab(QWidget):
         except Exception as e:                                # noqa: BLE001
             srcs = []
             self.lbl_status.setText(f"Library unreadable: {e}")
-        self.table.setRowCount(len(srcs))
-        for r, s in enumerate(srcs):
-            vals = [s.name, s.serial, s.unit, _fmt_range(s.valid_min_nm, s.valid_max_nm),
-                    s.input_optic or "—", "yes" if s.builtin else ""]
-            for c, t in enumerate(vals):
-                it = QTableWidgetItem(t)
-                if c == 0:
-                    it.setData(Qt.ItemDataRole.UserRole, s.id)
-                    it.setData(Qt.ItemDataRole.UserRole + 1, bool(s.builtin))
-                self.table.setItem(r, c, it)
+        rows = []
+        for s in srcs:
+            cells = [s.name, s.serial, s.unit, _fmt_range(s.valid_min_nm, s.valid_max_nm),
+                     s.input_optic or "—", "yes" if s.builtin else ""]
+            rows.append({"cells": cells,
+                         "data": {0: {Qt.ItemDataRole.UserRole: s.id,
+                                      Qt.ItemDataRole.UserRole + 1: bool(s.builtin)}}})
+        gtab.fill_table(self.table, rows)
 
     def selected(self):
-        r = self.table.currentRow()
-        it = self.table.item(r, 0) if r >= 0 else None
-        if it is None:
+        sid = gtab.selected_row_data(self.table)
+        if sid is None:
             return None, False
-        return it.data(Qt.ItemDataRole.UserRole), bool(it.data(Qt.ItemDataRole.UserRole + 1))
+        return sid, bool(gtab.selected_row_data(self.table, Qt.ItemDataRole.UserRole + 1))
 
     def _plot_selected(self):
         sid, _b = self.selected()

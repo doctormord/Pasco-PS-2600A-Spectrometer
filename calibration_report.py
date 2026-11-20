@@ -64,6 +64,12 @@ def default_protocol_basename(record: dict) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", "_".join(parts))
 
 
+def _segments_text(segs) -> str:
+    if not segs:
+        return ""
+    return ", ".join(f"{float(a):.1f}-{float(b):.1f}" for a, b in segs)
+
+
 def _metadata(record: dict) -> list[tuple[str, str]]:
     r = record or {}
     acq, chk, ref = r.get("acquisition") or {}, r.get("checks") or {}, r.get("reference") or {}
@@ -107,7 +113,33 @@ def _metadata(record: dict) -> list[tuple[str, str]]:
         ("itime_threshold_pct", _num(chk.get("itime_threshold_pct"), "{:.3f}")),
         ("itime_pass", "skipped" if skipped else _yesno(chk.get("itime_pass"))),
         ("wl_fingerprint", r.get("wl_fingerprint") or ""),
+        ("valid_segments_nm", _segments_text(r.get("valid_segments_nm"))),
     ]
+    pl = r.get("plausibility") or {}
+    if pl:
+        met, lim = pl.get("metrics") or {}, pl.get("limits") or {}
+        m += [
+            ("plausibility_pass", _yesno(pl.get("pass"))),
+            ("plausibility_override", _yesno(pl.get("override"), "no")),
+            ("coverage_pct", _num(None if met.get("coverage") is None
+                                  else 100 * float(met["coverage"]), "{:.1f}")),
+            ("min_coverage_pct", _num(None if lim.get("min_coverage") is None
+                                      else 100 * float(lim["min_coverage"]), "{:.1f}")),
+            ("max_gain_span", _num(lim.get("max_gain_span"), "{:.4g}")),
+            ("roughness_pct", _num(None if met.get("roughness") is None
+                                   else 100 * float(met["roughness"]), "{:.2f}")),
+            ("max_roughness_pct", _num(None if lim.get("max_roughness") is None
+                                       else 100 * float(lim["max_roughness"]), "{:.2f}")),
+            ("isolated_pct", _num(None if met.get("isolated_frac") is None
+                                  else 100 * float(met["isolated_frac"]), "{:.1f}")),
+            ("max_isolated_pct", _num(None if lim.get("max_isolated_frac") is None
+                                      else 100 * float(lim["max_isolated_frac"]), "{:.1f}")),
+            ("largest_segment_pct", _num(None if met.get("largest_segment_frac") is None
+                                         else 100 * float(met["largest_segment_frac"]), "{:.1f}")),
+            ("max_gap_nm", _num(lim.get("max_gap_nm"), "{:.3g}")),
+        ]
+        for i, f in enumerate(pl.get("failures") or [], 1):
+            m.append((f"plausibility_failure_{i}", str(f)))
     for i, w in enumerate(r.get("warnings") or [], 1):
         m.append((f"warning_{i}", str(w)))
     for i, p in enumerate(r.get("profiles") or [], 1):
@@ -181,7 +213,14 @@ def write_protocol_pdf(record: dict, path: str) -> str:
     unit = record.get("unit") or ""
     GREY, BLUE, ORANGE, RED = "#d9d9d9", "#1f5fa8", "#d9730d", "#b00020"
 
+    segs = record.get("valid_segments_nm") or []
+
     def shade(ax):
+        if n and segs:
+            ax.axvspan(np.nanmin(wl), np.nanmax(wl), color=GREY, alpha=0.6, lw=0)
+            for lo, hi in segs:
+                ax.axvspan(float(lo), float(hi), color="#eef6ee", alpha=1.0, lw=0)
+            return
         if n and vr and len(vr) == 2 and None not in vr:
             ax.axvspan(np.nanmin(wl), vr[0], color=GREY, alpha=0.6, lw=0)
             ax.axvspan(vr[1], np.nanmax(wl), color=GREY, alpha=0.6, lw=0)
@@ -249,7 +288,7 @@ def write_protocol_pdf(record: dict, path: str) -> str:
     a3.set_title("Result (valid pixels only)", fontsize=9, loc="left")
 
     # plot 3
-    a4 = axes([0.09, 0.215, 0.82, 0.14])
+    a4 = axes([0.09, 0.245, 0.82, 0.12])
     with np.errstate(divide="ignore", invalid="ignore"):
         r_rep, r_half = rep / C, half / C
     has_rep, has_half = np.isfinite(r_rep[valid]).any() if n else False, \
@@ -281,7 +320,21 @@ def write_protocol_pdf(record: dict, path: str) -> str:
             ["Integration time", _num(chk.get("itime_crosscheck_pct"), "{:.2f} %", "n/a"),
              _num(chk.get("itime_threshold_pct"), "{:.2f} %", "n/a"), "t/2 vs t",
              "skipped" if skipped else ("passed" if chk.get("itime_pass") else "FAILED")]]
-    at = fig.add_axes([0.06, 0.125, 0.88, 0.06])
+    pl = record.get("plausibility") or {}
+    if pl:
+        met, lim = pl.get("metrics") or {}, pl.get("limits") or {}
+        res_txt = "passed" if pl.get("pass") else (
+            "FAILED (saved on request)" if pl.get("override") else "FAILED")
+        rows.append(["Broadband / coverage",
+                     _num(None if met.get("coverage") is None else 100 * met["coverage"],
+                          "{:.0f} %", "n/a"),
+                     _num(None if lim.get("min_coverage") is None
+                          else 100 * lim["min_coverage"], ">= {:.0f} %", "n/a"),
+                     f"span {_num(met.get('gain_span'), '{:.1f}')}x "
+                     f"(<= {_num(lim.get('max_gain_span'), '{:.0f}')}x), "
+                     f"rough. {_num(None if met.get('roughness') is None else 100 * met['roughness'], '{:.1f}')} %",
+                     res_txt])
+    at = fig.add_axes([0.06, 0.125, 0.88, 0.02 + 0.02 * len(rows)])
     at.axis("off")
     tb = at.table(cellText=rows, colLabels=["Check", "Deviation", "Threshold", "Note", "Result"],
                   loc="upper center", cellLoc="left")

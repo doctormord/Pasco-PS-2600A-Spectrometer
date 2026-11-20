@@ -47,6 +47,23 @@ class WorkflowConfig:
     stability_delay_s: float = 5.0
     stability_threshold_pct: float = 1.0
     itime_threshold_pct: float = 2.0
+    # plausibility (broadband) limits — see calibration_profiles.broadband_check
+    min_coverage: float = 0.5
+    max_gain_span: float = 40.0
+    max_roughness: float = 0.05
+    max_isolated_frac: float = 0.2
+    min_segment_nm: float = 5.0
+    max_gap_nm: float = 2.0
+    min_largest_segment_frac: float = 0.5
+    roughness_px: int = 21
+
+    def plausibility_limits(self) -> "cp.PlausibilityLimits":
+        return cp.PlausibilityLimits(
+            min_coverage=self.min_coverage, max_gain_span=self.max_gain_span,
+            max_roughness=self.max_roughness, max_isolated_frac=self.max_isolated_frac,
+            min_segment_nm=self.min_segment_nm, max_gap_nm=self.max_gap_nm,
+            min_largest_segment_frac=self.min_largest_segment_frac,
+            roughness_px=self.roughness_px)
 
     @classmethod
     def from_config(cls) -> "WorkflowConfig":
@@ -54,7 +71,13 @@ class WorkflowConfig:
             from app_config import Config as C
         except Exception:
             return cls()
+        lim = cp.PlausibilityLimits.from_config()
         return cls(
+            min_coverage=lim.min_coverage, max_gain_span=lim.max_gain_span,
+            max_roughness=lim.max_roughness, max_isolated_frac=lim.max_isolated_frac,
+            min_segment_nm=lim.min_segment_nm, max_gap_nm=lim.max_gap_nm,
+            min_largest_segment_frac=lim.min_largest_segment_frac,
+            roughness_px=lim.roughness_px,
             n_frames=max(2, int(C.get("calibration_capture_frames", 16))),
             snr_k=float(C.get("calibration_snr_k", 10.0)),
             max_gain=float(C.get("calibration_max_gain", 50.0)),
@@ -65,6 +88,31 @@ class WorkflowConfig:
             stability_threshold_pct=float(C.get("calibration_stability_threshold_pct", 1.0)),
             itime_threshold_pct=float(C.get("calibration_itime_threshold_pct", 2.0)),
         )
+
+
+class PlausibilityError(RuntimeError):
+    """The result failed the broadband plausibility check; saving needs an
+    explicit override (save(allow_implausible=True))."""
+
+
+def _plausibility(result: dict, cfg: "WorkflowConfig", warnings: list) -> dict:
+    pl = cp.broadband_check(result, cfg.plausibility_limits())
+    result["segments_nm"] = pl["segments_nm"]
+    if not pl["pass"]:
+        msg = ("Plausibility check failed: " + "; ".join(pl["failures"])
+               + ". The calibration source must be smooth and broadband "
+                 "(no line lamp).")
+        if msg not in warnings:
+            warnings.append(msg)
+    return pl
+
+
+def _stored_plausibility(pl, override: bool):
+    if pl is None:
+        return None
+    return {"pass": bool(pl["pass"]), "override": bool(override and not pl["pass"]),
+            "failures": list(pl["failures"]), "metrics": dict(pl["metrics"]),
+            "limits": dict(pl["limits"])}
 
 
 def wavelength_check(backend, backend_name: str, optics_name: str = "",
@@ -136,6 +184,8 @@ class CalibrationWorkflow:
         self.checks: dict = {}
         self.warnings: list[str] = []
         self.saved: list[dict] = []
+        self.plausibility: dict | None = None
+        self.saved_with_override = False
         self.started = cc.now_iso()
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -282,13 +332,27 @@ class CalibrationWorkflow:
             snr_k=self.cfg.snr_k, max_gain=self.cfg.max_gain,
             smooth_px=self.cfg.smooth_px)
         self.result["C_cal"] = rate
+        self.plausibility = _plausibility(self.result, self.cfg, self.warnings)
+        self.checks["broadband_pass"] = self.plausibility["pass"]
         return self.result
 
-    def save(self) -> list[dict]:
-        """Step 8. New profile version(s). Absolute → also the derived relative."""
+    @property
+    def plausible(self) -> bool:
+        return bool(self.plausibility is None or self.plausibility["pass"])
+
+    def save(self, *, allow_implausible: bool = False) -> list[dict]:
+        """Step 8. New profile version(s). Absolute → also the derived relative.
+
+        A result that failed the plausibility check is only stored with
+        allow_implausible=True; the profile is then flagged (plausibility.pass
+        False, override True)."""
         if self.result is None:
             raise RuntimeError("compute first")
+        if not self.plausible and not allow_implausible:
+            raise PlausibilityError("; ".join(self.plausibility["failures"]))
         self._check_fp()
+        override = not self.plausible
+        stored_pl = _stored_plausibility(self.plausibility, override)
         ref = self.reference
         reference = {"name": ref.name, "serial": ref.serial, "unit": ref.unit,
                      "id": ref.id, "valid_range_nm": [ref.valid_min_nm, ref.valid_max_nm]}
@@ -302,13 +366,14 @@ class CalibrationWorkflow:
         checks = {"stability_pct": self.checks.get("stability_pct"),
                   "itime_crosscheck_pct": self.checks.get("itime_crosscheck_pct"),
                   "stability_pass": self.checks.get("stability_pass"),
-                  "itime_pass": self.checks.get("itime_pass")}
+                  "itime_pass": self.checks.get("itime_pass"),
+                  "broadband_pass": self.checks.get("broadband_pass")}
         serial = getattr(self.backend, "serial", None)
         fp = self.wl_check["fingerprint"] if self.wl_check else self.backend.wl_fingerprint()
         p = cp.new_profile(kind=self.kind, backend=self.backend_name, serial=serial,
                            optics=self.optics, reference=reference, wl_fingerprint=fp,
                            result=self.result, acquisition=acq, checks=checks,
-                           ref_unit=ref.unit)
+                           ref_unit=ref.unit, plausibility=stored_pl)
         saved = [cp.add_profile(p)]
         if self.kind == cp.TYPE_ABSOLUTE:
             S, valid = cp.relative_from_absolute(self.result["K"], self.result["valid"])
@@ -316,10 +381,12 @@ class CalibrationWorkflow:
             q = cp.new_profile(kind=cp.TYPE_RELATIVE, backend=self.backend_name,
                                serial=serial, optics=self.optics, reference=reference,
                                wl_fingerprint=fp, result=rel, acquisition=acq,
-                               checks=checks, ref_unit=ref.unit)
+                               checks=checks, ref_unit=ref.unit,
+                               plausibility=stored_pl)
             q["derived_from"] = {"id": saved[0]["id"], "how": "relative_from_absolute"}
             saved.append(cp.add_profile(q))
         self.saved = saved
+        self.saved_with_override = override
         return saved
 
     def run_all(self, *, integration_us: int | None = None, sleep=time.sleep,
@@ -381,6 +448,9 @@ class CalibrationWorkflow:
                             "full_scale": None if self.light is None else self.light.full_scale},
             "settings": asdict(self.cfg),
             "valid_range_nm": res.get("valid_range_nm"),
+            "valid_segments_nm": res.get("segments_nm"),
+            "plausibility": _stored_plausibility(self.plausibility,
+                                                 self.saved_with_override),
             "gain_span": res.get("gain_span"),
             "n_valid": res.get("n_valid"),
             "unit": (cp.UNIT_RELATIVE if self.kind == cp.TYPE_RELATIVE
@@ -434,6 +504,11 @@ class DerivationWorkflow:
         self.result = None
         self.saved: list[dict] = []
         self.warnings: list[str] = []
+        self.plausibility: dict | None = None
+
+    @property
+    def plausible(self) -> bool:
+        return bool(self.plausibility is None or self.plausibility["pass"])
 
     def set_integration(self, integration_us: int | None = None) -> int:
         if integration_us is None:
@@ -505,9 +580,14 @@ class DerivationWorkflow:
             max_gain=self.cfg.max_gain, smooth_px=self.cfg.smooth_px)
         self.result["C_known"] = self.rate_known.rate
         self.result["C_new"] = self.rate_new.rate
+        self.plausibility = _plausibility(self.result, self.cfg, self.warnings)
         return self.result
 
-    def save(self) -> dict:
+    def save(self, *, allow_implausible: bool = False) -> dict:
+        if self.result is None:
+            raise RuntimeError("compute first")
+        if not self.plausible and not allow_implausible:
+            raise PlausibilityError("; ".join(self.plausibility["failures"]))
         k = self.known
         acq = {"integration_us": int(self.integration_us),
                "averages": int(self.cfg.n_frames),
@@ -516,7 +596,10 @@ class DerivationWorkflow:
                            serial=getattr(self.backend, "serial", None),
                            optics=self.optics, reference=dict(k.get("reference") or {}),
                            wl_fingerprint=self.backend.wl_fingerprint(),
-                           result=self.result, acquisition=acq, checks={})
+                           result=self.result, acquisition=acq,
+                           checks={"broadband_pass": self.plausible},
+                           plausibility=_stored_plausibility(
+                               self.plausibility, not self.plausible))
         p["derived_from"] = {"id": k["id"], "how": "ratio C_new/C_known",
                              "known_optics": (k.get("optics") or {}).get("name")}
         saved = cp.add_profile(p)
