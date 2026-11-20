@@ -68,6 +68,56 @@ def set_active_palette(palette):
 
 
 # ════════════════════════════════════════════════════════════
+# Small vector icons for the stylesheet (check mark, arrows)
+# ════════════════════════════════════════════════════════════
+# Qt stylesheets cannot draw a check mark or a clean triangle themselves (the
+# CSS border trick renders as a bar), and an `image:` needs a file. The icons
+# are tiny SVGs written once per colour into a per-user cache folder.
+_ICON_SVG = {
+    "check": ('<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+              'viewBox="0 0 14 14"><path d="M3 7.4 L5.8 10.1 L11 4.1" fill="none" '
+              'stroke="{c}" stroke-width="2" stroke-linecap="round" '
+              'stroke-linejoin="round"/></svg>'),
+    "dot": ('<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" '
+            'viewBox="0 0 14 14"><circle cx="7" cy="7" r="3.2" fill="{c}"/></svg>'),
+    "down": ('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" '
+             'viewBox="0 0 10 6"><path d="M1 1 L5 5 L9 1" fill="none" stroke="{c}" '
+             'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+    "up": ('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" '
+           'viewBox="0 0 10 6"><path d="M1 5 L5 1 L9 5" fill="none" stroke="{c}" '
+           'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>'),
+}
+
+
+def _icon_dir() -> str:
+    import os
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "ps2600a-theme-icons")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def theme_icon(name: str, color: str) -> str:
+    """Path (forward slashes, for QSS url()) of a cached SVG icon in `color`.
+    Returns "" if the cache folder is not writable (the rule then shows no
+    icon instead of failing)."""
+    import os
+    try:
+        fn = os.path.join(_icon_dir(), f"{name}_{color.lstrip('#')}.svg")
+        if not os.path.exists(fn):
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(_ICON_SVG[name].format(c=color))
+        return fn.replace("\\", "/")
+    except OSError:
+        return ""
+
+
+def _url(name: str, color: str) -> str:
+    path = theme_icon(name, color)
+    return f'url("{path}")' if path else "none"
+
+
+# ════════════════════════════════════════════════════════════
 # Stylesheet generator (palette → QSS string)
 # ════════════════════════════════════════════════════════════
 def build_stylesheet(p) -> str:
@@ -318,18 +368,16 @@ QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
 QAbstractSpinBox::up-button:hover,
 QAbstractSpinBox::down-button:hover {{ background: {p.BG3}; }}
 QAbstractSpinBox::up-arrow {{
-    image: none;
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-bottom: 4px solid {p.FG3};
-    width: 0; height: 0;
+    image: {_url("up", p.FG2)}; width: 8px; height: 5px; border: none;
 }}
 QAbstractSpinBox::down-arrow {{
-    image: none;
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-top: 4px solid {p.FG3};
-    width: 0; height: 0;
+    image: {_url("down", p.FG2)}; width: 8px; height: 5px; border: none;
+}}
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::up-arrow:off {{
+    image: {_url("up", p.FG4)};
+}}
+QAbstractSpinBox::down-arrow:disabled, QAbstractSpinBox::down-arrow:off {{
+    image: {_url("down", p.FG4)};
 }}
 
 QComboBox {{
@@ -346,12 +394,10 @@ QComboBox:hover    {{ border-color: {p.BORDER2}; }}
 QComboBox:disabled {{ color: {p.FG4}; }}
 QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox::down-arrow {{
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid {p.FG3};
+    image: {_url("down", p.FG2)}; width: 10px; height: 6px; border: none;
     margin-right: 4px;
 }}
+QComboBox::down-arrow:disabled {{ image: {_url("down", p.FG4)}; }}
 QComboBox QAbstractItemView {{
     background: {p.BG2};
     border: 1px solid {p.BORDER2};
@@ -519,17 +565,28 @@ QCheckBox::indicator, QRadioButton::indicator {{
 QCheckBox::indicator {{ border-radius: 3px; }}
 QRadioButton::indicator {{ border-radius: 8px; }}
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: {p.ACCENT}; }}
-QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+QCheckBox::indicator:checked {{
     background: {p.ACCENT};
     border: 1px solid {p.ACCENT};
+    image: {_url("check", p.ACCENT_BTN_FG)};
+}}
+QRadioButton::indicator:checked {{
+    background: {p.BG2};
+    border: 1px solid {p.ACCENT};
+    image: {_url("dot", p.ACCENT)};
 }}
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
     background: {p.BG1};
     border: 1px solid {p.BORDER1};
 }}
-QCheckBox::indicator:checked:disabled, QRadioButton::indicator:checked:disabled {{
+QCheckBox::indicator:checked:disabled {{
     background: {p.FG4};
     border: 1px solid {p.FG4};
+    image: {_url("check", p.BG1)};
+}}
+QRadioButton::indicator:checked:disabled {{
+    border: 1px solid {p.FG4};
+    image: {_url("dot", p.FG4)};
 }}
 
 /* -- Menus -- */

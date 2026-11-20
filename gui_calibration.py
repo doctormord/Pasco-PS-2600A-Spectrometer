@@ -183,7 +183,7 @@ class CalibrationDialog(QDialog):
                             (self.tab_profiles, "Profiles"),
                             (self.tab_lamps, "Lamps"),
                             (self._build_response_tab(), "Response (legacy)")):
-            sa = scroll_page(page)
+            sa = page if getattr(page, "SELF_SCROLLING", False) else scroll_page(page)
             self._pages[id(sa)] = page
             self.tabs.addTab(sa, title)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -291,6 +291,7 @@ class CalibrationDialog(QDialog):
             ax = plot.getAxis(axis)
             ax.setPen(pg.mkPen(_T().BORDER2, width=1))
             ax.setTextPen(pg.mkPen(_T().FG3))
+            ax.enableAutoSIPrefix(False)      # always "nm", never "knm" / "Mnm"
         plot.showGrid(x=True, y=True, alpha=0.12)
         wl = getattr(self.dash, "active_wavelengths", None)
         if wl is not None and len(wl) > 1:
@@ -1050,30 +1051,35 @@ class _SpectralWizardTab(QWidget):
         self.refresh()
 
     # ── UI ───────────────────────────────────────────────────────────────
-    def _build(self):
-        v = QVBoxLayout(self)
-        intro = QLabel(
-            "Fixed sequence for every device. A protocol (PDF/CSV) is written for "
-            "every completed computation.")
-        intro.setWordWrap(True)
-        v.addWidget(intro)
+    # The wizard manages its own scrolling: the body scrolls, the footer with
+    # status, protocol and Start / Cancel is always visible.
+    SELF_SCROLLING = True
 
-        # Left column: selection + settings + step list; right: plots. The
-        # splitter keeps both user-resizable; nothing here can widen the window.
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        body = QWidget()
+        body.setObjectName("calTabPage")
+        v = QVBoxLayout(body)
+        v.setContentsMargins(8, 8, 8, 4)
+
+        # Left: selection, acquisition settings and step list (one column);
+        # right: plots + result. User-resizable, never widens the window.
         self.split = QSplitter(Qt.Orientation.Horizontal)
         self.split.setChildrenCollapsible(False)
         left = QWidget()
         lv = QVBoxLayout(left)
-        lv.setContentsMargins(0, 0, 4, 0)
+        lv.setContentsMargins(0, 0, 6, 0)
+        lv.setSpacing(6)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Mode:"))
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(["Calibrate against a reference lamp",
                                 "Derive from other optics"])
+        self.cmb_mode.setToolTip("Calibration mode")
         self.cmb_mode.currentIndexChanged.connect(self._mode_changed)
-        top.addWidget(self.cmb_mode, 1)
-        lv.addLayout(top)
+        lv.addWidget(self.cmb_mode)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_lamp_form())
@@ -1081,9 +1087,12 @@ class _SpectralWizardTab(QWidget):
         lv.addWidget(self.stack)
 
         g = QGridLayout()
-        g.addWidget(QLabel("Integration time:"), 0, 0)
+        g.setHorizontalSpacing(6)
+        g.addWidget(QLabel("Integration:"), 0, 0)
         self.cmb_itime = QComboBox()
-        self.cmb_itime.addItems(["Auto (target level)", "Fixed"])
+        self.cmb_itime.addItems(["Auto", "Fixed"])
+        self.cmb_itime.setToolTip("Auto: exposure to the target level (70–85 % of "
+                                  "full scale). Fixed: the value on the right.")
         self.cmb_itime.currentIndexChanged.connect(self._itime_mode_changed)
         g.addWidget(self.cmb_itime, 0, 1)
         self.spn_ms = QDoubleSpinBox()
@@ -1091,15 +1100,15 @@ class _SpectralWizardTab(QWidget):
         self.spn_ms.setValue(100.0); self.spn_ms.setSuffix(" ms")
         self.spn_ms.setEnabled(False)
         g.addWidget(self.spn_ms, 0, 2)
-        g.addWidget(QLabel("Frames per capture:"), 1, 0)
+        g.addWidget(QLabel("Frames:"), 1, 0)
         self.spn_frames = QSpinBox(); self.spn_frames.setRange(2, 1000)
+        self.spn_frames.setToolTip("Frames averaged per capture")
         self.spn_frames.setValue(cw.WorkflowConfig.from_config().n_frames)
         g.addWidget(self.spn_frames, 1, 1)
         self.lbl_itime = ElidedLabel("")
         g.addWidget(self.lbl_itime, 1, 2)
         g.setColumnStretch(2, 1)
         lv.addLayout(g)
-        lv.addStretch(1)
 
         self.lst_steps = QListWidget()
         self.lst_steps.setObjectName("calStepList")
@@ -1110,11 +1119,15 @@ class _SpectralWizardTab(QWidget):
         self.lst_steps.setUniformItemSizes(False)
         self.lst_steps.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.lst_steps.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.lst_steps.setMinimumHeight(110)
-        self.lst_steps.setMinimumWidth(170)
+        self.lst_steps.setMinimumHeight(100)
+        lv.addWidget(self.lst_steps, 1)
         left.setMinimumWidth(300)
         self.split.addWidget(left)
-        self.split.addWidget(self.lst_steps)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(6, 0, 0, 0)
+        rv.setSpacing(6)
         plots = QSplitter(Qt.Orientation.Vertical)
         plots.setChildrenCollapsible(False)
         self.plot_in = pg.PlotWidget()
@@ -1129,87 +1142,133 @@ class _SpectralWizardTab(QWidget):
         self.plot_out.addLegend()
         self.plot_out.setMinimumHeight(90)
         self.dlg._style_cal_plot(self.plot_out)
+        self._reset_plots()
         plots.addWidget(self.plot_in)
         plots.addWidget(self.plot_out)
-        self.split.addWidget(plots)
+        rv.addWidget(plots, 1)
+        # Fixed-height result pane — no layout jumps.
+        self.lbl_result = FixedTextPane(4)
+        rv.addWidget(self.lbl_result)
+        self.split.addWidget(right)
         self.split.setStretchFactor(0, 0)
-        self.split.setStretchFactor(1, 0)
-        self.split.setStretchFactor(2, 1)
-        self.split.setSizes([380, 240, 600])
+        self.split.setStretchFactor(1, 1)
+        self.split.setSizes([380, 800])
         v.addWidget(self.split, 1)
 
-        # Fixed-height result / status / protocol area — no layout jumps.
-        self.lbl_result = FixedTextPane(3)
-        v.addWidget(self.lbl_result)
+        self.body_scroll = scroll_page(body)
+        outer.addWidget(self.body_scroll, 1)
+
+        # Footer: always visible.
+        foot = QWidget()
+        foot.setObjectName("calTabPage")
+        fh = QHBoxLayout(foot)
+        fh.setContentsMargins(8, 4, 8, 6)
+        info = QVBoxLayout()
+        info.setSpacing(2)
         self.lbl_status = ElidedLabel("Ready.")
-        v.addWidget(self.lbl_status)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Protocol:"))
+        info.addWidget(self.lbl_status)
+        prow = QHBoxLayout()
+        prow.setSpacing(6)
+        prow.addWidget(QLabel("Protocol:"))
         self.lbl_protocol = ElidedLabel("—", mode=Qt.TextElideMode.ElideMiddle)
-        row.addWidget(self.lbl_protocol, 1)
+        prow.addWidget(self.lbl_protocol, 1)
+        info.addLayout(prow)
+        fh.addLayout(info, 1)
         self.btn_open_folder = QPushButton("Open folder")
         self.btn_open_folder.setEnabled(False)
         self.btn_open_folder.clicked.connect(self._open_protocol_folder)
-        row.addWidget(self.btn_open_folder)
-        row.addSpacing(16)
+        fh.addWidget(self.btn_open_folder)
+        fh.addSpacing(12)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.setToolTip("Stops after the running step.")
         self.btn_cancel.clicked.connect(self._cancel_clicked)
         self.btn_start = QPushButton("Start")
+        self.btn_start.setObjectName("primaryBtn")
+        self.btn_start.setToolTip("Runs the fixed sequence. A protocol (PDF/CSV) is "
+                                  "written for every completed computation.")
         self.btn_start.clicked.connect(self.start)
-        row.addWidget(self.btn_cancel)
-        row.addWidget(self.btn_start)
-        v.addLayout(row)
+        fh.addWidget(self.btn_cancel)
+        fh.addWidget(self.btn_start)
+        outer.addWidget(foot)
         self._set_steps(_LAMP_STEPS)
 
-    def _build_lamp_form(self) -> QWidget:
-        w = QWidget(); f = QFormLayout(w); f.setContentsMargins(0, 0, 0, 0)
+    def _reset_plots(self):
+        """Empty plots with the device's wavelength span and a 0..1 y range
+        (no stale autorange from a previous run)."""
+        wl = getattr(self.dlg.dash, "active_wavelengths", None)
+        lo, hi = ((float(wl[0]), float(wl[-1])) if wl is not None and len(wl) > 1
+                  else (300.0, 1050.0))
+        for p in (self.plot_in, self.plot_out):
+            p.clear()
+            p.setXRange(lo, hi, padding=0.02)
+            p.setYRange(0.0, 1.0, padding=0.05)
+
+    @staticmethod
+    def _form() -> tuple[QWidget, QFormLayout]:
+        w = QWidget()
+        f = QFormLayout(w)
+        f.setContentsMargins(0, 0, 0, 0)
+        f.setHorizontalSpacing(8)
+        f.setVerticalSpacing(6)
         f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        f.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        return w, f
+
+    @staticmethod
+    def _narrow_combo(cmb: QComboBox, chars: int = 12) -> QComboBox:
+        cmb.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        cmb.setMinimumContentsLength(chars)
+        return cmb
+
+    def _build_lamp_form(self) -> QWidget:
+        w, f = self._form()
         self.lbl_device = ElidedLabel("")
         f.addRow("Device:", self.lbl_device)
-        self.cmb_optics = QComboBox(); self.cmb_optics.setEditable(True)
+        self.cmb_optics = self._narrow_combo(QComboBox())
+        self.cmb_optics.setEditable(True)
         self.cmb_optics.lineEdit().setPlaceholderText("Optics configuration name")
+        self.cmb_optics.setToolTip("Optics configuration (name of the profile series)")
         self.cmb_optics.activated.connect(self._optics_picked)
-        f.addRow("Optics configuration:", self.cmb_optics)
+        f.addRow("Optics:", self.cmb_optics)
         self.edit_notes = QLineEdit(); self.edit_notes.setPlaceholderText("Notes")
         f.addRow("Notes:", self.edit_notes)
         self.cmb_input = QComboBox(); self.cmb_input.addItems(list(calprof.INPUT_OPTICS))
+        self.cmb_input.setToolTip("Input optic: cosine corrector, bare fibre or sphere")
         self.cmb_input.currentIndexChanged.connect(self._input_changed)
-        f.addRow("Input optic:", self.cmb_input)
-        self.cmb_ref = QComboBox()
-        self.cmb_ref.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.cmb_ref.setMinimumContentsLength(20)
-        self.cmb_ref.currentIndexChanged.connect(self._ref_changed)
-        f.addRow("Reference source:", self.cmb_ref)
-        # Space for the source notes is reserved permanently (3 lines), so
-        # showing / hiding a warning never moves the rest of the dialog.
-        self.lbl_ref_info = FixedTextPane(3)
-        f.addRow("", self.lbl_ref_info)
         self.cmb_type = QComboBox()
         self.cmb_type.addItems([calprof.TYPE_RELATIVE, calprof.TYPE_ABSOLUTE])
-        f.addRow("Type:", self.cmb_type)
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(self.cmb_input, 1)
+        row.addWidget(QLabel("Type:"))
+        row.addWidget(self.cmb_type, 1)
+        f.addRow("Input:", row)
+        self.cmb_ref = self._narrow_combo(QComboBox())
+        self.cmb_ref.currentIndexChanged.connect(self._ref_changed)
+        f.addRow("Reference:", self.cmb_ref)
+        # Space for the source notes is reserved permanently, so showing /
+        # hiding a warning never moves the rest of the dialog. Full width.
+        self.lbl_ref_info = FixedTextPane(3)
+        f.addRow(self.lbl_ref_info)
         return w
 
     def _build_deriv_form(self) -> QWidget:
-        w = QWidget(); f = QFormLayout(w); f.setContentsMargins(0, 0, 0, 0)
-        hint = QLabel("Measures the same diffuse, extended source with the known "
-                      "and the new optics: S_new = S_known · C_new / C_known.")
+        w, f = self._form()
+        hint = QLabel("Same diffuse, extended source with the known and the new "
+                      "optics: S_new = S_known · C_new / C_known.")
         hint.setWordWrap(True)
         f.addRow(hint)
-        self.cmb_known = QComboBox()
-        self.cmb_known.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.cmb_known.setMinimumContentsLength(20)
-        f.addRow("Known profile:", self.cmb_known)
+        self.cmb_known = self._narrow_combo(QComboBox())
+        f.addRow("Known:", self.cmb_known)
         self.edit_new_name = QLineEdit()
         self.edit_new_name.setPlaceholderText("Name of the NEW optics configuration")
-        f.addRow("New optics name:", self.edit_new_name)
+        f.addRow("New optics:", self.edit_new_name)
         self.cmb_new_input = QComboBox()
         self.cmb_new_input.addItems(list(calprof.INPUT_OPTICS))
-        f.addRow("New input optic:", self.cmb_new_input)
+        f.addRow("Input:", self.cmb_new_input)
         self.edit_new_notes = QLineEdit()
+        self.edit_new_notes.setPlaceholderText("Notes")
         f.addRow("Notes:", self.edit_new_notes)
         return w
 
@@ -1462,7 +1521,7 @@ class _SpectralWizardTab(QWidget):
         self._set_steps(_LAMP_STEPS if self.cmb_mode.currentIndex() == 0 else _DERIV_STEPS)
         self.lbl_result.setText("")
         self.lbl_itime.setText("")
-        self.plot_in.clear(); self.plot_out.clear()
+        self._reset_plots()
         cfg = cw.WorkflowConfig.from_config()
         cfg.n_frames = int(self.spn_frames.value())
         us = (None if self.cmb_itime.currentIndex() == 0
