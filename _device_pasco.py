@@ -595,6 +595,7 @@ class PascoPS2600A(BaseSpectrometer):
     WL_MIN_NM             = float(PASCO_WAVELENGTH_ARRAY[0])
     WL_MAX_NM             = float(PASCO_WAVELENGTH_ARRAY[-1])
     SPEC_CONFIG_PREFIX    = "pasco"      # pasco_spec_min_nm / pasco_spec_max_nm
+    ADC_FULL_SCALE        = float(PASCO_ADC_MAX)
     SUPPORTS_OB           = True
     SUPPORTS_FAST_PREVIEW = True
     RESPONSE_TABLE        = PASCO_RESPONSE_TABLE   # Nx2 array; GUI builds gain from this
@@ -680,8 +681,38 @@ class PascoPS2600A(BaseSpectrometer):
         except Exception:
             return []
 
+    @property
+    def adc_saturation_level(self) -> float:
+        return float(PASCO_ADC_SATURATION)
+
+    @staticmethod
+    def _serial_from_device(device_id: str) -> str | None:
+        """USB iSerial of the opened unit, if the hardware exposes one.
+
+        Windows: the WinUSB interface path is
+            \\\\?\\usb#vid_0945&pid_xxxx#<instance>#{guid}
+        where <instance> IS the iSerial when the device reports one; without
+        an iSerial Windows uses a port-based id containing '&' (not a serial).
+        Other platforms: read serial_number from the libusb device."""
+        try:
+            if _IS_WINDOWS:
+                parts = str(device_id).split("#")
+                if len(parts) >= 3:
+                    inst = parts[2].strip()
+                    if inst and "&" not in inst:
+                        return inst.upper()
+                return None
+            import _usb_linux
+            dev = getattr(_usb_linux, "_device", None)
+            sn = getattr(dev, "serial_number", None) if dev is not None else None
+            return str(sn).strip() or None if sn else None
+        except Exception:
+            return None
+
     def connect(self, device_id: str) -> None:
         connect_usb_device(device_id)
+        # Serial for profile binding (None → profiles stay unbound, shown so).
+        self.serial = self._serial_from_device(device_id)
         # Apply a persisted wavelength calibration (from the wavelength wizard)
         # over the factory polynomial, if one is stored for this device.
         try:

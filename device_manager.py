@@ -57,6 +57,77 @@ class BaseSpectrometer(ABC):
     SPEC_MIN_NM_DEFAULT: float | None = None
     SPEC_MAX_NM_DEFAULT: float | None = None
 
+    # Raw ADC full scale of the detector (counts). Subclasses set the real value
+    # (4095 for 12-bit PASCO, 65535 for 16-bit devices). Used by the generic
+    # calibration capture for the per-pixel saturation check.
+    ADC_FULL_SCALE: float = 65535.0
+
+    @property
+    def adc_full_scale(self) -> float:
+        """Raw ADC full scale (counts) of the connected detector."""
+        return float(getattr(self, "_adc_full_scale", self.ADC_FULL_SCALE))
+
+    @property
+    def adc_saturation_level(self) -> float:
+        """Counts at/above which a pixel is treated as saturated (no longer
+        linear). Default 98 % of full scale; backends with a known practical
+        limit (configurable threshold, soft-saturation knee) override this."""
+        return 0.98 * self.adc_full_scale
+
+    def wl_fingerprint(self) -> str:
+        """Fingerprint of the CURRENT wavelength calibration (pixel -> nm).
+
+        Derived from the effective per-pixel axis, so any change of the
+        polynomial, offset, flip or source (factory vs. user) changes it.
+        Response/absolute profiles store it; a mismatch means the pixel widths
+        baked into S/K no longer match and the profile must be re-done."""
+        from calibration_utils import wavelength_fingerprint
+        return wavelength_fingerprint(self.wavelength_array)
+
+    @property
+    def nl_correction_active(self) -> bool | None:
+        """True/False if the backend applies a detector nonlinearity
+        correction before on_frame, None if the device has none / unknown.
+        Recorded in calibration profiles (acquisition.nl_correction)."""
+        return None
+
+    # Optional shutter / light-source control. Generic hook for the dark
+    # capture: backends that can block the light (or the virtual demo lamp)
+    # return True; everyone else returns False and the wizard asks the user.
+    SUPPORTS_SHUTTER: bool = False
+
+    def set_shutter(self, closed: bool) -> bool:
+        """Close/open the light path. Returns True if supported and applied."""
+        return False
+
+    # ── Frame taps (generic calibration capture) ─────────────────────────
+    # Drivers call self.on_frame(...). __init__ routes that through
+    # _dispatch_frame so any number of taps (e.g. a calibration accumulator)
+    # see EVERY raw (linearised) driver frame — before fusion, averaging,
+    # smoothing or response correction — without any driver changes.
+    def add_frame_tap(self, fn: Callable[..., None]) -> None:
+        with self._tap_lock:
+            if fn not in self._frame_taps:
+                self._frame_taps.append(fn)
+
+    def remove_frame_tap(self, fn: Callable[..., None]) -> None:
+        with self._tap_lock:
+            if fn in self._frame_taps:
+                self._frame_taps.remove(fn)
+
+    def _dispatch_frame(self, pixels, dark=0.0, integration_us=0,
+                        kind="standard", ratio=1.0) -> None:
+        with self._tap_lock:
+            taps = list(self._frame_taps)
+        for fn in taps:
+            try:
+                fn(pixels, dark, integration_us, kind, ratio)
+            except Exception as exc:          # a tap must never kill acquisition
+                print(f"[device] frame tap error: {exc}")
+        cb = self._user_on_frame
+        if cb is not None:
+            cb(pixels, dark, integration_us, kind, ratio)
+
     @property
     def spec_range_nm(self) -> tuple[float | None, float | None]:
         """(min_nm, max_nm) of the manufacturer-guaranteed range, each possibly
@@ -103,7 +174,11 @@ class BaseSpectrometer(ABC):
         # on_frame is called as:
         #   on_frame(pixels, dark, integration_us, kind="standard", ratio=1.0)
         # where kind is one of fusion.FRAME_STANDARD / FRAME_LONG / FRAME_SHORT.
-        self.on_frame           = on_frame
+        # The app callback is wrapped by _dispatch_frame (frame taps first).
+        self._user_on_frame     = on_frame
+        self._frame_taps: list[Callable[..., None]] = []
+        self._tap_lock          = threading.Lock()
+        self.on_frame           = self._dispatch_frame
         self.on_auto_exp        = on_auto_exp
         self.on_connection_lost = on_connection_lost
 

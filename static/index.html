@@ -315,6 +315,7 @@
           <select id="cfg-dark_mode">
             <option value="optical_black">Optical Black</option>
             <option value="parametric">Parametric</option>
+            <option value="stored">Stored dark (per pixel)</option>
           </select></div>
         <div class="row"><label>Bias <span>ADC</span></label>
           <input type="number" id="cfg-dark_bias_adc" step="0.01" value="61.57" /></div>
@@ -332,6 +333,34 @@
         <div class="row"><label>Response compensation</label>
           <span class="toggle" data-key="spectral_response_compensation"
                 title="Apply the device spectral-response correction curve (no-op for devices without a response table)."></span></div>
+      </details>
+
+      <details class="section" id="sec-calibration">
+        <summary>Calibration</summary>
+        <div class="row"><label>Display unit</label>
+          <select id="cfg-display_unit">
+            <option value="counts">counts</option>
+            <option value="counts_per_s">counts/s</option>
+          </select></div>
+        <div class="row"><label>Irradiance unit</label>
+          <select id="cfg-irradiance_unit">
+            <option value="uW/cm2/nm">µW/(cm²·nm)</option>
+            <option value="W/m2/nm">W/(m²·nm)</option>
+          </select></div>
+        <div class="row"><label>Response profile</label>
+          <select id="cal-select"></select></div>
+        <div class="row"><label>Older versions</label>
+          <input type="checkbox" id="cal-include-old" /></div>
+        <div id="cal-status" class="cal-status">—</div>
+        <div class="export-row">
+          <button id="cal-delete">Delete</button>
+          <button id="cal-export">Export</button>
+          <button id="cal-import">Import</button>
+        </div>
+        <input type="file" id="cal-import-file" accept=".json,application/json" hidden />
+        <div class="row"><label>Copy from other unit</label>
+          <select id="cal-other"></select></div>
+        <button id="cal-copy" class="full">Copy profile to this device</button>
       </details>
 
       <details class="section">

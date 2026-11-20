@@ -340,6 +340,12 @@ button.tool-toggle:hover { background: var(--bg-3); color: var(--fg-1); }
 }
 .section .row select { width: 160px; }
 
+/* Calibration status line */
+.cal-status { padding: 2px 14px 8px 14px; font-size: 11px; color: var(--fg-3); }
+.cal-status.ok { color: var(--ok); }
+.cal-status.warn, .cal-status.wl_changed, .cal-status.nl_changed { color: var(--warn); }
+.cal-status.error, .cal-status.missing, .cal-status.other_device { color: var(--danger); }
+
 /* Inline control group: a small action button sitting next to an input
    (exposure "20 ms" reset, Y-max "▲" snap), mirroring the desktop GUI. */
 .ctl-group { display: flex; align-items: center; gap: 6px; flex: none; }

@@ -66,6 +66,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Only genuinely new frames are counted, so this is sqrt(N) regardless of the
     # live frame rate.
     "calibration_capture_frames": 16,
+
+    # ── Spectral calibration v2 (relative / absolute, see docs/PLAN_...) ───
+    # Library of imported calibrated lamps (reference_sources.py).
+    "reference_sources_file": "reference_sources.json",
+    # Per-pixel dark spectra, per device (backend + serial) and integration
+    # time (calibration_capture.py). Used by the calibration wizard and by the
+    # "Stored dark" dark mode of the main pipeline.
+    "dark_spectra_file": "dark_spectra.json",
+    # SNR criterion for the valid range: C_cal > k * sigma_dark (per pixel).
+    "calibration_snr_k": 10.0,
+    # Pixels whose gain (1/S, peak-normalised) would exceed this are masked.
+    "calibration_max_gain": 50.0,
+    # Optional moving-average smoothing of S / K (pixels; 0/1 = off).
+    "calibration_smooth_px": 5,
+    # Auto-exposure target for the calibration capture (fraction of full scale).
+    "calibration_target_frac_lo": 0.70,
+    "calibration_target_frac_hi": 0.85,
+    # Automatic checks (wizard): two captures this many seconds apart, and a
+    # second capture at ~half t_int with its own dark.
+    "calibration_stability_delay_s": 5.0,
+    "calibration_stability_threshold_pct": 1.0,
+    "calibration_itime_threshold_pct": 2.0,
+    # Display unit of the main plot when NO v2 profile is active:
+    # "counts" (unchanged legacy behaviour) or "counts_per_s".
+    "display_unit": "counts",
+    # Irradiance unit for absolute profiles: "uW/cm2/nm" or "W/m2/nm".
+    "irradiance_unit": "uW/cm2/nm",
+    # {profile_id: wl_fingerprint} — profiles the user explicitly chose to apply
+    # although the wavelength calibration changed since they were made.
+    "calibration_fingerprint_overrides": {},
     # Persisted degree-3 wavelength polynomials from the wavelength wizard.
     # null = use the device's factory/default axis. Pixel -> lambda:
     #   lambda(i) = C0 + C1*i + C2*i**2 + C3*i**3.
@@ -143,6 +173,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "demo_soft_knee": 0.85,                  # soft-saturation knee (fraction of full scale; 1.0 = hard clip)
     "demo_read_noise": 12.0,                 # demo read-noise sigma (counts)
     "demo_shot_noise": 1.0,                  # demo shot-noise scale (×sqrt(signal))
+    "demo_serial": "DEMO-0001",              # virtual serial (change to emulate a 2nd unit)
+    "demo_sensitivity": "none",              # "none" (flat, unchanged) | "synthetic" (known S(λ) for calibration tests)
 
     # ── Filter tab ──
     "filter_baseline_frames": 16,            # frames averaged into the 100% reference on "Set baseline" (1 = single frame)

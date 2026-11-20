@@ -217,6 +217,42 @@ def build_response_gain(
     return np.minimum(1.0 / sensitivity, max_gain)
 
 
+DEMO_LAMP_TEMPERATURE_K = 3000.0
+DEMO_LAMP_VALUE_AT_560 = 10.0          # µW/(cm²·nm) at 560 nm
+
+
+def demo_lamp_irradiance(wl_nm) -> np.ndarray:
+    """Spectral irradiance of the synthetic demo calibration lamp in µW/(cm²·nm).
+
+    A 3000 K Planck shape scaled to 10 µW/(cm²·nm) at 560 nm. Shared by the demo
+    backend (what the virtual detector 'sees') and the built-in reference source
+    (what the lamp certificate says), so a calibration run on the demo backend
+    has a known ground truth."""
+    wl = np.asarray(wl_nm, dtype=float)
+
+    def planck(lnm):
+        l = lnm * 1e-9
+        h, c, k = 6.62607015e-34, 2.99792458e8, 1.380649e-23
+        return (1.0 / l ** 5) / np.expm1(h * c / (l * k * DEMO_LAMP_TEMPERATURE_K))
+
+    return DEMO_LAMP_VALUE_AT_560 * planck(wl) / planck(np.array(560.0))
+
+
+def wavelength_fingerprint(wl) -> str:
+    """Stable fingerprint of a per-pixel wavelength axis.
+
+    sha256 over the axis rounded to 1 pm (float64, little endian) plus the pixel
+    count; first 16 hex digits. Rounding absorbs float round-off between
+    equivalent evaluations of the same polynomial, while any real change of the
+    calibration (coefficients, offset, flip) changes the value."""
+    import hashlib
+    a = np.round(np.asarray(wl, dtype=float), 3).astype("<f8")
+    h = hashlib.sha256()
+    h.update(str(a.size).encode("ascii"))
+    h.update(a.tobytes())
+    return h.hexdigest()[:16]
+
+
 def axis_is_monotonic(wl, min_nm: float = 50.0, max_nm: float = 1400.0) -> bool:
     """True if `wl` is a strictly increasing, plausibly-ranged wavelength axis.
     A saved calibration polynomial can turn over at the array ends (a degree-3

@@ -171,6 +171,11 @@ class DashboardWindow(QMainWindow):
         # *measuring* the instrument response). Updated each frame.
         self._pixels_pre_response = np.zeros(self.active_pixel_count)
         self.hardware_thread = None
+        # Spectral calibration v2 — same runtime class + processing.pipeline_kwargs
+        # as the web server, so a profile is applied identically on both.
+        self.calib_runtime = calprof.CalibrationRuntime()
+        self._current_unit = "counts"
+        self._shown_unit = None
 
         # Spectrum fusion stage (long + short → adaptive temporal stream).
         # Sits between the driver's frame callback and process_new_spectrum.
@@ -520,9 +525,20 @@ class DashboardWindow(QMainWindow):
             _it.setZValue(-100)          # behind spectrum, fill, overlays
             _it.setVisible(False)
             self.plot_canvas.addItem(_it, ignoreBounds=True)
+        # Grey bands outside the valid range of the active calibration profile
+        # (pixels there are masked = NaN, plan §2.4).
+        _cal_brush = pg.mkBrush(128, 128, 128, 40)
+        self.calib_region_lo = pg.LinearRegionItem(
+            values=(-1e9, -1e9), movable=False, brush=_cal_brush, pen=pg.mkPen(None))
+        self.calib_region_hi = pg.LinearRegionItem(
+            values=(1e9, 1e9), movable=False, brush=_cal_brush, pen=pg.mkPen(None))
+        for _it in (self.calib_region_lo, self.calib_region_hi):
+            _it.setZValue(-99)
+            _it.setVisible(False)
+            self.plot_canvas.addItem(_it, ignoreBounds=True)
         # Keep the bands reaching the plot edges as the user zooms/pans.
         self.plot_canvas.getViewBox().sigXRangeChanged.connect(
-            lambda *a: self._update_spec_overlay())
+            lambda *a: (self._update_spec_overlay(), self._update_calib_overlay()))
 
         # ── Overlay cluster curves (CSV bg / freeze / diff / peak-hold /
         # persistence). All start hidden; driven per frame in _redraw_overlays().
@@ -1057,6 +1073,7 @@ class DashboardWindow(QMainWindow):
         self.combo_dark_mode = QComboBox()
         self.combo_dark_mode.addItem("Optical Black (live)", DARK_MODE_OPTICAL_BLACK)
         self.combo_dark_mode.addItem("Parametric (Bias+Rate)", DARK_MODE_PARAMETRIC)
+        self.combo_dark_mode.addItem("Stored dark (per pixel)", processing.DARK_MODE_STORED)
         self.combo_dark_mode.setFixedWidth(190)
         target_dm = Config.get("dark_mode", DARK_MODE_OPTICAL_BLACK)
         for i in range(self.combo_dark_mode.count()):
@@ -1100,8 +1117,14 @@ class DashboardWindow(QMainWindow):
         self.combo_response = QComboBox()
         self.combo_response.setObjectName("deviceSelect")
         self.combo_response.setFixedWidth(150)
-        self.combo_response.addItem(calprof.SEL_NONE)
-        self.combo_response.currentTextChanged.connect(self._on_response_selection)
+        self.combo_response.addItem(calprof.SEL_NONE, calprof.SEL_NONE)
+        self.combo_response.currentIndexChanged.connect(
+            lambda _i: self._on_response_selection(self.combo_response.currentData()))
+        # Status of the active calibration profile (name/type/version, warnings
+        # such as "wavelength changed – recalibrate").
+        self.label_calib_status = QLabel("")
+        self.label_calib_status.setWordWrap(True)
+        self.label_calib_status.setObjectName("calibStatus")
 
         # Delete the selected saved profile (parity with the web client's
         # "Manage profile" delete). Disabled for None / Device default.
@@ -1113,12 +1136,21 @@ class DashboardWindow(QMainWindow):
             "Delete the selected response-correction profile for this device.")
         self.button_response_delete.clicked.connect(self._on_response_delete)
 
+        # Per-pixel dark spectrum at the CURRENT integration time (for the
+        # "Stored dark" mode; the wizard stores darks at its own t_int and t/2).
+        self.button_capture_dark = QPushButton("Capture dark")
+        self.button_capture_dark.setToolTip(
+            "Capture and store a per-pixel dark spectrum for this device at the\n"
+            "current integration time (used by dark mode 'Stored dark').")
+        self.button_capture_dark.clicked.connect(self.capture_stored_dark)
+
         self.button_calibrate = QPushButton("Calibration…")
         self.button_calibrate.clicked.connect(self.open_calibration_dialog)
 
         _sec_processing = self._collapsible("Processing", [
             ("Dark correction",       None,  self.button_dark_correct),
             ("Dark mode",             None,  self.combo_dark_mode),
+            ("Stored dark",           None,  self.button_capture_dark),
             ("Bias offset",          "ADC",  self.spinbox_dark_bias),
             ("Rate",               "ADC/s",  self.spinbox_dark_rate),
             ("Hot-pixel filter",      None,  self.button_despeckle),
@@ -1126,6 +1158,7 @@ class DashboardWindow(QMainWindow):
             ("Spatial smoothing",     None,  self.button_spatial_smooth),
             ("Spatial width",         "px",  self.spinbox_spatial_width),
             ("Response correction",   None,  [self.combo_response, self.button_response_delete]),
+            ("Calibration status",    None,  self.label_calib_status),
             ("Calibrate device",      None,  self.button_calibrate),
         ])
 
@@ -1639,6 +1672,8 @@ class DashboardWindow(QMainWindow):
             self._deliberate_disconnect = True
             self.hardware_thread.disconnect()
             self.hardware_thread = None
+        self.calib_runtime = calprof.CalibrationRuntime()
+        self._update_calib_status()
         self._update_spec_overlay()
         self.button_connect.setText("Connect")
         self.button_connect.setObjectName("primaryBtn")
@@ -2117,25 +2152,134 @@ class DashboardWindow(QMainWindow):
         and restore its persisted selection (without re-triggering apply)."""
         dev = self.combo_backend.currentText()
         has_default = self._device_default_response_table() is not None
-        items = calprof.selection_items(dev, has_default)
+        bk = self.hardware_thread
+        serial = getattr(bk, "serial", None) if bk is not None else None
+        fp = None
+        if bk is not None:
+            try:
+                fp = bk.wl_fingerprint()
+            except Exception:
+                fp = None
+        nl = calprof.device_nl_active(bk)
+        items = calprof.selection_items(dev, has_default, serial, fp, nl_active=nl)
         sel = calprof.active_selection(dev)
+        if sel not in items and calprof.get_profile_by_id(sel) is not None:
+            items.append(sel)            # an explicitly chosen older version
         if sel not in items:
             sel = calprof.SEL_NONE
         self.combo_response.blockSignals(True)
         self.combo_response.clear()
-        self.combo_response.addItems(items)
-        self.combo_response.setCurrentText(sel)
+        for it in items:
+            label = calprof.selection_label(it)
+            p = calprof.get_profile_by_id(it)
+            if p is not None and bk is not None:
+                st = calprof.profile_status(p, dev, serial, fp, nl)
+                if st.get("wl_changed"):
+                    label += "  ⚠ λ changed"
+                if st.get("nl_changed"):
+                    label += "  ⚠ linearisation changed"
+            self.combo_response.addItem(label, it)
+            self.combo_response.setItemData(self.combo_response.count() - 1,
+                                            label, Qt.ItemDataRole.ToolTipRole)
+        idx = self.combo_response.findData(sel)
+        self.combo_response.setCurrentIndex(max(0, idx))
         self.combo_response.blockSignals(False)
         self._sync_response_delete_enabled()
 
     def _on_response_selection(self, selection: str) -> None:
-        """User picked a correction in the dropdown — persist + apply live."""
+        """User picked a correction in the dropdown — persist + apply live.
+        A profile whose wavelength fingerprint or detector-linearisation state
+        no longer matches is applied only after explicit confirmation."""
         if not selection:
             return
         dev = self.combo_backend.currentText()
+        p = calprof.get_profile_by_id(selection)
+        bk = self.hardware_thread
+        if p is not None and bk is not None:
+            fp = bk.wl_fingerprint()
+            nl = calprof.device_nl_active(bk)
+            st = calprof.profile_status(p, dev, getattr(bk, "serial", None), fp, nl)
+            if (st["state"] in calprof.CONFIRM_STATES
+                    and not calprof.fingerprint_override_ok(selection, fp, nl)):
+                why = []
+                if st.get("wl_changed"):
+                    why.append("• The wavelength calibration of this device changed "
+                               "since the profile was made, so the pixel widths in "
+                               "its S/K no longer match.")
+                if st.get("nl_changed"):
+                    why.append("• The detector linearisation was switched since the "
+                               "profile was made. S/K were measured at one signal "
+                               "level; without the same linearisation the results "
+                               "depend on the signal level.")
+                ans = QMessageBox.question(
+                    self, "Calibration conditions changed – recalibrate",
+                    "\n".join(why) + "\n\nRecalibrating is recommended.\n\n"
+                    "Apply it anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if ans == QMessageBox.StandardButton.Yes:
+                    calprof.confirm_fingerprint_override(selection, fp, nl)
         calprof.set_active_selection(dev, selection)
         self.apply_response_correction()
         self._sync_response_delete_enabled()
+
+    def capture_stored_dark(self) -> None:
+        """Capture a per-pixel dark at the current t_int in a worker thread
+        (generic calibration_capture path) and store it for this device."""
+        import threading
+        import calibration_capture as cc
+        bk = self.hardware_thread
+        if bk is None:
+            QMessageBox.warning(self, "Not connected", "Connect a device first.")
+            return
+        if not getattr(bk, "SUPPORTS_SHUTTER", False):
+            if QMessageBox.question(
+                    self, "Capture dark",
+                    "Block the light path / cover the input now, then press OK.",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+            ) != QMessageBox.StandardButton.Ok:
+                return
+        n = max(2, int(Config.get("calibration_capture_frames", 16)))
+        name = self.combo_backend.currentText()
+        box = {}
+
+        def work():
+            try:
+                box["dark"] = cc.capture_dark(bk, n, backend_name=name)
+            except Exception as e:          # reported in the GUI thread
+                box["error"] = e
+
+        self.button_capture_dark.setEnabled(False)
+        self.button_capture_dark.setText("Capturing…")
+        threading.Thread(target=work, daemon=True, name="dark-capture").start()
+        timer = QTimer(self)
+
+        def poll():
+            if not box:
+                return
+            timer.stop()
+            self.button_capture_dark.setEnabled(True)
+            self.button_capture_dark.setText("Capture dark")
+            if "error" in box:
+                QMessageBox.critical(self, "Dark capture failed", str(box["error"]))
+                return
+            d = box["dark"]
+            cc.save_dark(d)
+            self.calib_runtime.invalidate_darks()
+            msg = (f"Stored dark: {d.integration_us/1000:.3f} ms, {d.n_frames} frames, "
+                   f"mean {float(np.mean(d.mean)):.1f} counts.")
+            if not getattr(bk, "SUPPORTS_SHUTTER", False):
+                msg += "\n\nYou can uncover the input now."
+            QMessageBox.information(self, "Dark stored", msg)
+
+        timer.timeout.connect(poll)
+        timer.start(100)
+
+    def on_calibration_profiles_changed(self) -> None:
+        """Called by the calibration dialog after a profile was saved, imported,
+        deleted or copied."""
+        self._refresh_response_combo()
+        self.apply_response_correction()
 
     def _sync_response_delete_enabled(self) -> None:
         """Enable delete only for a real saved profile (not None / Device
@@ -2143,24 +2287,25 @@ class DashboardWindow(QMainWindow):
         if not hasattr(self, "button_response_delete"):
             return
         dev = self.combo_backend.currentText()
-        sel = self.combo_response.currentText()
+        sel = self.combo_response.currentData()
         self.button_response_delete.setEnabled(sel in calprof.list_profiles(dev))
 
     def _on_response_delete(self) -> None:
-        """Delete the selected saved response-correction profile for this device
-        (mirrors the web client). If the deleted profile was active, fall back to
-        None and rebuild the live gain."""
+        """Delete the selected saved response-correction profile (this version)
+        for this device (mirrors the web client). If the deleted profile was
+        active, fall back to None and rebuild the live gain."""
         dev = self.combo_backend.currentText()
-        name = self.combo_response.currentText()
+        name = self.combo_response.currentData()
         if name not in calprof.list_profiles(dev):
             return
         if QMessageBox.question(
                 self, "Delete profile",
-                f"Delete response-correction profile \u201c{name}\u201d for {dev}?",
+                f"Delete calibration profile \u201c{calprof.selection_label(name)}\u201d "
+                f"for {dev}?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
-        calprof.delete_profile(dev, name)
+        calprof.delete_profile_id(name)
         if calprof.active_selection(dev) == name:
             calprof.set_active_selection(dev, calprof.SEL_NONE)
         self._refresh_response_combo()   # repopulates + re-syncs delete-enable
@@ -2177,6 +2322,72 @@ class DashboardWindow(QMainWindow):
             device_default_table=self._device_default_response_table())
         self.active_response_gain = gain
         self.is_response_comp_enabled = (eff != calprof.SEL_NONE)
+        # v2 runtime: resolves serial binding / fingerprint / applier
+        bk = self.hardware_thread
+        if bk is not None:
+            self.calib_runtime.configure(dev, bk, self.active_wavelengths)
+        else:
+            self.calib_runtime = calprof.CalibrationRuntime()
+        self._update_calib_status()
+
+    def _update_calib_status(self) -> None:
+        """Status line + y-axis unit + greyed-out region outside the valid range."""
+        st = self.calib_runtime.status
+        if hasattr(self, "label_calib_status"):
+            if st.get("state") in (None, "none"):
+                txt = ""
+            else:
+                txt = st.get("label", "")
+                if st.get("valid_range_nm"):
+                    lo, hi = st["valid_range_nm"]
+                    txt += f"\nvalid {lo:.0f}–{hi:.0f} nm"
+                if st.get("message"):
+                    txt += f"\n{st['message']}"
+                if self.calib_runtime.active_v2 and st.get("dark_source"):
+                    txt += {"stored": "\ndark: stored (this t_int)",
+                            "stored_model": "\ndark: per-pixel model b+r·t"}.get(
+                                st["dark_source"], "")
+                if st.get("dark_warning"):
+                    txt += f"\n⚠ {st['dark_warning']}"
+            color = {"wl_changed": T().WARN, "nl_changed": T().WARN,
+                     "other_device": T().WARN,
+                     "missing": T().WARN, "error": T().WARN}.get(st.get("state"))
+            if st.get("dark_warning"):
+                color = T().WARN
+            self.label_calib_status.setStyleSheet(
+                f"color: {color}; font-size: 10px;" if color else "font-size: 10px;")
+            self.label_calib_status.setText(txt)
+        self._update_calib_overlay()
+
+    def _update_calib_overlay(self) -> None:
+        if not hasattr(self, "calib_region_lo"):
+            return
+        st = self.calib_runtime.status
+        vr = st.get("valid_range_nm") if self.calib_runtime.active_v2 else None
+        try:
+            (vx0, vx1), _ = self.plot_canvas.getViewBox().viewRange()
+        except Exception:
+            vx0, vx1 = 0.0, 2000.0
+        pad = max(vx1 - vx0, 1.0)
+        show = vr is not None
+        if show:
+            self.calib_region_lo.setRegion((vx0 - pad, float(vr[0])))
+            self.calib_region_hi.setRegion((float(vr[1]), vx1 + pad))
+        self.calib_region_lo.setVisible(show)
+        self.calib_region_hi.setVisible(show)
+
+    def _apply_unit_to_axis(self, unit: str) -> None:
+        if unit == self._shown_unit:
+            return
+        self._shown_unit = unit
+        if unit == "counts":
+            self.plot_canvas.setLabel("left", "Intensity", units="ADC",
+                                      color=T().FG3, **{"font-size": "10px"})
+        else:
+            name = ("Irradiance" if processing.is_absolute_unit(unit)
+                    else "Relative irradiance" if unit == "relative" else "Count rate")
+            self.plot_canvas.setLabel("left", f"{name} [{processing.unit_label(unit)}]",
+                                      units="", color=T().FG3, **{"font-size": "10px"})
 
     def capture_snapshot(self):
         """Return (wavelengths, intensities) of the current dark-corrected,
@@ -2240,6 +2451,10 @@ class DashboardWindow(QMainWindow):
         self._load_reference_library()          # reference back onto true nm
         if self.combo_reference.currentText() != "None":
             self._update_reference_curve_scale()
+        # The wavelength fingerprint changed → re-check the active profile
+        # (it is withheld with "wavelength changed – recalibrate").
+        self.calib_runtime.update_axis(wl, self.hardware_thread)
+        self._update_calib_status()
         return True
 
     def open_calibration_dialog(self) -> None:
@@ -2315,7 +2530,7 @@ class DashboardWindow(QMainWindow):
     def _snap_y_to_peak(self) -> None:
         """Set Y max to the current frame peak and disable auto-scale."""
         if self.current_averaged_pixels is not None and len(self.current_averaged_pixels):
-            peak = int(np.max(self.current_averaged_pixels))
+            peak = int(np.nan_to_num(np.nanmax(self.current_averaged_pixels)))
             peak = max(peak, 10)   # guard: no signal yet / fully dark
             self.spinbox_y_max.setValue(peak)
             # spinbox.valueChanged → apply_manual_y_axis → disables auto-Y + sets range
@@ -2631,10 +2846,25 @@ class DashboardWindow(QMainWindow):
                     w.writerow(["# Dark mode", self.dark_correction_mode])
                     w.writerow(["# Response compensation",
                                 "ON" if self.is_response_comp_enabled else "OFF"])
-                    w.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
-                    for i, (wl, v) in enumerate(
-                            zip(self.active_wavelengths, self.current_averaged_pixels)):
-                        w.writerow([i, round(wl, 2), round(v, 2)])
+                    unit = getattr(self, "_current_unit", "counts")
+                    if unit == "counts":
+                        w.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
+                        for i, (wl, v) in enumerate(
+                                zip(self.active_wavelengths, self.current_averaged_pixels)):
+                            w.writerow([i, round(wl, 2), round(v, 2)])
+                    else:
+                        st = self.calib_runtime.status
+                        w.writerow(["# Unit", unit])
+                        if self.calib_runtime.active_v2:
+                            w.writerow(["# Calibration profile", st.get("label", "")])
+                            vr = st.get("valid_range_nm")
+                            if vr:
+                                w.writerow(["# Valid range (nm)", f"{vr[0]:.1f}–{vr[1]:.1f}"])
+                        w.writerow(["Pixel_ID", "Wavelength_nm", f"Value_{unit}"])
+                        for i, (wl, v) in enumerate(
+                                zip(self.active_wavelengths, self.current_averaged_pixels)):
+                            w.writerow([i, round(wl, 2),
+                                        "" if not np.isfinite(v) else f"{v:.6g}"])
             self._note_export_saved(filename, path_err)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Save CSV failed: {e}")
@@ -2669,9 +2899,15 @@ class DashboardWindow(QMainWindow):
         QMessageBox.information(self, "Saved", msg)
 
     def copy_spectrum_to_clipboard(self) -> None:
-        lines = ["Wavelength_nm\tIntensity_ADC"]
-        for wl, v in zip(self.active_wavelengths, self.current_averaged_pixels):
-            lines.append(f"{wl:.2f}\t{v:.2f}")
+        unit = getattr(self, "_current_unit", "counts")
+        if unit == "counts":
+            lines = ["Wavelength_nm\tIntensity_ADC"]
+            for wl, v in zip(self.active_wavelengths, self.current_averaged_pixels):
+                lines.append(f"{wl:.2f}\t{v:.2f}")
+        else:
+            lines = [f"Wavelength_nm\tValue_{unit}"]
+            for wl, v in zip(self.active_wavelengths, self.current_averaged_pixels):
+                lines.append(f"{wl:.2f}\t" + ("" if not np.isfinite(v) else f"{v:.6g}"))
         QGuiApplication.clipboard().setText("\n".join(lines))
         QToolTip.showText(
             self.button_copy_clip.mapToGlobal(self.button_copy_clip.rect().bottomLeft()),
@@ -2742,9 +2978,16 @@ class DashboardWindow(QMainWindow):
         self.latest_integration_us = integration_us
         self.update_ob_readout()
 
+        averaged_raw = self.current_averaged_pixels.copy()
+
         # 1. Dark correction
         if self.is_dark_correction_enabled:
-            if self.dark_correction_mode == DARK_MODE_OPTICAL_BLACK:
+            if self.dark_correction_mode == processing.DARK_MODE_STORED:
+                stored = self.calib_runtime.stored_dark(integration_us)
+                dark_estimate = (stored if stored is not None and
+                                 len(stored) == len(self.current_averaged_pixels)
+                                 else OB_CORRECTION_SLOPE * ob_mean + OB_CORRECTION_OFFSET)
+            elif self.dark_correction_mode == DARK_MODE_OPTICAL_BLACK:
                 dark_estimate = OB_CORRECTION_SLOPE * ob_mean + OB_CORRECTION_OFFSET
             else:
                 dark_estimate = (self.spinbox_dark_bias.value()
@@ -2776,9 +3019,35 @@ class DashboardWindow(QMainWindow):
         # Capture the dark-corrected, pre-correction spectrum first — that is
         # what the calibration wizards measure.
         self._pixels_pre_response = self.current_averaged_pixels.copy()
-        if self.is_response_comp_enabled:
+        unit = "counts"
+        if processing.needs_shared_pipeline(Config.get, self.calib_runtime):
+            # v2 path (active profile / counts/s / stored dark): the SAME function
+            # and the SAME kwargs as the web server → identical values.
+            bk = self.hardware_thread
+            ob_slope, ob_offset = ((OB_CORRECTION_SLOPE, OB_CORRECTION_OFFSET)
+                                   if getattr(bk, "SUPPORTS_OB", True) else (1.0, 0.0))
+            kw = processing.pipeline_kwargs(
+                Config.get, self.calib_runtime, integration_us=integration_us,
+                ob_slope=ob_slope, ob_offset=ob_offset,
+                default_bias=DEFAULT_DARK_BIAS_ADC,
+                default_rate=DEFAULT_DARK_RATE_ADC_PER_SEC)
+            kw["peak_detection"] = False           # desktop has its own peak path
+            out = processing.process_frame(averaged_raw, ob_mean, integration_us,
+                                           wavelengths=self.active_wavelengths, **kw)
+            self.current_averaged_pixels = out["pixels"]
+            unit = out["unit"]
+            if out["dark_source"] != getattr(self, "_shown_dark_source", None):
+                self._shown_dark_source = out["dark_source"]
+                self._update_calib_status()
+        elif self.is_response_comp_enabled:
             self.current_averaged_pixels = np.clip(
                 self.current_averaged_pixels * self.active_response_gain, 0.0, None)
+        self._current_unit = unit
+        self._apply_unit_to_axis(unit)
+        # NaN = masked (outside the profile's valid range). The calibrated array
+        # stays in current_averaged_pixels (exports); displays get finite data.
+        disp = (np.nan_to_num(self.current_averaged_pixels, nan=0.0)
+                if unit != "counts" else self.current_averaged_pixels)
 
         # 3. Dynamic Y
         current_y_max = self.plot_canvas.getViewBox().viewRange()[1][1]
@@ -2787,23 +3056,29 @@ class DashboardWindow(QMainWindow):
             x_lo, x_hi = self.plot_canvas.getViewBox().viewRange()[0]
             vis = (self.active_wavelengths >= x_lo) & (self.active_wavelengths <= x_hi)
             if np.any(vis):
-                mv = float(np.max(self.current_averaged_pixels[vis]))
-                ideal_y = max(mv * 1.1, 50.0)
+                mv = float(np.max(disp[vis]))
+                ideal_y = (max(mv * 1.1, 50.0) if unit == "counts"
+                           else (mv * 1.1 if mv > 0 else 1.0))
                 ideal_heatmap_max = ideal_y
                 if ideal_y > current_y_max or ideal_y < current_y_max * 0.7:
                     self.plot_canvas.setYRange(
-                        Y_AXIS_BOTTOM_MARGIN_ADC, ideal_y, padding=0)
+                        Y_AXIS_BOTTOM_MARGIN_ADC if unit == "counts" else 0.0,
+                        ideal_y, padding=0)
         else:
             ideal_heatmap_max = self.spinbox_y_max.value()
 
         # 4. Scope
-        self.spectrum_curve.setData(self.active_wavelengths, self.current_averaged_pixels)
-        self.spectrum_fill.setData(self.active_wavelengths, self.current_averaged_pixels)
+        if unit == "counts":
+            self.spectrum_curve.setData(self.active_wavelengths, self.current_averaged_pixels)
+        else:   # masked pixels (NaN) as gaps
+            self.spectrum_curve.setData(self.active_wavelengths,
+                                        self.current_averaged_pixels, connect="finite")
+        self.spectrum_fill.setData(self.active_wavelengths, disp)
         # Rescale reference overlay to match current Y range every frame
         if self.reference_curve.isVisible():
             self._update_reference_curve_scale()
         # Overlay cluster (CSV bg / freeze / diff / peak-hold / persistence)
-        self._advance_overlays(self.current_averaged_pixels)
+        self._advance_overlays(disp)
         self._redraw_overlays()
 
         # 5. Heatmap — optional measurement-rate decimation (decouples the
@@ -2814,7 +3089,7 @@ class DashboardWindow(QMainWindow):
         if interval <= 0.0 or (now - self._heatmap_last_push) >= interval:
             self._heatmap_last_push = now
             linear_spec = np.interp(self.heatmap_linear_waves,
-                                    self.active_wavelengths, self.current_averaged_pixels)
+                                    self.active_wavelengths, disp)
             self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
             self.heatmap_buffer[:, 0] = linear_spec
             self.heatmap_times = np.roll(self.heatmap_times, 1)
@@ -2857,11 +3132,14 @@ class DashboardWindow(QMainWindow):
             self._update_peaks()
 
         # 8. CIE tab (throttled inside)
-        self.cie_tab.update_measurement(self.active_wavelengths, self.current_averaged_pixels)
-        self.filter_tab.update_measurement(self.active_wavelengths, self.current_averaged_pixels)
+        # Absolute profile → E(λ) in W/(m²·nm) and lux directly from it
+        # (radiometric_calibration_factor ignored); relative → corrected shape.
+        spd, lux_cal = processing.photometric_inputs(self.current_averaged_pixels, unit)
+        self.cie_tab.update_measurement(self.active_wavelengths, spd, lux_cal)
+        self.filter_tab.update_measurement(self.active_wavelengths, disp)
 
     def _update_peaks(self) -> None:
-        y = self.current_averaged_pixels
+        y = np.nan_to_num(self.current_averaged_pixels, nan=0.0)
         ws  = max(5, int(self.spinbox_sg_window.value()))
         if ws % 2 == 0: ws += 1
         order = min(int(self.spinbox_sg_order.value()), ws - 1)

@@ -36,6 +36,10 @@ const State = {
   referenceName: 'None',
   specRange: { min: null, max: null },  // manufacturer-guaranteed range (nm);
                              // data outside it is shaded on the scope.
+  validRange: null,          // [lo, hi] nm of the active calibration profile
+                             // (null = none); outside it is shaded grey.
+  unit: 'counts',            // unit of msg.intensities (from the frame)
+  unitLabel: 'counts',
   // Overlay cluster (client-only, reset on reload — these hold captured data
   // that can't meaningfully persist across a page load).
   overlay: { diff: false, peakHold: false, persist: false },
@@ -197,6 +201,14 @@ function handleFrame(msg) {
   // Manufacturer-guaranteed range for out-of-spec shading (may be null).
   if (msg.spec_min !== undefined) State.specRange.min = msg.spec_min;
   if (msg.spec_max !== undefined) State.specRange.max = msg.spec_max;
+  // Calibration: unit of the data + valid range of the active v2 profile.
+  State.validRange = Array.isArray(msg.valid_range_nm) ? msg.valid_range_nm : null;
+  if (msg.unit !== undefined && (msg.unit !== State.unit || msg.unit_label !== State.unitLabel)) {
+    State.unit = msg.unit;
+    State.unitLabel = msg.unit_label || msg.unit;
+    updateYAxisLabel();
+  }
+  Cal.onFrameStatus(msg.calibration);
   // Reference overlay: scale the normalised (0..1) library spectrum to 90% of
   // the current Y maximum so it always fits the displayed signal. Aligned to
   // the device axis at fetch time; null-filled (drawn as a gap) when off or on
@@ -258,7 +270,7 @@ function buildScopeSeries() {
   s[SI.LIVE] = {
     stroke: '#2dd4bf',          // fixed bright teal — visible on both themes
     width: 2,
-    spanGaps: true,
+    spanGaps: false,            // null = masked pixel (outside profile range) -> gap
     fill: makeSpectrumFill,     // wavelength-colored area fill under the curve
     points: { show: false },
   };
@@ -329,6 +341,7 @@ function makeScopePlot() {
     },
     plugins: [
       outOfSpecPlugin(),
+      validRangePlugin(),
       hoverReadoutPlugin(),
       measureModePlugin(),
       wheelZoomPlugin(),
@@ -362,6 +375,20 @@ function makeScopePlot() {
   window.addEventListener('resize', fitScope);
 }
 
+// Y-axis title follows the unit of the frame (counts -> ADC, else unit_label).
+function yAxisTitle() {
+  if (State.unit === 'counts') return 'Intensity (ADC)';
+  if (State.unit === 'counts/s') return 'Count rate (counts/s)';
+  if (State.unit === 'relative') return 'Relative intensity';
+  return `Spectral irradiance (${State.unitLabel})`;
+}
+function updateYAxisLabel() {
+  const u = State.scopePlot;
+  if (!u || !u.axes[1]) return;
+  u.axes[1].label = yAxisTitle();
+  u.redraw(true, true);
+}
+
 function autoYRange() {
   // Signed extent across the live trace plus any ABSOLUTE-ADC overlays that can
   // exceed it (freeze, peak-hold, signed difference). The 0.9·Ymax overlays
@@ -381,6 +408,11 @@ function autoYRange() {
   if (State.freeze)           consider(State.scopeData[SI.FREEZE]);
   if (State.overlay.peakHold) consider(State.scopeData[SI.ENV]);
   if (State.overlay.diff)     consider(State.scopeData[SI.DIFF]);   // may be negative
+  // Calibrated (irradiance) values can be << 1: no ADC-sized floor/ceiling.
+  const calUnit = State.unit !== 'counts' && State.unit !== 'counts/s';
+  if (calUnit && State.cfg.auto_y !== false) {
+    return [Math.min(0, mn * 1.1), (mx > 0 ? mx : 1) * 1.1];
+  }
   const lo = Math.min(-20, mn * 1.1);
   if (State.cfg.auto_y === false) {
     return [lo, State.cfg.y_max_adc || 4000];
@@ -442,6 +474,32 @@ function outOfSpecPlugin() {
       if (val == null || val <= xmin || val >= xmax) continue;
       const x = Math.round(u.valToPos(val, 'x', true)) + 0.5;
       ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + height); ctx.stroke();
+    }
+    ctx.restore();
+  } } };
+}
+
+// Grey shading outside the valid range of the active calibration profile
+// (no calibrated values there: the trace shows a gap). Same drawClear approach
+// as the out-of-spec bands; reads State.validRange from the frame payload.
+function validRangePlugin() {
+  return { hooks: { drawClear: u => {
+    const vr = State.validRange;
+    if (!vr || vr.length < 2) return;
+    const lo = vr[0], hi = vr[1];
+    const ctx = u.ctx;
+    const { left, top, width, height } = u.bbox;
+    const xmin = u.scales.x.min, xmax = u.scales.x.max;
+    if (xmin == null || xmax == null) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(128,128,128,0.16)';
+    if (lo != null && lo > xmin) {
+      const x1 = Math.round(u.valToPos(Math.min(lo, xmax), 'x', true));
+      if (x1 > left) ctx.fillRect(left, top, x1 - left, height);
+    }
+    if (hi != null && hi < xmax) {
+      const x0 = Math.round(u.valToPos(Math.max(hi, xmin), 'x', true));
+      if (left + width > x0) ctx.fillRect(x0, top, left + width - x0, height);
     }
     ctx.restore();
   } } };
@@ -1907,6 +1965,7 @@ async function init() {
       $('#sidebar').classList.toggle('open');
     });
     wireConfigInputs();
+    Cal.init();
   } catch (e) {
     console.error('init: wiring controls failed', e);
   }
@@ -1931,6 +1990,152 @@ async function init() {
   try { Replay.init(); } catch (e) { console.error('init: Replay.init failed', e); }
   try { Filter.init(); } catch (e) { console.error('init: Filter.init failed', e); }
 }
+
+// ── Spectral calibration (schema v2) ─────────────────────────
+// Profile dropdown (value = profile id), status line, delete / export /
+// import / copy-to-this-device. Capture/wizard is desktop-only.
+const Cal = (() => {
+  let lastKey = '';
+  let items = [];
+
+  const api = async (url, opts) => {
+    const r = await fetch(url, opts);
+    let j = null;
+    try { j = await r.json(); } catch (e) { /* non-JSON body */ }
+    return { r, j };
+  };
+  const post = (url, body) => api(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  const err = (j, r) => (j && (j.detail || j.message)) || `HTTP ${r.status}`;
+
+  function showStatus(st) {
+    const el = $('#cal-status');
+    if (!el || !st) return;
+    const s = st.state || 'none';
+    el.className = 'cal-status ' + s;
+    let txt = st.message || '';
+    // wl_changed / nl_changed: the server message already names the cause(s)
+    if ((s === 'wl_changed' || s === 'nl_changed') && !txt) txt = 'Calibration conditions changed – recalibrate.';
+    else if (!txt && s === 'none') txt = 'No calibration active (counts).';
+    else if (!txt && s === 'ok') txt = 'OK';
+    if (st.valid_range_nm) {
+      txt += ` Valid ${st.valid_range_nm[0].toFixed(0)}–${st.valid_range_nm[1].toFixed(0)} nm.`;
+    }
+    if (st.dark_source === 'stored') txt += ' Dark: stored (this t_int).';
+    else if (st.dark_source === 'stored_model') txt += ' Dark: per-pixel model b+r·t.';
+    if (st.dark_warning) {
+      txt += ' ⚠ ' + st.dark_warning;
+      el.className += ' wl_changed';      // same warning colour
+    }
+    el.textContent = `${st.label || ''}: ${txt}`.trim();
+  }
+
+  // Frames carry the status; only re-render when it changes.
+  function onFrameStatus(st) {
+    if (!st) return;
+    const key = JSON.stringify([st.state, st.profile_id, st.label, st.unit,
+                                st.dark_source, st.dark_warning]);
+    if (key === lastKey) return;
+    lastKey = key;
+    showStatus(st);
+  }
+
+  async function refresh() {
+    const sel = $('#cal-select');
+    if (!sel) return;
+    const old = $('#cal-include-old').checked ? 1 : 0;
+    let j;
+    try { ({ j } = await api('/api/calibration/profiles?include_old=' + old)); }
+    catch (e) { return; }
+    if (!j || !Array.isArray(j.items)) return;
+    items = j.items;
+    sel.innerHTML = '';
+    for (const it of items) {
+      const warn = it.state === 'wl_changed' || it.state === 'nl_changed';
+      const o = new Option(it.label + (warn ? ' ⚠' : ''), it.value);
+      o.title = it.message || '';
+      sel.appendChild(o);
+    }
+    sel.value = j.selection;
+    const oth = $('#cal-other');
+    oth.innerHTML = '';
+    for (const o of (j.other_units || [])) oth.appendChild(new Option(`${o.serial} · ${o.label}`, o.id));
+    $('#cal-copy').disabled = !(j.other_units || []).length;
+    showStatus(j.status);
+  }
+
+  async function select(value, confirm) {
+    const { r, j } = await post('/api/calibration/select', { selection: value, confirm: !!confirm });
+    if (r.status === 409 && j && j.needs_confirmation) {
+      if (window.confirm((j.message || 'Wavelength calibration changed.') +
+                         '\n\nApply this profile anyway?')) return select(value, true);
+      return refresh();
+    }
+    if (!r.ok) { toast(err(j, r)); return refresh(); }
+    lastKey = '';
+    showStatus(j.status);
+    refresh();
+  }
+
+  async function del() {
+    const id = $('#cal-select').value;
+    const it = items.find(x => x.value === id);
+    if (!it || it.state === 'builtin') { toast('Select a saved profile first'); return; }
+    if (!window.confirm(`Delete profile "${it.label}"?`)) return;
+    const { r, j } = await post('/api/calibration/profile/delete', { id });
+    if (!r.ok) toast(err(j, r)); else toast('Profile deleted');
+    lastKey = '';
+    refresh();
+  }
+
+  function exportProfile() {
+    const id = $('#cal-select').value;
+    const it = items.find(x => x.value === id);
+    if (!it || it.state === 'builtin') { toast('Select a saved profile first'); return; }
+    const a = document.createElement('a');
+    a.href = '/api/calibration/profile/export?id=' + encodeURIComponent(id);
+    a.download = '';
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  async function importFile(ev) {
+    const f = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    let body;
+    try { body = JSON.parse(await f.text()); }
+    catch (e) { toast('Not a valid JSON file'); return; }
+    const { r, j } = await post('/api/calibration/profile/import', body);
+    toast(r.ok ? `Imported: ${j.label}` : err(j, r), 3000);
+    refresh();
+  }
+
+  async function copyToDevice() {
+    const id = $('#cal-other').value;
+    if (!id) return;
+    const { r, j } = await post('/api/calibration/profile/copy', { id });
+    toast(r.ok ? `Copied: ${j.label}` : err(j, r), 3000);
+    refresh();
+  }
+
+  function init() {
+    const sel = $('#cal-select');
+    if (!sel) return;
+    sel.addEventListener('change', () => select(sel.value));
+    $('#cal-include-old').addEventListener('change', refresh);
+    $('#cal-delete').addEventListener('click', del);
+    $('#cal-export').addEventListener('click', exportProfile);
+    $('#cal-import').addEventListener('click', () => $('#cal-import-file').click());
+    $('#cal-import-file').addEventListener('change', importFile);
+    $('#cal-copy').addEventListener('click', copyToDevice);
+    $('#sec-calibration')?.addEventListener('toggle', e => { if (e.target.open) refresh(); });
+    refresh();
+  }
+
+  return { init, refresh, onFrameStatus };
+})();
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);

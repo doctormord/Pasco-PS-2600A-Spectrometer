@@ -31,6 +31,32 @@ def apply_dark_correction(
     return np.maximum(0.0, pixels - dark)
 
 
+DARK_MODE_STORED = "stored"
+
+
+def dark_estimate(
+    *, mode: str, ob_mean: float, integration_us: int, ob_slope: float,
+    ob_offset: float, bias_adc: float, rate_adc_per_s: float,
+    stored_dark: np.ndarray | None = None,
+):
+    """Dark level to subtract: per-pixel array for mode 'stored' (when a stored
+    dark at this t_int exists), else the scalar of the optical-black /
+    parametric model. Returns (dark, source) with source in
+    {'stored', 'optical_black', 'parametric'}. A missing stored dark falls back
+    to the optical-black/baseline estimate."""
+    if mode == DARK_MODE_STORED and stored_dark is not None:
+        return np.asarray(stored_dark, dtype=float), DARK_MODE_STORED
+    if mode == "parametric":
+        return bias_adc + rate_adc_per_s * integration_us / 1_000_000.0, "parametric"
+    return ob_slope * ob_mean + ob_offset, "optical_black"
+
+
+def to_count_rate(net_counts: np.ndarray, integration_us: int) -> np.ndarray:
+    """counts → counts/s (dark must already be subtracted)."""
+    t = max(int(integration_us), 1) / 1_000_000.0
+    return np.asarray(net_counts, dtype=float) / t
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Hot-pixel / median despeckle
 # ──────────────────────────────────────────────────────────────────────
@@ -173,12 +199,42 @@ def process_frame(
     response_compensation: bool = False,
     peak_detection: bool = False,
     peak_params: dict | None = None,
+    # Spectral calibration v2 (all default to the unchanged legacy behaviour)
+    calibration=None,               # calibration_profiles.CalibrationApplier | None
+    stored_dark: np.ndarray | None = None,
+    stored_dark_source: str = "stored",   # "stored" | "stored_model" (reporting)
+    display_unit: str = "counts",   # "counts" | "counts_per_s" (no profile)
 ) -> dict:
     """Apply the full processing pipeline. Returns a dict containing the
-    processed pixel array plus any computed peaks."""
-    arr = np.asarray(pixels, dtype=float).copy()
+    processed pixel array plus any computed peaks, the y unit and the dark
+    source actually used.
 
-    if dark_correction:
+    Legacy path (no v2 profile, display_unit 'counts', dark mode not 'stored'):
+    bit-identical to the previous implementation.
+
+    Calibrated path (v2 profile active): dark subtraction is mandatory and NOT
+    clipped (the configured dark mode; 'stored' = per-pixel dark at this t_int),
+    then counts/s, despeckle/smoothing, then × factor (1/S or K) and NaN outside
+    the profile's valid range. The legacy response gain is not applied."""
+    arr = np.asarray(pixels, dtype=float).copy()
+    unit = "counts"
+    dark_source = None
+
+    calibrated = calibration is not None
+    rate_mode = calibrated or display_unit == "counts_per_s"
+    new_dark = (dark_mode == DARK_MODE_STORED)
+
+    if calibrated or (dark_correction and new_dark):
+        dark, dark_source = dark_estimate(
+            mode=dark_mode, ob_mean=ob_mean, integration_us=integration_us,
+            ob_slope=ob_slope, ob_offset=ob_offset, bias_adc=dark_bias_adc,
+            rate_adc_per_s=dark_rate_adc_per_s, stored_dark=stored_dark)
+        if dark_source == DARK_MODE_STORED:
+            dark_source = stored_dark_source
+        arr = arr - dark
+        if not calibrated:
+            arr = np.maximum(0.0, arr)       # display path keeps the old clip
+    elif dark_correction:
         arr = apply_dark_correction(
             arr, mode=dark_mode, ob_mean=ob_mean,
             integration_us=integration_us,
@@ -186,18 +242,25 @@ def process_frame(
             bias_adc=dark_bias_adc,
             rate_adc_per_s=dark_rate_adc_per_s,
         )
+        dark_source = dark_mode
+    if rate_mode:
+        arr = to_count_rate(arr, integration_us)
+        unit = "counts/s"
     if hot_pixel_filter:
         arr = apply_despeckle(arr, smoothing_width)
     if spatial_smoothing:
         arr = apply_spatial_smoothing(arr, spatial_smoothing_width)
-    if response_compensation:
+    if calibrated:
+        arr = calibration.apply(arr)
+        unit = calibration.unit
+    elif response_compensation:
         arr = apply_response_compensation(arr, response_gain)
 
     peaks: list[dict] = []
     if peak_detection:
         p = peak_params or {}
         peaks = detect_peaks(
-            arr, wavelengths,
+            np.nan_to_num(arr, nan=0.0) if calibrated else arr, wavelengths,
             savgol_window  = p.get("peak_savgol_window", 11),
             savgol_order   = p.get("peak_savgol_order", 3),
             min_prominence = p.get("peak_prominence", 50.0),
@@ -206,4 +269,103 @@ def process_frame(
             max_count      = p.get("peak_max_count", 3),
         )
 
-    return {"pixels": arr, "peaks": peaks}
+    return {"pixels": arr, "peaks": peaks, "unit": unit, "dark_source": dark_source}
+
+
+def pipeline_kwargs(cfg_get, runtime, *, integration_us: int, ob_slope: float,
+                    ob_offset: float, default_bias: float = 0.0,
+                    default_rate: float = 0.0) -> dict:
+    """The keyword arguments of process_frame(), built from the live config and
+    the active CalibrationRuntime. Desktop AND web call this with the same
+    config, runtime and OB constants, so both run process_frame() with identical
+    inputs → identical output (plan: bit-identical desktop/web).
+
+    cfg_get: Config.get-like callable. runtime: calibration_profiles
+    .CalibrationRuntime (or None). OB constants: the device's OB model (PASCO)
+    or (1, 0) for devices without optical-black pixels."""
+    dark_mode = cfg_get("dark_mode", "optical_black")
+    applier = getattr(runtime, "applier", None)
+    legacy = getattr(runtime, "legacy_gain", None)
+    stored = None
+    stored_src = DARK_MODE_STORED
+    # With an active v2 profile a PER-PIXEL dark is always used (the scalar
+    # optical-black / parametric estimates bias the weak blue end badly and are
+    # not t_int-consistent). Exact stored dark, else per-pixel b + r·t model;
+    # only if neither exists the configured scalar mode is the fallback (and
+    # the runtime status carries a warning).
+    if runtime is not None and (applier is not None or dark_mode == DARK_MODE_STORED):
+        stored, src = runtime.dark_for(integration_us)
+        if stored is not None:
+            stored_src = src
+            if applier is not None:
+                dark_mode = DARK_MODE_STORED
+    return dict(
+        response_gain=(legacy if legacy is not None else 1.0),
+        ob_slope=float(ob_slope),
+        ob_offset=float(ob_offset),
+        dark_correction=bool(cfg_get("dark_correction", False)),
+        dark_mode=dark_mode,
+        dark_bias_adc=float(cfg_get("dark_bias_adc", default_bias)),
+        dark_rate_adc_per_s=float(cfg_get("dark_rate_adc_per_s", default_rate)),
+        hot_pixel_filter=bool(cfg_get("hot_pixel_filter", False)),
+        smoothing_width=int(cfg_get("smoothing_width", 5)),
+        spatial_smoothing=bool(cfg_get("spatial_smoothing", False)),
+        spatial_smoothing_width=int(cfg_get("spatial_smoothing_width", 5)),
+        response_compensation=legacy is not None,
+        peak_detection=bool(cfg_get("show_peaks", False)),
+        peak_params={k: cfg_get(k) for k in (
+            "peak_savgol_window", "peak_savgol_order", "peak_prominence",
+            "peak_min_distance_px", "peak_min_height", "peak_max_count")
+            if cfg_get(k) is not None},
+        calibration=applier,
+        stored_dark=stored,
+        stored_dark_source=stored_src,
+        display_unit=str(cfg_get("display_unit", "counts")),
+    )
+
+
+def needs_shared_pipeline(cfg_get, runtime) -> bool:
+    """True when a frame must go through process_frame() with the v2 features
+    (active v2 profile, counts/s display, or the stored-dark mode)."""
+    return bool(getattr(runtime, "active_v2", False)
+                or cfg_get("display_unit", "counts") == "counts_per_s"
+                or (cfg_get("dark_correction", False)
+                    and cfg_get("dark_mode", "optical_black") == DARK_MODE_STORED))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Units / photometry helpers (shared desktop + web)
+# ──────────────────────────────────────────────────────────────────────
+UNIT_LABELS = {
+    "counts": "counts",
+    "counts/s": "counts/s",
+    "relative": "relative",
+    "uW/cm2/nm": "µW/(cm²·nm)",
+    "W/m2/nm": "W/(m²·nm)",
+    "mW/m2/nm": "mW/(m²·nm)",
+}
+
+# factor to W/(m²·nm) for the absolute units
+_TO_W_M2_NM = {"uW/cm2/nm": 0.01, "W/m2/nm": 1.0, "mW/m2/nm": 1e-3}
+
+
+def unit_label(unit: str) -> str:
+    return UNIT_LABELS.get(unit, unit)
+
+
+def is_absolute_unit(unit: str) -> bool:
+    return unit in _TO_W_M2_NM
+
+
+def photometric_inputs(values: np.ndarray, unit: str):
+    """Spectrum + lux calibration for color_science.measure_all().
+
+    Masked (NaN) pixels → 0. For an absolute unit the spectrum is returned in
+    W/(m²·nm) and lux_calibration = 1.0, so illuminance_lux() gives true lux
+    directly from E(λ) (radiometric_calibration_factor is then ignored). For
+    any other unit returns lux_calibration None (= use the configured factor)."""
+    v = np.nan_to_num(np.asarray(values, dtype=float), nan=0.0,
+                      posinf=0.0, neginf=0.0)
+    if is_absolute_unit(unit):
+        return v * _TO_W_M2_NM[unit], 1.0
+    return v, None

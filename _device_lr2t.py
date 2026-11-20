@@ -208,6 +208,7 @@ class LasertrackLR2T(BaseSpectrometer):
     WL_MIN_NM             = 297.0
     WL_MAX_NM             = 981.0
     SPEC_CONFIG_PREFIX    = "lr2t"       # lr2t_spec_min_nm / lr2t_spec_max_nm
+    ADC_FULL_SCALE        = float(ASEQ_ADC_MAX)
     SUPPORTS_OB           = False
     SUPPORTS_FAST_PREVIEW = True
     RESPONSE_TABLE        = None   # no response correction characterised yet
@@ -274,6 +275,10 @@ class LasertrackLR2T(BaseSpectrometer):
         except Exception:
             return []
 
+    @property
+    def adc_saturation_level(self) -> float:
+        return float(ASEQ_ADC_SATURATION)
+
     def connect(self, device_id: str) -> None:
         if not _HID_AVAILABLE:
             raise RuntimeError(
@@ -296,6 +301,7 @@ class LasertrackLR2T(BaseSpectrometer):
             self._dev.open(ASEQ_VID, ASEQ_PID, serial or None)
 
         self._dev.set_nonblocking(0)
+        self.serial = serial or None
 
         # Read actual frame size from device
         self._n_pixels_in_frame = self._cmd_get_frame_format()
