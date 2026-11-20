@@ -1057,7 +1057,14 @@ class CIETab(QWidget):
             QMessageBox.warning(self, "Colour CSV", f"Export failed:\n{e}")
 
     def update_measurement(self, wavelengths_nm: np.ndarray,
-                           intensities: np.ndarray) -> None:
+                           intensities: np.ndarray,
+                           lux_calibration: float | None = None) -> None:
+        """lux_calibration: None → use radiometric_calibration_factor from the
+        config (legacy). With an ABSOLUTE calibration profile active the
+        dashboard passes E(λ) in W/(m²·nm) and lux_calibration=1.0, so lux is
+        computed directly from the spectral irradiance and the scalar factor is
+        ignored."""
+        self._lux_override = lux_calibration
         self._latest = (np.asarray(wavelengths_nm, dtype=float),
                         np.asarray(intensities, dtype=float))
         self._frame_count += 1
@@ -1084,7 +1091,9 @@ class CIETab(QWidget):
             return
         try:
             from app_config import Config
-            calib = float(Config.get("radiometric_calibration_factor", 0.0))
+            override = getattr(self, "_lux_override", None)
+            calib = (float(override) if override is not None
+                     else float(Config.get("radiometric_calibration_factor", 0.0)))
             self._calib = calib
             m = cs.measure_all(wavelengths_nm, intensities,
                                lux_calibration=calib)

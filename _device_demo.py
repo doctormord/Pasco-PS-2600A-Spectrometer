@@ -97,7 +97,24 @@ def _bi_tungsten(wl, T=2856.0):
 def _bi_flat(wl):
     return np.ones_like(wl)
 
+def _bi_cal_lamp(wl):
+    """Calibration lamp irradiance E_lamp(lambda) (see calibration_utils)."""
+    from calibration_utils import demo_lamp_irradiance
+    return np.asarray(demo_lamp_irradiance(wl), dtype=float)
+
+
+def demo_true_sensitivity(wl_nm) -> np.ndarray:
+    """Known synthetic detector sensitivity S_true(lambda), peak-normalised
+    over the demo axis (max = 1). Used when demo_sensitivity == "synthetic"."""
+    def _raw(w):
+        return np.exp(-0.5 * ((np.asarray(w, dtype=float) - 600.0) / 160.0) ** 2)
+    ref = float(np.max(_raw(np.linspace(DEMO_WL_MIN_NM, DEMO_WL_MAX_NM,
+                                        DEMO_PIXEL_COUNT))))
+    return _raw(wl_nm) / ref
+
+
 _BUILTINS = {
+    "cal_lamp":  _bi_cal_lamp,
     "led_white": _bi_led_white,
     "led_cool":  _bi_led_cool,
     "tungsten":  _bi_tungsten,
@@ -140,7 +157,8 @@ def _load_csv_spectrum(name: str, wl: np.ndarray):
     return None
 
 
-def _resolve_spectrum(name: str, wl: np.ndarray) -> np.ndarray:
+def _resolve_spectrum(name: str, wl: np.ndarray,
+                      sensitivity: str = "none") -> np.ndarray:
     """Return a peak-normalised (max=1) shape for `name`: a built-in or a CSV column."""
     key = (name or "led_white").strip()
     fn = _BUILTINS.get(key.lower())
@@ -149,6 +167,8 @@ def _resolve_spectrum(name: str, wl: np.ndarray) -> np.ndarray:
         print(f"[DEMO] spectrum '{name}' not found (built-in or "
               f"reference_spectra.csv column) — using led_white")
         shape = _bi_led_white(wl)
+    if str(sensitivity).strip().lower() == "synthetic":
+        shape = np.asarray(shape, dtype=float) * demo_true_sensitivity(wl)
     m = float(np.max(shape))
     return (shape / m) if m > 0 else np.zeros_like(wl)
 
@@ -174,7 +194,9 @@ class DemoSpectrometer(BaseSpectrometer):
     SPEC_MAX_NM_DEFAULT   = 780.0
     SUPPORTS_OB           = False
     SUPPORTS_FAST_PREVIEW = True
+    SUPPORTS_SHUTTER      = True
     RESPONSE_TABLE        = None
+    ADC_FULL_SCALE        = float(DEMO_ADC_MAX)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -186,6 +208,8 @@ class DemoSpectrometer(BaseSpectrometer):
         self._wl    = np.linspace(self.WL_MIN_NM, self.WL_MAX_NM, self.PIXEL_COUNT)
         self._shape = _resolve_spectrum("led_white", self._wl)
         self._rng   = np.random.default_rng()
+        self._shutter_closed = False
+        self.serial: str | None = None
 
         # Per-device integration bounds (µs); overridden from Config in connect.
         self._min_us = DEMO_MIN_INTEGRATION_US
@@ -231,8 +255,9 @@ class DemoSpectrometer(BaseSpectrometer):
         self._gain_per_ms = DEMO_FULLSCALE_FRAC * DEMO_ADC_MAX / fullscale_ms
 
         spec_name = str(Config.get("demo_spectrum", "led_white"))
-        self._shape = _resolve_spectrum(spec_name, self._wl)
-        self.serial = "DEMO-0001"
+        sens = str(Config.get("demo_sensitivity", "none"))
+        self._shape = _resolve_spectrum(spec_name, self._wl, sens)
+        self.serial = str(Config.get("demo_serial", "DEMO-0001"))
 
         self.current_integration_time_us = max(
             self._min_us, min(self._max_us, self.current_integration_time_us))
@@ -270,6 +295,15 @@ class DemoSpectrometer(BaseSpectrometer):
         # Virtual device — wavelength axis is exact, nothing to calibrate.
         return False
 
+    @property
+    def adc_saturation_level(self) -> float:
+        # Above the soft knee the response is nonlinear.
+        return float(min(self._knee_counts, 0.98 * DEMO_ADC_MAX))
+
+    def set_shutter(self, closed: bool) -> bool:
+        self._shutter_closed = bool(closed)
+        return True
+
     # ── Frame synthesis ─────────────────────────────────────────────────────
     def _expose(self, t_us: int) -> np.ndarray:
         """Synthesise one 16-bit frame genuinely 'integrated' for t_us, with
@@ -278,6 +312,8 @@ class DemoSpectrometer(BaseSpectrometer):
         dark_current = self._dark_current * t_ms          # accumulates with t
         dark   = self._dark_bias + dark_current
         signal = self._shape * self._gain_per_ms * t_ms   # photo-signal
+        if self._shutter_closed:
+            signal = np.zeros_like(signal)                 # true dark frame
         ideal  = dark + signal
         # Shot noise ∝ sqrt(photo-signal + dark-current counts); read noise fixed.
         sigma  = (np.sqrt(np.maximum(signal + dark_current, 0.0)) * self._shot_noise

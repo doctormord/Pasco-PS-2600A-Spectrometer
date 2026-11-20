@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.exe
+.claude/settings.local.json
+ASEQ_*
+.claude/
+docs/KICKOFF_PROMPT.md

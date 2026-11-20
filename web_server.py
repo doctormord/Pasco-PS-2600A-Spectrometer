@@ -120,6 +120,11 @@ class ServerState:
         # Latest processed state (held for WS broadcast + export)
         self.current_pixels: np.ndarray = np.zeros(self.pixel_count)
         self.current_peaks: list[dict] = []
+        # Spectral calibration v2: shared with the desktop (same class, same
+        # processing.pipeline_kwargs) so both apply a profile identically.
+        self.calib = calprof.CalibrationRuntime()
+        self.current_unit: str = "counts"
+        self.current_dark_source: str | None = None
         self.latest_ob_mean: float = 0.0
         self.latest_integration_us: int = START_INTEGRATION_TIME_US
 
@@ -220,44 +225,25 @@ def _fused_emit(pixels: np.ndarray, ob_mean: float, integration_us: int) -> None
     state.latest_ob_mean = ob_mean
     state.latest_integration_us = integration_us
 
-    # Pull live config knobs
-    dark_correction = bool(Config.get("dark_correction", False))
-    dark_mode       = Config.get("dark_mode", DARK_MODE_OPTICAL_BLACK)
-    hot_pixel       = bool(Config.get("hot_pixel_filter", False))
-    smooth          = int(Config.get("smoothing_width", 5))
-    spatial_smooth  = bool(Config.get("spatial_smoothing", False))
-    spatial_width   = int(Config.get("spatial_smoothing_width", 5))
-    response_comp   = bool(Config.get("spectral_response_compensation", False))
-    peak_on         = bool(Config.get("show_peaks", False))
-
+    # Live config knobs + active calibration → identical kwargs to the desktop
+    # (processing.pipeline_kwargs). Legacy profiles / device default arrive as
+    # state.calib.legacy_gain, v2 profiles as state.calib.applier.
+    kwargs = processing.pipeline_kwargs(
+        Config.get, state.calib, integration_us=integration_us,
+        ob_slope=state.ob_slope, ob_offset=state.ob_offset,
+        default_bias=DEFAULT_DARK_BIAS_ADC,
+        default_rate=DEFAULT_DARK_RATE_ADC_PER_SEC)
     result = processing.process_frame(
         averaged, ob_mean, integration_us,
-        wavelengths=state.wavelength_array,
-        response_gain=state.response_gain,
-        ob_slope=state.ob_slope,
-        ob_offset=state.ob_offset,
-        dark_correction=dark_correction,
-        dark_mode=dark_mode,
-        dark_bias_adc=float(Config.get("dark_bias_adc", DEFAULT_DARK_BIAS_ADC)),
-        dark_rate_adc_per_s=float(Config.get("dark_rate_adc_per_s",
-                                             DEFAULT_DARK_RATE_ADC_PER_SEC)),
-        hot_pixel_filter=hot_pixel,
-        smoothing_width=smooth,
-        spatial_smoothing=spatial_smooth,
-        spatial_smoothing_width=spatial_width,
-        response_compensation=response_comp,
-        peak_detection=peak_on,
-        peak_params={k: Config.get(k) for k in (
-            "peak_savgol_window", "peak_savgol_order", "peak_prominence",
-            "peak_min_distance_px", "peak_min_height", "peak_max_count",
-        )},
-    )
+        wavelengths=state.wavelength_array, **kwargs)
     state.current_pixels = result["pixels"]
     state.current_peaks  = result["peaks"]
+    state.current_unit   = result["unit"]
+    state.current_dark_source = result["dark_source"]
 
-    # Heatmap rolling buffer
-    linear = np.interp(state.heatmap_linear_waves,
-                       state.wavelength_array, state.current_pixels)
+    # Heatmap rolling buffer (masked pixels → 0)
+    linear = np.interp(state.heatmap_linear_waves, state.wavelength_array,
+                       np.nan_to_num(state.current_pixels, nan=0.0))
     state.heatmap_buffer = np.roll(state.heatmap_buffer, 1, axis=1)
     state.heatmap_buffer[:, 0] = linear
 
@@ -265,7 +251,11 @@ def _fused_emit(pixels: np.ndarray, ob_mean: float, integration_us: int) -> None
     state._frame_counter += 1
     if state._frame_counter % state.color_metrics_period_frames == 0:
         try:
-            m = cs.measure_all(state.wavelength_array, state.current_pixels)
+            spd, lux_cal = processing.photometric_inputs(state.current_pixels,
+                                                         state.current_unit)
+            m = (cs.measure_all(state.wavelength_array, spd, lux_calibration=lux_cal)
+                 if lux_cal is not None else
+                 cs.measure_all(state.wavelength_array, spd))
             # Strip non-JSON-friendly floats
             state.color_metrics = {k: (None if isinstance(v, float) and not np.isfinite(v)
                                        else v)
@@ -336,6 +326,17 @@ def on_connection_lost() -> None:
 # ============================================================
 # WebSocket broadcasts
 # ============================================================
+_COUNT_UNITS = ("counts", "counts/s")
+
+
+def _round_counts(v: float) -> float:
+    return round(v, 2)
+
+
+def _round_sig(v: float) -> float:
+    return float(f"{v:.6g}")
+
+
 def _build_frame_payload(downsample: int = 1) -> dict:
     """Compact JSON payload for the live stream. By default sends the FULL
     spectrum (no downsampling) so the scope line and the waterfall heatmap keep
@@ -350,17 +351,34 @@ def _build_frame_payload(downsample: int = 1) -> dict:
     else:
         px_ds = px
         wl_ds = wl
-    # Replace any NaN/inf with finite numbers. A single NaN in the intensity
-    # array serializes to JSON NaN/null and breaks the uPlot line into
-    # invisible fragments. nan_to_num guarantees a clean, plottable array.
-    px_ds = np.nan_to_num(np.asarray(px_ds, dtype=float),
-                          nan=0.0, posinf=0.0, neginf=0.0)
+    px_ds = np.asarray(px_ds, dtype=float)
+    unit = state.current_unit or "counts"
+    if state.calib.active_v2:
+        # Active v2 profile: masked pixels (NaN) go out as null so the plot
+        # shows gaps instead of a fake zero line.
+        finite = np.isfinite(px_ds)
+        # Irradiance values are small: keep significant digits there.
+        rnd = _round_counts if unit in _COUNT_UNITS else _round_sig
+        intens = [rnd(float(v)) if f else None for v, f in zip(px_ds, finite)]
+    else:
+        # Replace any NaN/inf with finite numbers. A single NaN in the
+        # intensity array serializes to JSON NaN/null and breaks the uPlot
+        # line into invisible fragments. nan_to_num guarantees a clean array.
+        px_ds = np.nan_to_num(px_ds, nan=0.0, posinf=0.0, neginf=0.0)
+        rnd = _round_counts if unit in _COUNT_UNITS else _round_sig
+        intens = [rnd(float(v)) for v in px_ds]
     wl_ds = np.nan_to_num(np.asarray(wl_ds, dtype=float),
                           nan=0.0, posinf=0.0, neginf=0.0)
+    calib_status = _json_safe(dict(state.calib.status))
     return {
         "type": "frame",
         "wavelengths": [round(float(w), 2) for w in wl_ds],
-        "intensities": [round(float(v), 2) for v in px_ds],
+        "intensities": intens,
+        "unit": unit,
+        "unit_label": processing.unit_label(unit),
+        "calibration": calib_status,
+        "valid_range_nm": calib_status.get("valid_range_nm"),
+        "dark_source": state.current_dark_source,
         "ob_mean": round(state.latest_ob_mean, 3),
         # Device-aware dark readout. PASCO has real optical-black pixels, so the
         # value is a true OB mean and the parametric Bias/Rate fields are
@@ -423,6 +441,13 @@ def _rebuild_response_gain(backend=None) -> None:
     state.response_gain, _eff = calprof.build_gain_for_selection(
         state.wavelength_array, dev, selection,
         device_default_table=default_table)
+    # v2 runtime (what the pipeline actually applies)
+    if src is not None:
+        state.calib.configure(dev, src, state.wavelength_array)
+    else:
+        state.calib.backend_name = dev
+        state.calib.wl = np.asarray(state.wavelength_array, float)
+        state.calib.refresh()
 
 
 def _apply_device_params(backend: BaseSpectrometer, backend_name: str | None = None) -> None:
@@ -476,6 +501,8 @@ def _reset_device_params() -> None:
     state.adc_saturation   = float(DEFAULT_ADC_SATURATION)
     state.supports_ob      = True
     state.spec_range_nm    = (None, None)
+    state.calib            = calprof.CalibrationRuntime()
+    state.current_unit     = "counts"
     state.current_pixels   = np.zeros(state.pixel_count)
     state.heatmap_linear_waves = np.linspace(
         state.wavelength_array[0], state.wavelength_array[-1], state.pixel_count)
@@ -836,55 +863,198 @@ async def api_config_set(payload: dict):
     fusion_keys = {k: payload[k] for k in payload if k in fusion.DEFAULTS}
     if fusion_keys:
         state.fusion.configure(**fusion_keys)
+    if "irradiance_unit" in payload:
+        state.calib.refresh()          # applier output unit follows the config
     return Config.all()
 
 
+def _cal_ctx() -> tuple[str, str | None, str | None]:
+    """(device, serial, fingerprint) of the active device."""
+    return (_active_device_name(),
+            getattr(state.acquisition, "serial", None),
+            state.calib.fingerprint)
+
+
+def _cal_nl() -> bool | None:
+    """Detector-linearisation state of the active device (None = n/a)."""
+    return calprof.device_nl_active(state.acquisition)
+
+
+def _profile_item(p: dict, dev: str, serial, fp) -> dict:
+    st = calprof.profile_status(p, dev, serial, fp, _cal_nl())
+    return {"value": p["id"], "label": calprof.profile_label(p),
+            "state": st["state"], "message": st["message"],
+            "type": p.get("type"), "version": p.get("version"),
+            "created": p.get("created"),
+            "valid_range_nm": p.get("valid_range_nm"),
+            "unit": p.get("unit")}
+
+
+def _calibration_status_payload() -> dict:
+    st = _json_safe(dict(state.calib.status))
+    st["display_unit"] = state.current_unit
+    return st
+
+
 @app.get("/api/calibration/profiles")
-async def api_calibration_profiles():
-    """Response-correction options for the active device: the selectable items
-    (None / Device default if the driver ships a table / saved profiles) and the
-    current selection. Mirrors the desktop dropdown."""
-    dev = _active_device_name()
+async def api_calibration_profiles(include_old: int = 0):
+    """Response-correction options for the active device: None / Device default
+    (if the driver ships a table) / saved profiles of THIS unit, plus the
+    profiles of other units of the same backend (copy candidates)."""
+    dev, serial, fp = _cal_ctx()
     has_default = getattr(state.acquisition, "RESPONSE_TABLE", None) is not None
-    return {
-        "device":    dev,
-        "selection": calprof.active_selection(dev),
-        "items":     calprof.selection_items(dev, has_default),
-        "profiles":  calprof.list_profiles(dev),
-    }
+    items = [{"value": calprof.SEL_NONE, "label": calprof.SEL_NONE,
+              "state": "builtin", "message": "", "type": None, "version": None,
+              "created": None, "valid_range_nm": None, "unit": "counts"}]
+    if has_default:
+        items.append({"value": calprof.SEL_DEVICE_DEFAULT,
+                      "label": calprof.SEL_DEVICE_DEFAULT, "state": "builtin",
+                      "message": "", "type": None, "version": None,
+                      "created": None, "valid_range_nm": None, "unit": None})
+    profs = (calprof.profiles_for_device(dev, serial, fp, nl_active=_cal_nl(),
+                                         include_old=bool(include_old))
+             if dev else [])
+    items += [_profile_item(p, dev, serial, fp) for p in profs]
+    others = calprof.profiles_other_units(dev, serial) if dev else []
+    sel = calprof.active_selection(dev) if dev else calprof.SEL_NONE
+    return _json_safe({
+        "device": dev, "serial": serial, "fingerprint": fp,
+        "selection": sel,
+        "selection_label": calprof.selection_label(sel),
+        "status": _calibration_status_payload(),
+        "items": items,
+        "profiles": calprof.list_profiles(dev) if dev else [],
+        "other_units": [{"id": p["id"], "label": calprof.profile_label(p),
+                         "serial": (p.get("device") or {}).get("serial")}
+                        for p in others],
+    })
+
+
+@app.get("/api/calibration/status")
+async def api_calibration_status():
+    return _json_safe(_calibration_status_payload())
 
 
 @app.post("/api/calibration/select")
 async def api_calibration_select(payload: dict):
-    """Set the active response-correction selection for the current device and
-    rebuild the live gain. selection in {None, Device default, <profile name>}."""
-    dev = _active_device_name()
+    """Set the active selection (None / Device default / profile id). A profile
+    whose wavelength fingerprint or detector-linearisation state no longer
+    matches needs confirm:true (HTTP 409 otherwise)."""
+    dev, serial, fp = _cal_ctx()
+    nl = _cal_nl()
     if not dev:
         raise HTTPException(400, "No device selected.")
     selection = str(payload.get("selection", calprof.SEL_NONE))
-    valid = calprof.selection_items(
-        dev, getattr(state.acquisition, "RESPONSE_TABLE", None) is not None)
+    has_default = getattr(state.acquisition, "RESPONSE_TABLE", None) is not None
+    valid = calprof.selection_items(dev, has_default, serial, fp, include_old=True,
+                                    nl_active=nl)
     if selection not in valid:
         raise HTTPException(400, f"Unknown selection '{selection}'.")
+    p = calprof.get_profile_by_id(selection)
+    if p is not None:
+        st = calprof.profile_status(p, dev, serial, fp, nl)
+        if (st["state"] in calprof.CONFIRM_STATES
+                and not calprof.fingerprint_override_ok(selection, fp, nl)):
+            if not payload.get("confirm"):
+                return JSONResponse(status_code=409, content={
+                    "needs_confirmation": True, "state": st["state"],
+                    "message": st["message"]})
+            if fp or nl is not None:
+                calprof.confirm_fingerprint_override(selection, fp, nl)
     calprof.set_active_selection(dev, selection)
     _rebuild_response_gain()
-    return {"ok": True, "device": dev, "selection": selection}
+    return _json_safe({"ok": True, "device": dev, "selection": selection,
+                       "status": _calibration_status_payload()})
 
 
 @app.post("/api/calibration/profile/delete")
 async def api_calibration_profile_delete(payload: dict):
-    """Delete a saved response-correction profile for the current device. If it
-    was active, fall back to None and rebuild the gain."""
+    """Delete a profile by id (or, legacy, by name). If it was active, fall back
+    to None and rebuild the gain."""
     dev = _active_device_name()
+    pid = str(payload.get("id", "")).strip()
     name = str(payload.get("name", "")).strip()
-    if not name:
-        raise HTTPException(400, "Profile name required.")
-    deleted = calprof.delete_profile(dev, name)
-    if calprof.active_selection(dev) == name:
+    if not pid and not name:
+        raise HTTPException(400, "Profile id required.")
+    stored = (Config.get("response_correction_active", {}) or {}).get(dev)
+    if pid:
+        deleted = calprof.delete_profile_id(pid)
+        was_active = pid in (stored, calprof.active_selection(dev))
+    else:
+        was_active = name == stored or calprof.active_selection(dev) == name
+        deleted = calprof.delete_profile(dev, name)
+    if dev and was_active:
         calprof.set_active_selection(dev, calprof.SEL_NONE)
     _rebuild_response_gain()
-    return {"ok": bool(deleted), "device": dev,
-            "selection": calprof.active_selection(dev)}
+    return _json_safe({"ok": bool(deleted), "device": dev,
+                       "selection": calprof.active_selection(dev),
+                       "status": _calibration_status_payload()})
+
+
+@app.post("/api/calibration/profile/copy")
+async def api_calibration_profile_copy(payload: dict):
+    dev, serial, _fp = _cal_ctx()
+    pid = str(payload.get("id", "")).strip()
+    if not dev or not pid:
+        raise HTTPException(400, "Device and profile id required.")
+    try:
+        cp = calprof.copy_profile_to_device(pid, serial, dev)
+    except KeyError:
+        raise HTTPException(404, f"Profile '{pid}' not found.")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "id": cp["id"], "label": calprof.profile_label(cp)}
+
+
+@app.get("/api/calibration/profile/export")
+async def api_calibration_profile_export(id: str):
+    p = calprof.get_profile_by_id(id)
+    if p is None:
+        raise HTTPException(404, f"Profile '{id}' not found.")
+    body = json.dumps(p, indent=1, allow_nan=False)
+    return Response(
+        content=body, media_type="application/json",
+        headers={"Content-Disposition":
+                 f'attachment; filename="calibration_profile_{id}.json"'})
+
+
+@app.post("/api/calibration/profile/import")
+async def api_calibration_profile_import(payload: dict):
+    """Body = content of a profile file (schema 2, or a schema-1 entry)."""
+    import tempfile
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as f:
+            json.dump(payload, f)
+            tmp = f.name
+        p = calprof.import_profile(tmp)
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise HTTPException(400, f"Import failed: {e}")
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return {"ok": True, "id": p["id"], "label": calprof.profile_label(p)}
+
+
+@app.get("/api/calibration/references")
+async def api_calibration_references():
+    import reference_sources as rs
+    out = [{"id": s.id, "name": s.name, "serial": s.serial, "unit": s.unit,
+            "valid_min_nm": s.valid_min_nm, "valid_max_nm": s.valid_max_nm,
+            "input_optic": s.input_optic, "builtin": bool(s.builtin)}
+           for s in rs.ReferenceLibrary().list()]
+    return _json_safe(out)
+
+
+@app.get("/api/calibration/darks")
+async def api_calibration_darks():
+    import calibration_capture as cc
+    dev, serial, _fp = _cal_ctx()
+    return _json_safe(cc.list_darks(dev, serial) if dev else [])
 
 
 @app.get("/api/heatmap")
@@ -917,9 +1087,23 @@ async def api_export_csv(tab: str = "spectrum"):
         buf.write(f"# Dark correction;{('ON' if Config.get('dark_correction') else 'OFF')}\n")
         buf.write(f"# Dark mode;{Config.get('dark_mode')}\n")
         buf.write(f"# Response compensation;{('ON' if Config.get('spectral_response_compensation') else 'OFF')}\n")
-        buf.write("Pixel_ID;Wavelength_nm;ADC_Counts\n")
+        unit = state.current_unit or "counts"
+        if state.calib.active_v2:
+            st = state.calib.status
+            buf.write(f"# Unit;{unit}\n")
+            buf.write(f"# Calibration profile;{st.get('label', '')}\n")
+            vr = st.get("valid_range_nm")
+            if vr:
+                buf.write(f"# Valid range (nm);{float(vr[0]):.1f}–{float(vr[1]):.1f}\n")
+        col = "ADC_Counts" if unit == "counts" else f"Value_{unit}"
+        buf.write(f"Pixel_ID;Wavelength_nm;{col}\n")
         for i, (wl, v) in enumerate(zip(state.wavelength_array, state.current_pixels)):
-            buf.write(f"{i};{wl:.2f};{v:.2f}\n")
+            if not np.isfinite(v):
+                buf.write(f"{i};{wl:.2f};\n")
+            elif unit == "counts":
+                buf.write(f"{i};{wl:.2f};{v:.2f}\n")
+            else:
+                buf.write(f"{i};{wl:.2f};{v:.6g}\n")
         name = f"spectrum_{ts}.csv"
     return Response(
         content=buf.getvalue(),
@@ -1014,6 +1198,8 @@ async def ws_stream(ws: WebSocket):
                 fusion_keys = {k: payload[k] for k in payload if k in fusion.DEFAULTS}
                 if fusion_keys:
                     state.fusion.configure(**fusion_keys)
+                if "irradiance_unit" in payload:
+                    state.calib.refresh()
             elif t == "pause":
                 if state.acquisition is not None:
                     state.acquisition.is_measurement_paused = bool(data.get("paused", False))

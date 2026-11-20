@@ -185,6 +185,8 @@ the shared report renderers.}
 \file{spectrometer\_core.py} & App-wide constants, the reference library, context help. \emph{No device code.}\\
 \file{calibration\_utils.py} & Generic polynomial pixel$\to\lambda$ mapping, line fitting, response gain.\\
 \file{calibration\_profiles.py} & Calibration store: line lists, sub-pixel peak find, response-table computation, profile registry + per-device selection.\\
+\file{calibration\_capture.py}, \file{calibration\_workflow.py}, \file{calibration\_report.py} & Spectral calibration: counts/s capture with per-pixel dark, 8-step workflow, PDF/CSV protocol (\S\ref{sec:speccal}).\\
+\file{reference\_sources.py} & Lamp library, \file{.lmp}/CSV parser, PCHIP, units.\\
 \file{device\_constants.py}  & Device-agnostic timing and auto-exposure ratios; global integration backstops.\\
 \file{device\_manager.py}    & \code{BaseSpectrometer} abstract base class and the backend registry.\\
 \file{\_device\_pasco.py}    & PASCO: WinUSB ctypes layer + acquisition \code{QThread}.\\
@@ -393,6 +395,8 @@ Unlike wavelength, this is genuinely \emph{per fibre / optical setup} (it folds 
 detector QE, grating efficiency, optics \emph{and} fibre transmission), so it is
 stored as \emph{named, selectable profiles} per device.
 
+\emph{Note: the generic relative\,/\,absolute calibration with lamp library, versions and protocol is described in \S\ref{sec:speccal}; the wizard below is the legacy route (tab ``Response (legacy)'').}
+
 \paragraph{The response wizard (desktop).} \emph{Calibration\ldots\ $\to$
 Response} measures a SMOOTH BROADBAND lamp (halogen, white LED --- never a line
 lamp) on the device under test and divides it by a reference of the \emph{same}
@@ -450,11 +454,273 @@ response-\emph{un}corrected spectrum --- a calibration must measure the
 instrument, not a previous correction.
 
 \subsection{Absolute radiometric calibration}
+\emph{Superseded by the spectral absolute calibration (\S\ref{sec:speccal}); the scalar below is used only without an absolute profile.}\\
 \key{radiometric\_calibration\_factor} is the scale (W/m\textsuperscript{2}/nm per
 ADC count) used to turn counts into absolute irradiance and thus lux / foot-candle
 readings. $0.0$ means \emph{uncalibrated} --- lux displays show ``\,--\,''. Derive
 it by measuring a lamp of known spectral irradiance at a known distance and fitting
 the scale factor.
+
+% =====================================================================
+\section{Spectral calibration (relative \& absolute)}\label{sec:speccal}
+This chapter describes the generic calibration process that is identical for
+every back-end (PASCO PS-2600A, Ocean HDX, ASEQ LR-2T, Demo) and for any input
+optic. The computation lives in device-agnostic modules
+(\file{calibration\_profiles.py}, \file{calibration\_capture.py},
+\file{calibration\_workflow.py}, \file{reference\_sources.py},
+\file{calibration\_report.py}, \file{processing.py}); there are no device
+special cases outside the drivers. Without an active profile the behaviour is
+unchanged (\S\ref{sec:speccal-profiles}).
+
+\subsection{Terms}
+\begin{longtable}{@{}p{3.6cm}p{10.6cm}@{}}
+\toprule \textbf{Term} & \textbf{Meaning}\\ \midrule\endhead
+Wavelength calibration & Pixel $\to\lambda$ polynomial of the \emph{device}
+  (\S\ref{sec:wl-wizard}), unit nm.\\
+Relative calibration & Sensitivity $S(\lambda)$, peak $=1$. Output is
+  proportional to spectral irradiance (unit: \emph{relative}). Valid for device
+  + optics configuration.\\
+Absolute calibration & Factor $K(\lambda)$; output is spectral irradiance in
+  $\mu$W/(cm$^2$\,nm) (\code{uW/cm2/nm}) or W/(m$^2$\,nm). Needs
+  an input optic with a defined entrance area (CC or sphere).\\
+Optics configuration & Freely named combination of fibre, input optic and
+  connector. Any configuration can be recalibrated at any time; every run
+  creates a new profile version.\\
+Input optic & \code{CC} (cosine corrector), \code{bare} (bare fibre) or
+  \code{sphere}. \code{bare} is \emph{always relative}.\\
+Reference source & A calibrated lamp (e.g.\ HAL-CAL) stored as \emph{data} in the
+  lamp library: name, serial number, unit, lower/upper validity limit,
+  intended input optic.\\
+Profile & One stored calibration result (schema~2): type, device, optics,
+  reference, table, valid range, checks, timestamp.\\
+Version & Counter per series (device, optics, type). The newest \emph{valid}
+  version is the default; older versions remain available.\\
+Fingerprint & Hash of the wavelength axis stored in each profile; $S$ and $K$
+  contain the pixel width in nm, so a changed axis invalidates them.\\
+Serial binding & A profile is bound to the serial number of the unit it was
+  made on. A second unit of the same type does not list it.\\
+\bottomrule
+\end{longtable}
+
+\subsection{Physics and formulas}
+All calibration and measurement data are referred to the count rate
+\[
+  C(\lambda) = \frac{\mathrm{raw}_{\mathrm{lin}}(\lambda) - \mathrm{dark}(\lambda)}{t_{\mathrm{int}}}
+  \quad[\mathrm{counts/s}] ,
+\]
+with the linearised raw data, a \emph{per-pixel} dark spectrum taken at the same
+integration time, and the mean over $N$ frames. $S$ and $K$ are thereby
+independent of integration time and averaging. Negative values are not clipped
+in the calibration path.
+
+\paragraph{Relative.}
+$S(\lambda) = C_{\mathrm{cal}}(\lambda)/E_{\mathrm{ref}}(\lambda)$, normalised to
+a peak of 1 (after an optional small moving average, \key{calibration\_smooth\_px}).
+Correction: $C/S$.
+
+\paragraph{Absolute.}
+$K(\lambda) = E_{\mathrm{ref}}(\lambda)/C_{\mathrm{cal}}(\lambda)$; measurement
+$E(\lambda) = C(\lambda)\cdot K(\lambda)$. The relative profile derived from an
+absolute one ($S\propto 1/K$, peak 1) is saved as well.
+
+\paragraph{Reference and units.}
+The reference table is interpolated onto the pixel axis by monotone PCHIP
+(no overshoot). Units: $1\,\mu\mathrm{W}/(\mathrm{cm}^2\,\mathrm{nm}) =
+0.01\,\mathrm{W}/(\mathrm{m}^2\,\mathrm{nm})$; lamps may also be delivered in
+mW/(m$^2$\,nm). Illuminance (lux) is computed directly from $E(\lambda)$
+(\S\ref{sec:speccal-apply}).
+
+\subsection{Valid range and masking}
+The valid range is the \emph{intersection} of
+\begin{itemize}
+  \item the device display limits (\code{spec\_range\_nm()} /
+        \key{<device>\_spec\_min\_nm}, \key{\_max\_nm}),
+  \item the defined range of the reference source (lower limit configurable per
+        source; HAL-CAL: 380\nm),
+  \item pixels with sufficient signal: $C_{\mathrm{cal}} > k\cdot\sigma_{\mathrm{dark}}$
+        (\key{calibration\_snr\_k}, default 10),
+\end{itemize}
+and excludes saturated pixels (any frame at or above the backend's ADC full scale)
+and pixels whose gain would exceed \key{calibration\_max\_gain}
+($S<1/\mathrm{max\_gain}$). Outside the valid range the output is \emph{masked}
+(NaN, drawn grey in the plot); it is never continued with gain~1. A calibration
+is refused if the calibration spectrum contains saturated pixels or if no valid
+pixel remains.
+
+\subsection{Procedure}\label{sec:speccal-wizard}
+\paragraph{Preparation (identical for every device and optic).}
+(1)~Calibrate the wavelength axis with line lamps (e.g.\ Cd and Hg) over the whole
+display range; do not change it afterwards, otherwise recalibrate the
+response. (2)~Define and name the optics configuration; do not disconnect fibres
+or connectors until the series is finished. (3)~Warm up device and lamp.
+(4)~\emph{Absolute:} mount the input optic with a defined area (CC) in the
+lamp setup for which the lamp's calibration is valid. \emph{Relative, bare
+fibre:} centre the fibre reproducibly in the lamp port (adapter sleeve) or derive
+the profile (\S\ref{sec:speccal-derive}).
+
+\paragraph{Wizard} (\emph{Calibration\ldots\ $\to$ Spectral calibration}, fixed
+sequence of 8 steps):
+\begin{enumerate}
+  \item Choose device, optics configuration (new or existing), input optic,
+        reference source from the library and type (relative\,/\,absolute;
+        absolute only for input $\neq$ bare).
+  \item Check that a wavelength calibration exists (fingerprint); warnings for
+        the factory linear axis or for changes since the last run.
+  \item Set the integration time or use auto-exposure to the target band
+        (\key{calibration\_target\_frac\_lo/hi}, default 70--85\,\% of full scale);
+        it is then fixed.
+  \item Capture the dark spectra. \emph{Both} dark spectra ($t_{\mathrm{int}}$
+        and $\approx t_{\mathrm{int}}/2$ for the cross check) are taken in
+        \emph{one} covering step at the start. Devices without a shutter ask you
+        to cover the input once and to uncover it afterwards.
+  \item Capture the calibration spectrum; the automatic \emph{stability check}
+        follows (second capture after \key{calibration\_stability\_delay\_s}).
+  \item Automatic \emph{integration-time cross check}: capture at
+        $\approx t_{\mathrm{int}}/2$ with its own dark; $C(\lambda)$ must agree.
+  \item Compute $S$ or $K$, valid range, gain span; display $C_{\mathrm{cal}}$,
+        $E_{\mathrm{ref}}$, result and warnings.
+  \item Save as a new profile version (absolute: plus the derived relative
+        profile) and create the calibration protocol.
+\end{enumerate}
+\paragraph{Check criterion.} For both checks the ratio of the two count rates is
+smoothed over 21 pixels (spectrally smooth drift is real, per-pixel shot noise is
+not). Evaluated over valid pixels with $C>10\,\%$ of the maximum, the
+\emph{95th percentile of the absolute deviation} must stay below the threshold:
+\key{calibration\_stability\_threshold\_pct} (default 1\,\%) and
+\key{calibration\_itime\_threshold\_pct} (default 2\,\%). A failed check produces
+a warning, not a block; it is recorded in the profile and the protocol. If
+$t_{\mathrm{int}}$ cannot be halved (device minimum) the cross check is skipped
+and noted.
+
+\subsection{Deriving one optic from another}\label{sec:speccal-derive}
+The mode \emph{Derive from other optics} (tab \emph{Spectral calibration})
+creates a profile for a new optics configuration (e.g.\ bare fibre) from a known
+one (e.g.\ CC) via two measurements of the \emph{same diffuse, extended source}:
+\[
+  S_{\mathrm{new}} = S_{\mathrm{known}}\cdot\frac{C_{\mathrm{new}}}{C_{\mathrm{known}}} .
+\]
+The result is always relative. The valid range is the overlap of the known
+profile's range with the pixels of sufficient signal in both captures.
+
+\subsection{Lamp library}
+Tab \emph{Lamps}: import Avantes \file{.lmp} (tab/space separated, decimal comma
+or point, CRLF, optional index column) or CSV; per lamp enter name, serial number,
+unit, lower/upper validity limit (HAL-CAL: 380\nm) and intended input optic. The
+library is stored in \key{reference\_sources\_file}. A synthetic demo lamp is
+built in.
+
+\subsection{Profile management}\label{sec:speccal-profiles}
+The tab \emph{Profiles} lists all versions with their status; it provides
+activate, export\,/\,import (one profile as a file), delete and
+\emph{Copy profile to this device\ldots}.
+\begin{itemize}
+  \item \textbf{Versions:} each run adds a version; the newest \emph{valid} one is
+        the default, older ones stay available.
+  \item \textbf{Serial binding:} profiles of another unit of the same type
+        (e.g.\ a second HDX) are not shown. Copying is deliberate and recorded in
+        the profile (\code{copied\_from}). A back-end that reports no serial
+        (PASCO) produces unbound profiles.
+  \item \textbf{Wavelength changed:} if the current fingerprint differs from the
+        stored one the profile is marked \emph{``Wavelength changed --- recalibrate''}
+        and applied only after explicit confirmation.
+  \item \textbf{Linearisation changed:} each profile records whether the
+        detector nonlinearity correction was active
+        (\code{acquisition.nl\_correction}; Ocean HDX:
+        \key{ocean\_nonlinearity\_correction}). $S$ and $K$ are per-pixel factors
+        measured at one signal level; only the linearisation makes them valid at
+        every other level. If the current state differs, the profile is marked
+        (state \code{nl\_changed}) and applied only after confirmation. The
+        calibration does \emph{not} compensate a missing linearisation. Devices
+        without a linearisation (PASCO, LR-2T, Demo) are not checked.
+        A confirmation is valid only for exactly the current combination of
+        wavelength fingerprint and linearisation state.
+  \item \textbf{Migration:} profiles of the previous format become
+        \code{relative}, optics \code{unknown}, unbound, and keep the old gain
+        rule ($\min(1/S,10)$, gain~1 outside), so their result is unchanged.
+        Before the first write in the new schema a backup
+        \file{calibration\_profiles.v1.bak.json} is kept. The old way
+        ``reference = second measurement'' remains in the tab \emph{Response
+        (legacy)}.
+\end{itemize}
+
+\subsection{Measuring with a profile}\label{sec:speccal-apply}
+Main window and web client run \code{processing.process\_frame()} with identical
+inputs (\code{pipeline\_kwargs}), hence identical values. Order:
+\begin{enumerate}
+  \item subtract a \emph{per-pixel} dark --- \emph{mandatory} with a profile,
+        independent of the \emph{Dark correction} switch and of \key{dark\_mode},
+        not clipped. Source, in this order: the stored dark of this unit at
+        exactly the current $t_{\mathrm{int}}$; otherwise the per-pixel model
+        $D(t) = b + r\,t$ fitted over all stored darks of the unit (the wizard
+        always stores $t_{\mathrm{int}}$ and $t_{\mathrm{int}}/2$; more via
+        \emph{Processing $\to$ Stored dark $\to$ Capture dark}, input covered).
+        Only if the unit has no stored dark at all, the scalar
+        optical-black/parametric estimate is used and the status line shows a
+        warning (values not reliable --- the scalar estimate biases the weak
+        blue end by tens of percent). The status line names the dark source.
+        Without a profile, \emph{Stored dark (per pixel)} uses the same sources;
+  \item divide by $t_{\mathrm{int}}$ ($\to$ counts/s);
+  \item despeckle and spatial smoothing (if enabled);
+  \item multiply by $1/S$ or $K$ (unit factor applied); NaN outside the valid range.
+\end{enumerate}
+The legacy response gain is not applied in this case. \emph{Y-axis and exports}
+carry the unit: counts, counts/s (\key{display\_unit}), relative,
+\code{uW/cm2/nm} or \code{W/m2/nm} (\key{irradiance\_unit}); masked ranges are
+grey in the plot and empty in CSV. Profile selection: the \emph{Response
+correction} drop-down (name $\cdot$ type $\cdot$ version $\cdot$ date) and the
+\emph{Calibration status} line show the active profile, its valid range and
+warnings. With an absolute profile lux is computed directly from $E(\lambda)$
+and \key{radiometric\_calibration\_factor} is ignored; with a relative profile
+colorimetry uses the corrected distribution. The web client offers the same
+profiles, units and management (\code{/api/calibration/*}); it does
+\emph{not} capture calibrations.
+
+\subsection{Calibration protocol}
+Each run produces a protocol as \textbf{PDF} and \textbf{CSV}
+(\file{calibration\_report.py}): date/time, device and serial, optics
+configuration, reference source, $t_{\mathrm{int}}$, $N$, valid range, results of
+the stability and cross check (value, threshold, pass), warnings, plots.
+The CSV contains per pixel $\lambda$, $C_{\mathrm{cal}}$, $E_{\mathrm{ref}}$, $S$,
+$K$, validity, repeat and half-$t_{\mathrm{int}}$ rates. Default file name:
+\file{calib\_device\_serial\_optics\_type\_timestamp}.
+
+\subsection{Configuration keys}
+\begin{longtable}{@{}p{5.6cm}p{2.3cm}p{6.3cm}@{}}
+\toprule \textbf{Key} & \textbf{Default} & \textbf{Meaning}\\ \midrule\endhead
+\key{calibration\_profiles\_file} & \file{calibration\_profiles.json} & Profile store (schema 2).\\
+\key{reference\_sources\_file} & \file{reference\_sources.json} & Lamp library.\\
+\key{dark\_spectra\_file} & \file{dark\_spectra.json} & Per-pixel darks per unit and $t_{\mathrm{int}}$.\\
+\key{calibration\_capture\_frames} & 16 & Frames averaged per capture.\\
+\key{calibration\_snr\_k} & 10 & SNR criterion $C>k\sigma_{\mathrm{dark}}$.\\
+\key{calibration\_max\_gain} & 50 & Mask pixels with $S<1/\mathrm{max\_gain}$.\\
+\key{calibration\_smooth\_px} & 5 & Moving average of $S$/$K$ (0/1 = off).\\
+\key{calibration\_target\_frac\_lo/hi} & 0.70 / 0.85 & Auto-exposure target (fraction of full scale).\\
+\key{calibration\_stability\_delay\_s} & 5.0 & Delay of the second capture.\\
+\key{calibration\_stability\_threshold\_pct} & 1.0 & Stability limit (p95, \%).\\
+\key{calibration\_itime\_threshold\_pct} & 2.0 & Cross-check limit (p95, \%).\\
+\key{calibration\_fingerprint\_overrides} & \code{\{\}} & Confirmed applications despite changed wavelength calibration or linearisation.\\
+\key{display\_unit} & counts & \code{counts} or \code{counts\_per\_s} without v2 profile.\\
+\key{irradiance\_unit} & uW/cm2/nm & or \code{W/m2/nm} for absolute profiles.\\
+\key{dark\_mode} & --- & Includes \code{stored} (Stored dark, per pixel).\\
+\key{demo\_serial} & DEMO-0001 & Virtual serial (emulates a second unit).\\
+\key{demo\_sensitivity} & none & \code{synthetic}: known $S(\lambda)$ for calibration tests.\\
+\bottomrule
+\end{longtable}
+
+\subsection{Limits}
+\begin{itemize}
+  \item Below the validity limit of the reference source (HAL-CAL: about 380\nm)
+        there is no calibration; on the HDX (display from 350\nm) the range
+        350--380\nm stays masked.
+  \item Stray light from the strong red/NIR part of a halogen lamp raises the
+        uncertainty in the blue.
+  \item Bare fibre: for spatially or angularly inhomogeneous sources the spectrum
+        depends on alignment (not a calibration error).
+  \item Absolute only with a defined entrance area; no luminous or radiant flux
+        (integrating sphere) and no radiance.
+  \item $S$ and $K$ are valid only for the wavelength calibration of their
+        fingerprint and for the optics configuration and unit they were made on.
+\end{itemize}
 
 % =====================================================================
 \section{Signal-processing pipeline}\label{sec:pipeline}

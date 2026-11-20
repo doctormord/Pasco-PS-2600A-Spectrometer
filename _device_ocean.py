@@ -317,6 +317,7 @@ class OceanHDX(BaseSpectrometer):
     WL_MIN_NM            = 346.0
     WL_MAX_NM            = 929.0
     SPEC_CONFIG_PREFIX   = "ocean"      # ocean_spec_min_nm / ocean_spec_max_nm
+    ADC_FULL_SCALE       = 65535.0
     SUPPORTS_OB          = False          # no optical-black pixels in raw mode
     RESPONSE_TABLE       = None           # filled from config if a table is provided
     SUPPORTS_FAST_PREVIEW = True          # FP: short exposure (trigger mode 0) + scaling
@@ -524,6 +525,7 @@ class OceanHDX(BaseSpectrometer):
 
         # ── Read calibration from the device ─────────────────────────────────
         self._read_serial()
+        self.serial = self._serial if self._serial not in ("", "?") else None
         self._read_wavelength_coeffs()
         self._read_nonlinearity_coeffs()
 
@@ -740,6 +742,15 @@ class OceanHDX(BaseSpectrometer):
         return int(max(lo, min(hi, us)))
 
     # ── GET: identity & calibration ────────────────────────────────────────
+
+    @property
+    def adc_saturation_level(self) -> float:
+        return float(self._adc_saturation)
+
+    @property
+    def nl_correction_active(self) -> bool | None:
+        # linearisation is applied only if enabled AND coefficients were read
+        return bool(self._nl_enabled and getattr(self, "_nl_coeffs", None))
 
     def _read_serial(self) -> None:
         try:
