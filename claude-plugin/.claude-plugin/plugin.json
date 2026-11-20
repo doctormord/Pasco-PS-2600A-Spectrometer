@@ -1,0 +1,8 @@
+{
+  "name": "ps2600-spectrometer",
+  "version": "1.0.0",
+  "description": "Measure, calibrate and report with the PS-2600A spectrometer application: MCP tools over its REST API, plus agents and skills for measurement runs, calibration and test reports.",
+  "author": {"name": "PS-2600A project"},
+  "license": "LGPL-2.1",
+  "keywords": ["spectrometer", "spectroscopy", "colorimetry", "calibration", "pasco", "ps-2600a", "mcp"]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "ps2600-local",
+  "owner": {"name": "PS-2600A project"},
+  "metadata": {"description": "Local marketplace of the PS-2600A spectrometer repository."},
+  "plugins": [
+    {
+      "name": "ps2600-spectrometer",
+      "source": "./claude-plugin",
+      "description": "Measure, calibrate and report with the PS-2600A spectrometer application (MCP tools, agents, skills)."
+    }
+  ]
+}

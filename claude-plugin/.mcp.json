@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "spectrometer": {
+      "command": "${SPECTRO_PYTHON:-python}",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/run_mcp_server.py"],
+      "env": {
+        "SPECTRO_API_URL": "${SPECTRO_API_URL:-http://127.0.0.1:8000}",
+        "SPECTRO_API_TOKEN": "${SPECTRO_API_TOKEN:-}",
+        "SPECTRO_CLIENT_ID": "${SPECTRO_CLIENT_ID:-claude}",
+        "SPECTRO_DATA_DIR": "${SPECTRO_DATA_DIR:-}"
+      }
+    }
+  }
+}

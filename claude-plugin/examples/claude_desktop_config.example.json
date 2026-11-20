@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ps2600-spectrometer": {
+      "command": "python",
+      "args": ["C:\\path\\to\\Pasco-PS-2600A-Spectrometer\\claude-plugin\\scripts\\run_mcp_server.py"],
+      "env": {
+        "SPECTRO_API_URL": "http://127.0.0.1:8000",
+        "SPECTRO_API_TOKEN": "<token from the app's Remote access panel>",
+        "SPECTRO_CLIENT_ID": "claude-desktop",
+        "SPECTRO_DATA_DIR": "C:\\Users\\<you>\\Documents\\ps2600-mcp"
+      }
+    }
+  }
+}
