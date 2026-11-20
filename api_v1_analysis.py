@@ -229,7 +229,7 @@ def register(router: APIRouter, ctx: V1Context) -> None:
             raise ApiError(503, "unavailable", "matplotlib is not installed on the server.")
         return buf.getvalue(), fmt, meta, wl
 
-    @router.post("/reports", tags=["reports"],
+    @router.post("/reports", tags=["reports"], dependencies=ctx.auth,
                  summary="Colour / filter / measurement report as file download "
                          "(save=true: store in the export folder, answer JSON)")
     async def reports(body: M.ReportRequest, request: Request):

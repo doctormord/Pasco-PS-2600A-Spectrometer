@@ -149,6 +149,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def headless_main(argv: list[str] | None = None) -> int:
     """Engine + API without any Qt import."""
     args = build_arg_parser().parse_args(argv)
+    # Redirected stdout on Windows may be cp1252: never crash on the banner.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     import device_manager as dm
     from engine import Engine
 

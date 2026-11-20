@@ -123,16 +123,20 @@ hardware at all (the built-in \emph{Demo (virtual)} device). Every USB protocol
 was reverse-engineered from scratch; there are no vendor SDKs in the loop.
 
 \medskip
-There are two front-ends that share one science core:
+The front-ends share one Qt-free engine (\S\ref{sec:architecture}):
 \begin{itemize}
   \item \textbf{Desktop} --- \file{PS-2600A\_Pro.py}, a PyQt6 + pyqtgraph GUI.
-  \item \textbf{Web} --- \file{web\_server.py}, a FastAPI + WebSocket server with a
-        browser client (\file{index.html} / \file{app.js} / \file{styles.css}, a
-        uPlot scope and canvas-drawn heatmap\slash CIE\slash radar).
+  \item \textbf{Web} --- a FastAPI + WebSocket server with a browser client
+        (\file{static/index.html} / \file{app.js} / \file{styles.css}, a uPlot
+        scope and canvas-drawn heatmap\slash CIE\slash radar). It is started from the
+        desktop app (\emph{Remote access}) or headless (\S\ref{sec:remote}).
+  \item \textbf{REST API and MCP server} --- a versioned \code{/api/v1} for
+        automated measurements, and an MCP server so that Claude can operate the
+        instrument (\S\ref{sec:api}, \S\ref{sec:mcp}).
 \end{itemize}
-Because both call the identical engines (\file{color\_science.py},
-\file{filter\_analysis.py}), a report exported from the web and one exported from
-the desktop contain the same values.
+Because all of them call the identical engines (\file{color\_science.py},
+\file{filter\_analysis.py}), a report exported from the web, the API or the
+desktop contains the same values.
 
 \medskip
 \textbf{What it does:} live scope with overlays (CSV background reference,
@@ -150,8 +154,9 @@ spatial smoothing; and (web) a CSV waterfall replay player.
 \subsection{How to run}
 \begin{quote}\ttfamily\small
 python PS-2600A\_Pro.py\hfill\# desktop GUI (entry point)\\
-python web\_server.py\hfill\# headless web server (FastAPI + WebSocket)\\
-set FP\_DEBUG=1 \&\& python web\_server.py\hfill\# Windows: per-frame fast-preview log
+python PS-2600A\_Pro.py --headless\hfill\# engine + web UI + REST API, no Qt\\
+python web\_server.py\hfill\# same, historic entry point (forwards)\\
+set FP\_DEBUG=1 \&\& python PS-2600A\_Pro.py\hfill\# Windows: per-frame fast-preview log
 \end{quote}
 
 \textbf{Dependencies} (\file{requirements.txt}): PyQt6, pyqtgraph, numpy, scipy.
@@ -169,11 +174,61 @@ The Demo device needs only numpy, so the application is always usable for
 learning and testing with no hardware attached.
 
 % =====================================================================
-\section{System architecture}
-\fig{fig_architecture.pdf}{0.92}{Module layout and the frame data path: a driver
-acquires and tags a frame, optional temporal smoothing and an emit timer feed a
-single \code{process\_new\_spectrum} entry point, which fans out to the tabs and
-the shared report renderers.}
+\section{System architecture}\label{sec:architecture}
+All front-ends --- the desktop GUI, the web interface, the REST API and the MCP
+server --- sit on one Qt-free core, the \code{Engine} (\file{engine.py}). The
+engine owns the spectrometer, the acquisition threads, temporal smoothing and
+frame averaging, the processing pipeline, the calibration runtime, the heatmap
+buffer, the throttled colour metrics, the control ownership and the job system.
+Front-ends never re-implement any of this; they only present it.
+
+{\footnotesize
+\begin{verbatim}
+          +--------------------------------------------+
+          | engine.py (no Qt)                          |
+          |  Engine: device, fusion, averaging,        |
+          |  processing, CalibrationRuntime, heatmap,  |
+          |  colour metrics, jobs, control ownership   |
+          +-----------+-----------------+--------------+
+              listener|                 |listener
+   +------------------+--+     +--------+----------------------+
+   | GUI (PyQt6)         |     | api.py (FastAPI, no Qt)       |
+   | Qt-signal bridge    |---->| create_app(engine, settings)  |
+   | starts/stops server |     | REST /api, /api/v1, WebSocket |
+   +---------------------+     +--------+----------------------+
+                                        | HTTP + token
+                               +--------+----------------------+
+                               | mcp_server/ (stdio)           |
+                               +--------+----------------------+
+                                        |
+                               Claude (plugin: agents, skills)
+\end{verbatim}}
+\captionof{figure}{Architecture. The engine publishes events to registered
+listeners; the GUI attaches a Qt-signal bridge, the API server schedules sends on
+its asyncio loop. Commands flow the other way, thread-safe and tagged with an
+owner.}
+
+\begin{itemize}
+  \item \textbf{Engine and listeners.} \code{engine.subscribe(callback)} delivers
+        \code{EngineEvent} objects (kinds: \code{frame}, \code{auto\_exposure},
+        \code{config}, \code{connection}, \code{calibration}, \code{axis},
+        \code{control}, \code{job}, \code{measurement}) from engine threads. Reads
+        return snapshots or copies.
+  \item \textbf{Qt-signal bridge.} The desktop window marshals every event to the GUI
+        thread with a signal; only pure display logic (freeze, diff, peak-hold,
+        persistence, overlays) stays in \file{gui\_dashboard.py}.
+  \item \textbf{API hub.} \file{api.py} (\code{create\_app(engine, settings)}) keeps
+        no device state. A hub forwards engine events to the WebSocket clients
+        with \code{asyncio.run\_coroutine\_threadsafe}.
+  \item \textbf{Control ownership.} The engine knows one controlling party at a
+        time: \code{local} (the desktop), \code{web} or \code{remote:<client>}. A
+        job or an explicit lease holds control; a conflicting steering command
+        gets HTTP~409, the desktop locks its controls (\S\ref{sec:remote}).
+  \item \textbf{Jobs.} Single measurement, series, dark capture, calibration run and
+        derivation run as jobs with an ID, status, progress and result. They
+        acquire raw frames through frame taps (\file{calibration\_capture.py}), not
+        through the display pipeline.
+\end{itemize}
 
 \subsection{Modules}
 \begin{longtable}{@{}p{4.3cm}p{10.5cm}@{}}
@@ -181,7 +236,16 @@ the shared report renderers.}
 \textbf{File} & \textbf{Responsibility}\\
 \midrule
 \endhead
-\file{PS-2600A\_Pro.py}    & Desktop entry point.\\
+\file{PS-2600A\_Pro.py}    & Entry point: desktop GUI, or \code{--headless} (engine + API, no Qt import).\\
+\file{engine.py}            & Shared Qt-free core: device life cycle, fusion, averaging, processing, calibration runtime, heatmap buffer, colour metrics, control ownership, job system.\\
+\file{api.py}               & FastAPI app over the engine (\code{create\_app}): legacy \code{/api}, \code{/ws/stream}, token check, error format.\\
+\file{api\_v1.py}, \file{api\_v1\_analysis.py}, \file{api\_v1\_calibration.py}, \file{api\_v1\_display.py}, \file{api\_v1\_wavelength.py} & The versioned \code{/api/v1} routes: core (system, device, measurement, jobs, data), analysis + reports, calibration, heatmap, wavelength calibration.\\
+\file{api\_models.py}       & Pydantic models and the error-response schema of \code{/api/v1}.\\
+\file{server\_runner.py}    & \code{ServerRunner} (uvicorn in a thread with clean start/stop) and the headless entry point.\\
+\file{gui\_remote.py}       & Desktop ``Remote access'' panel (switch, port, access, token, control, cancel).\\
+\file{wavelength\_calibration.py} & Qt-free line-lamp wavelength calibration (peak match, fit, save); used by the web UI via \code{/api/v1/wavelength}.\\
+\file{mcp\_server/}         & MCP server (stdio) over the REST API; no engine or Qt import (\S\ref{sec:mcp}).\\
+\file{claude-plugin/}       & Claude Code plugin: MCP configuration, agents, skills.\\
 \file{spectrometer\_core.py} & App-wide constants, the reference library, context help. \emph{No device code.}\\
 \file{calibration\_utils.py} & Generic polynomial pixel$\to\lambda$ mapping, line fitting, response gain.\\
 \file{calibration\_profiles.py} & Calibration store: line lists, sub-pixel peak find, response-table computation, profile registry + per-device selection.\\
@@ -204,8 +268,9 @@ the shared report renderers.}
 \file{gui\_calibration.py} & Calibration dialog (desktop): wavelength + response wizards.\\
 \file{gui\_theme.py}        & Palettes, stylesheets, custom widgets.\\
 \file{app\_config.py}       & JSON config singleton (\code{Config.get/set}) and \code{DEFAULT\_CONFIG}.\\
-\file{web\_server.py}       & FastAPI + WebSocket server + report/TM-30 endpoints.\\
-\file{index.html / app.js / styles.css} & Web front-end.\\
+\file{web\_server.py}       & Compatibility entry: module-level \code{app}/\code{engine} for old scripts; forwards to the same server.\\
+\file{static/index.html}, \file{app.js}, \file{styles.css} & Web front-end.\\
+\file{examples/api\_client.py} & REST example client (\code{httpx} only).\\
 \file{reference\_spectra.csv} & The reference-spectrum library (semicolon-delimited).\\
 \bottomrule
 \end{longtable}
@@ -215,6 +280,17 @@ the shared report renderers.}
   \item \textbf{All device-specific code lives in its \file{\_device\_*.py} file.}
         \file{spectrometer\_core.py} holds only app-wide constants, the reference
         library and context help.
+  \item \textbf{No PyQt in the core.} \file{engine.py}, \file{api*.py},
+        \file{server\_runner.py}, \file{wavelength\_calibration.py},
+        \file{mcp\_server/} and every module they import must not import PyQt, not
+        even indirectly (a test enforces this). That is what makes
+        \code{--headless} run without Qt installed.
+  \item \textbf{One device = one engine.} A device is opened by exactly one
+        \code{Engine} instance; the desktop app and a separate headless server
+        cannot use the same device at the same time (one process per device).
+  \item \textbf{Logic exists once.} Desktop and web differ only in presentation;
+        existing \code{/api/...} and \code{/ws/stream} endpoints keep path and
+        format, new functions go under \code{/api/v1}.
   \item \textbf{Science/signal processing is device-agnostic}
         (\file{fusion.py}, \file{processing.py}, \file{color\_science.py},
         \file{filter\_analysis.py}) --- never inside a driver. Drivers acquire and
@@ -234,13 +310,17 @@ the shared report renderers.}
         single, finished, displayable frame.
   \item \code{SpectrumFusion.submit()} optionally applies adaptive temporal
         smoothing (if the ``Smoothing'' section is enabled).
-  \item A free-running \emph{emit timer} marshals the latest frame onto the GUI
-        thread and calls \code{process\_new\_spectrum}.
-  \item That single entry point fans out to Scope, Heatmap, Color (+CRI/TM-30) and
-        Filter.
+  \item The engine runs the processing pipeline (\file{processing.py}), updates the
+        heatmap buffer and the throttled colour metrics, and publishes a
+        \code{frame} event.
+  \item Listeners receive it: the desktop (via the Qt-signal bridge, on the GUI
+        thread) fans it out to Scope, Heatmap, Color (+CRI/TM-30) and Filter; the
+        API hub sends it to the WebSocket clients.
 \end{enumerate}
-The emit timer keeps the canvas fluid even when new measurements arrive slowly,
-but it cannot invent new data --- the \emph{new-data} rate is set by the exposure
+Jobs (measurements, series, calibration) bypass the display pipeline: they read
+raw frames through frame taps on the driver, so their result does not depend on
+the live view settings. The fusion emit stage keeps the canvas fluid even when new measurements
+arrive slowly, but it cannot invent new data --- the \emph{new-data} rate is set by the exposure
 (\S\ref{sec:perf}).
 
 % =====================================================================
@@ -1019,16 +1099,257 @@ Both apps export from the shared renderers, so numbers match exactly.
 \end{itemize}
 
 % =====================================================================
-\section{Web server \& API}
-\file{web\_server.py} (FastAPI + WebSocket) streams frames to the browser and
-exposes:
+% =====================================================================
+\section{Remote access}\label{sec:remote}
+The application can serve its web interface and the REST API itself. Nothing is
+reachable from the network unless this is switched on; the default is the local
+machine only.
+
+\subsection{Desktop panel}
+The sidebar section \emph{Remote access} (\file{gui\_remote.py}) contains:
+\begin{itemize}
+  \item \textbf{Remote access} switch --- starts or stops the server (uvicorn in a
+        background thread, \file{server\_runner.py}) on the running engine. If the
+        port is busy or the start fails, the switch returns to off and a message
+        names the reason. The state is stored (\key{remote\_enabled}); the server
+        starts again with the app.
+  \item \textbf{Port} (1024--65535, \key{remote\_port}).
+  \item \textbf{Access}: \emph{Local only (127.0.0.1)} or \emph{LAN (all
+        interfaces)}. LAN mode forces the token and shows a hint: the connection
+        is unencrypted HTTP; use a TLS reverse proxy outside the lab.
+  \item \textbf{Require token locally} --- also check the token on a local bind
+        (\key{remote\_require\_token\_local}).
+  \item \textbf{Token} (masked): \emph{Show}\slash\emph{Hide}, \emph{Copy},
+        \emph{Renew}. Renewing asks for confirmation, invalidates the old token and
+        restarts a running server.
+  \item \textbf{URL} with \emph{Copy URL}.
+  \item \textbf{Control} line (who holds control, \S\ref{sec:control}), the running
+        remote job, and the buttons \emph{Cancel remote job} and
+        \emph{Revoke control}.
+\end{itemize}
+
+\subsection{Status bar, locking and Cancel}\label{sec:control}
+Exactly one party controls the instrument: \code{local} (the desktop),
+\code{web} (a browser) or \code{remote:<client>} (REST/MCP; client name from the
+header \code{X-Client-Id}). Settings that alter the acquisition (exposure,
+averaging, pause, dark, Fast Preview, \dots) and all jobs need control.
+\begin{itemize}
+  \item A running job holds control until it ends; a client may also take an
+        explicit lease (\code{POST /api/v1/control}).
+  \item While a remote party holds control, the desktop disables its control
+        sidebar, the header controls and the Connect button. A local change
+        attempt shows \emph{Remote control active}.
+  \item The status bar shows \emph{Remote: <owner> $\cdot$ <reason>} (and, during a
+        job, \emph{Remote job <kind> <n>\,\%}, or the pending user step) with the
+        button \textbf{Cancel remote}: it cancels the job and revokes the lease; the
+        desktop controls are released at once.
+  \item Over the API a conflicting steering command is answered with HTTP~409
+        (\code{control\_busy}).
+\end{itemize}
+
+\subsection{Headless operation}
+\begin{quote}\ttfamily\small
+python PS-2600A\_Pro.py --headless [--host H] [--lan] [--port P]\\
+\hspace*{2em}[--token T] [--require-token] [--no-connect] [--backend NAME]
+\end{quote}
+No Qt module is imported on this path, so it runs on a machine without PyQt6
+(Raspberry Pi, lab PC without display). Defaults: bind \code{127.0.0.1}; \code{--lan}
+binds all interfaces and makes the token mandatory; port from \key{remote\_port};
+token from \key{remote\_token}, generated and stored if empty; the first device of
+the first backend is connected unless \code{--no-connect} (\code{--backend}
+selects another backend, for example \emph{Demo (virtual)}). The start banner prints
+the URL, the \code{/docs} URL and the token. \code{python web\_server.py} still
+works and forwards to the same server.
+
+A packaged build (\code{pyinstaller PS-2600A\_Pro.spec}) also accepts
+\code{--headless}; because the spec builds a windowed executable
+(\code{console=False}) the banner is not visible there --- start the server from the
+desktop panel or use a source checkout when the token must be read from the
+console.
+
+\subsection{Token and security}
+For a local bind the token is optional; for LAN it is always required. It is sent as
+\code{Authorization: Bearer <token>}; the browser takes it from
+\code{http://<host>:8000/?token=<token>} (stored in the browser, removed from the
+address bar); the WebSocket accepts \code{?token=}. Without a valid token the web
+page stays read-only (live display and display-only settings), and every steering
+endpoint answers 401. Read-only endpoints do not need the token.
+
+\medskip\noindent\textbf{Security notes.}
+LAN access is plain HTTP: anyone on the network can read the token. Use it only in
+a trusted lab network, or put a reverse proxy with TLS (nginx, Caddy) in front. Do
+not expose the port to the internet. Renew the token if it leaked. One device is
+opened by one engine, so the desktop app and a separate headless server cannot run
+on the same device at the same time.
+
+% =====================================================================
+\section{Web server \& API}\label{sec:api}
+\file{api.py} (\code{create\_app(engine, settings)}) is the FastAPI application. It
+serves the web client from \code{static/} (\code{GET /}), the WebSocket
+\code{/ws/stream} (live frames + config push, token via \code{?token=} or an
+\code{auth} message), the unchanged legacy \code{/api/...} endpoints (below) and the
+versioned automation API \code{/api/v1}. Interactive documentation
+(OpenAPI\slash Swagger UI) is at \code{/docs}, the schema at \code{/openapi.json}.
+All \code{/api/v1} requests and answers are typed with Pydantic
+(\file{api\_models.py}).
+
+\subsection{Endpoints \texttt{/api/v1}}
+Paths are relative to \code{/api/v1}. ``Auth'' = needs the token whenever a token is
+required (LAN, or \key{remote\_require\_token\_local}).
+\begin{longtable}{@{}p{1.25cm}p{5.5cm}p{6.6cm}p{1.1cm}@{}}
+\toprule \textbf{Method} & \textbf{Path} & \textbf{Purpose} & \textbf{Auth}\\ \midrule\endhead
+\multicolumn{4}{@{}l}{\textit{System}}\\
+GET & \code{/status} & Device, connection, exposure, averaging, active profile, unit, control owner, jobs.& no\\
+GET & \code{/backends} & Back-ends and the selected one.& no\\
+GET & \code{/devices} & Scan a back-end (\code{?backend=}).& no\\
+\multicolumn{4}{@{}l}{\textit{Device and control}}\\
+POST & \code{/connect} & Connect (\code{backend}, \code{device\_path}).& yes\\
+POST & \code{/disconnect} & Disconnect.& yes\\
+GET & \code{/acquisition} & Current acquisition and processing settings.& no\\
+PUT & \code{/acquisition} & Change exposure, averaging, pause, dark, smoothing, units, Fast Preview, fusion, heatmap buffer (only the given fields).& yes\\
+POST & \code{/auto-exposure} & One-shot auto exposure to a target band (default 70--85\,\% FS).& yes\\
+GET & \code{/control} & Control owner, reason, job.& no\\
+POST & \code{/control} & Acquire or release an explicit lease.& yes\\
+\multicolumn{4}{@{}l}{\textit{Measurement and jobs}}\\
+POST & \code{/measure} & Single measurement (job); see below.& yes\\
+POST & \code{/series} & Series: \code{count} measurements every \code{interval\_s}.& yes\\
+POST & \code{/dark} & Capture and store a per-pixel dark (job; user step ``cover'' without shutter).& yes\\
+GET & \code{/jobs} & All jobs (\code{?active=true}).& no\\
+GET & \code{/jobs/\{id\}} & Job; \code{?wait\_s=} waits for a state change.& no\\
+POST & \code{/jobs/\{id\}/cancel} & Cancel.& yes\\
+POST & \code{/jobs/\{id\}/continue} & Confirm a user step.& yes\\
+\multicolumn{4}{@{}l}{\textit{Data}}\\
+GET & \code{/spectrum/latest} & Live spectrum; \code{downsample}, \code{wl\_min}, \code{wl\_max}, \code{max\_points}.& no\\
+GET & \code{/measurements} & List of stored measurements.& no\\
+GET & \code{/measurements/\{id\}} & One measurement (\code{?arrays=false} without data).& no\\
+GET & \code{/measurements/\{id\}/export} & CSV or JSON file (\code{?format=}).& no\\
+GET & \code{/export/filename} & File name from the export template.& no\\
+\multicolumn{4}{@{}l}{\textit{Analysis and reports}}\\
+POST & \code{/analyze/color} & CCT, Duv, CRI, lux, wavelengths of a measurement, data or the live spectrum.& no\\
+POST & \code{/analyze/peaks} & Peak detection.& no\\
+POST & \code{/analyze/filter} & Filter transmission (reference vs.\ sample).& no\\
+POST & \code{/analyze/tm30} & TM-30 and CQS (503 without colour-science).& no\\
+POST & \code{/reports} & Colour, filter or measurement report (pdf, png, csv); \code{save=true} writes to the export folder.& no\\
+\multicolumn{4}{@{}l}{\textit{Calibration}}\\
+GET & \code{/calibration/profiles} & Selectable profiles of the connected device.& no\\
+GET & \code{/calibration/status} & Active profile, valid range, warnings.& no\\
+POST & \code{/calibration/select} & Select a profile (\code{None}, \code{Device default}, id); 409 \code{needs\_confirmation} for a flagged profile, repeat with \code{confirm}.& yes\\
+POST & \code{/calibration/profiles/copy} & Copy a profile from another unit.& yes\\
+GET & \code{/calibration/profiles/\{id\}/export} & Profile export.& no\\
+POST & \code{/calibration/profiles/import} & Profile import.& yes\\
+GET & \code{/calibration/references} & Lamps (reference sources).& no\\
+POST & \code{/calibration/references} & Import a lamp file (LMP\slash CSV).& yes\\
+DELETE & \code{/calibration/references/\{id\}} & Remove an imported lamp (not a built-in; no MCP tool).& yes\\
+GET & \code{/calibration/darks} & Stored dark spectra (metadata).& no\\
+POST & \code{/calibration/runs} & Calibration run (job with user steps).& yes\\
+POST & \code{/calibration/derivations} & Derive other optics from a known profile (job).& yes\\
+GET & \code{/calibration/runs/\{job\}/protocol} & Protocol PDF or CSV (\code{?format=}).& no\\
+\multicolumn{4}{@{}l}{\textit{Wavelength calibration (line lamp)}}\\
+GET & \code{/wavelength/lamps} & Known lamps.& no\\
+GET & \code{/wavelength/session} & Current session (capture, pairs, fit).& no\\
+POST & \code{/wavelength/session} & Open a session.& yes\\
+DELETE & \code{/wavelength/session} & Discard the session and the preview.& yes\\
+POST & \code{/wavelength/capture} & Capture a lamp spectrum (\code{frames}, \code{integration\_ms}).& yes\\
+POST & \code{/wavelength/match} & Match peaks to lamp lines (\code{accumulate} for multi-lamp).& yes\\
+PUT & \code{/wavelength/pairs} & Edit the pixel/nm pairs.& yes\\
+POST & \code{/wavelength/fit} & Fit; live preview for all clients.& yes\\
+POST & \code{/wavelength/save} & Save to the device (needs \code{confirm: true}; backup).& yes\\
+\multicolumn{4}{@{}l}{\textit{Heatmap}}\\
+GET & \code{/heatmap} & Buffer state (size, filled, interval, span, autosave).& no\\
+PUT & \code{/heatmap} & Buffer size (clears the buffer), measure interval.& yes\\
+POST & \code{/heatmap/clear} & Clear the buffer.& yes\\
+POST & \code{/heatmap/autosave} & Start\slash stop the server-side autosave.& yes\\
+GET & \code{/heatmap/frame} & One column of the buffer.& no\\
+GET & \code{/heatmap/export} & CSV of the visible\slash full buffer or one frame.& no\\
+\bottomrule
+\end{longtable}
+
+\subsection{Errors}
+All \code{/api/v1} errors have one shape:
+\code{\{"error": \{"code", "message", "details"\}\}}.
+\begin{center}\small
+\begin{tabular}{@{}llp{8cm}@{}}
+\toprule \textbf{HTTP} & \textbf{code} & \textbf{Meaning}\\ \midrule
+400 & \code{bad\_request} & Malformed or incomplete request.\\
+401 & \code{unauthorized} & Token missing or wrong (header \code{WWW-Authenticate: Bearer}).\\
+404 & \code{not\_found} & Unknown measurement, job, profile.\\
+409 & \code{control\_busy} & Another party holds control (\code{details}: owner, job).\\
+409 & \code{needs\_confirmation} & Profile needs explicit confirmation.\\
+422 & \code{validation\_error} & Request body invalid (\code{details}: fields).\\
+422 & \code{unprocessable} & Valid request, but not possible (for example no stored dark at this exposure).\\
+503 & \code{not\_connected} & No device connected \slash\ no live spectrum yet.\\
+503 & \code{unavailable} & Optional component missing (matplotlib, colour-science).\\
+500 & \code{job\_failed} & A job failed unexpectedly (\code{details.job}).\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Measuring}
+\code{POST /measure} takes:
+\begin{itemize}
+  \item \code{integration\_ms} --- exposure in ms; \code{"auto"} runs the auto exposure
+        first (target 70--85\,\% FS); \code{null} keeps the current live exposure.
+  \item \code{frames} --- raw frames averaged (1--1000), captured through frame
+        taps independent of the display pipeline.
+  \item \code{dark} --- \code{auto} (as the live view), \code{stored} (stored
+        per-pixel dark at this exposure; 422 if missing), \code{capture} (capture a
+        new dark first; user step ``cover'' on devices without shutter) or
+        \code{none} (raw counts, no calibration profile).
+  \item \code{profile} (restored afterwards), \code{confirm\_profile},
+        \code{include\_color}, \code{include\_peaks}, \code{label}, \code{wait},
+        \code{timeout\_s}.
+\end{itemize}
+The answer holds wavelengths, values, unit, valid range, metadata (time stamp with
+time zone, device\slash serial, acquisition, profile) and optionally colour
+metrics and peaks. With \code{wait=false}, or when the job pauses for a user step,
+the answer is \code{202} with the job and a \code{Location} header.
+
+\subsection{Jobs}
+Measurement, series, dark capture, calibration run and derivation are jobs with an
+ID, progress, message and result. Status:
+\code{queued} $\to$ \code{running} $\to$ \{\code{done}, \code{failed},
+\code{cancelled}\}, with \code{waiting\_for\_user} whenever a physical step is
+needed (cover or uncover the light path, swap optics); the job's \code{prompt}
+names the step. After the user has done it, \code{POST /jobs/\{id\}/continue}
+resumes the job; \code{POST /jobs/\{id\}/cancel} ends it at any time. A job holds
+control while it runs (\S\ref{sec:control}). Calibration protocols (PDF\slash CSV) are
+fetched from \code{/calibration/runs/\{job\}/protocol}.
+
+\subsection{Example}
+\begin{quote}\ttfamily\small\raggedright
+TOKEN=...\\
+curl -s http://127.0.0.1:8000/api/v1/status\\
+curl -s -X POST http://127.0.0.1:8000/api/v1/connect \textbackslash\\
+\hspace*{1em}-H "Authorization: Bearer \$TOKEN" -H "Content-Type: application/json" \textbackslash\\
+\hspace*{1em}-d '\{"backend": "Demo (virtual)"\}'\\
+curl -s -X POST http://127.0.0.1:8000/api/v1/measure \textbackslash\\
+\hspace*{1em}-H "Authorization: Bearer \$TOKEN" -H "Content-Type: application/json" \textbackslash\\
+\hspace*{1em}-d '\{"integration\_ms": "auto", "frames": 5\}'
+\end{quote}
+\file{examples/api\_client.py} (\code{httpx} only) shows the same flow in Python,
+including the confirmation of user steps on the console.
+
+\subsection{Web client}
+The browser client covers the functions of the desktop: scope, heatmap (buffer,
+interval, clear, scrub, autosave, export), colour\slash CRI and TM-30, replay,
+filter, acquisition and display settings, dark capture, the calibration run
+(lamp calibration and derivation, with the user steps confirmed in the browser),
+the calibration data manager (profiles, lamps, darks), the wavelength calibration
+and the download of calibration protocols. The page shows who holds control and is
+read-only without a valid token or while another party holds control. Files that the
+server writes (autosave, saved reports, protocols) go to its export folder, browser
+downloads to the browser's folder. The matrix of what exists where is in
+\file{docs/PARITAET\_Desktop\_Web.md}.
+
+\subsection{Legacy endpoints}
+These keep their path and answer format (web client, existing scripts). Steering
+calls honour the same token rule.
 \begin{longtable}{@{}p{5.2cm}p{9.6cm}@{}}
 \toprule \textbf{Endpoint} & \textbf{Purpose}\\ \midrule\endhead
 \code{GET /} & Serves \code{static/index.html} (the web client).\\
-\code{WebSocket /ws/stream} & Live frames + config push (the client mirrors \code{Config.all()} into \code{State.cfg}).\\
+\code{WebSocket /ws/stream} & Live frames + config push (the client mirrors the configuration into \code{State.cfg}).\\
 \code{GET /api/status} & Server / connection status.\\
-\code{GET /api/backends} & Available device back-ends.\\
-\code{GET /api/devices} & Scan for connected devices.\\
+\code{GET /api/backends} \textbar{} \code{/api/devices} & Back-ends; scan for devices.\\
 \code{POST /api/connect} \textbar{} \code{/api/disconnect} & Connect / disconnect a device.\\
 \code{GET /api/config} \textbar{} \code{POST /api/config} & Read / write configuration.\\
 \code{GET /api/references} \textbar{} \code{/api/reference} & Reference-library list / fetch.\\
@@ -1038,13 +1359,96 @@ exposes:
 \code{POST /api/filter/report} & Filter report (pdf / png / csv).\\
 \code{POST /api/color/report} & Colour/CRI report (pdf / png / csv).\\
 \code{POST /api/tm30} & TM-30 + CQS ($\to$ \{tm30, cqs, bin\_colors\}); 503 without colour-science.\\
+\code{/api/calibration/...} & Profile list, status, select, copy, export, import; references; darks.\\
 \bottomrule
 \end{longtable}
 
-\noindent The web client is served from a \code{static/} folder next to
-\file{web\_server.py} (\code{Path(\_\_file\_\_).parent/"static"}); the three
-front-end files (\file{index.html}, \file{app.js}, \file{styles.css}) must live
-there.
+\noindent The client lives in the \code{static/} folder next to \file{api.py}
+(\file{index.html}, \file{app.js}, \file{styles.css}); the three files must stay there.
+
+% =====================================================================
+\section{MCP server \& Claude plugin}\label{sec:mcp}
+The MCP server (\file{mcp\_server/}, official Python SDK \code{mcp>=2.3}, stdio
+transport) lets Claude operate the instrument. It is a thin layer over the REST API:
+it talks to the application only over HTTP (\code{httpx}), imports neither the engine
+nor PyQt, and therefore works with the desktop app, with a headless server and over
+the network. Install the optional packages with
+\code{pip install "mcp>=2.3" httpx} (Python 3.10+).
+
+\subsection{Tools}
+\begin{longtable}{@{}p{4.1cm}p{10.7cm}@{}}
+\toprule \textbf{Tool} & \textbf{Purpose}\\ \midrule\endhead
+\code{status} & Compact state: connection, exposure, calibration, control owner, active jobs with prompts.\\
+\code{list\_devices}, \code{connect}, \code{disconnect} & Back-ends, devices; open\slash close the spectrometer.\\
+\code{set\_acquisition}, \code{auto\_expose}, \code{capture\_dark} & Exposure, averaging, dark, units, filters, fusion; one-shot auto exposure; stored dark (job, user step on devices without shutter).\\
+\code{measure} & Single measurement: compact result plus a CSV of the full spectrum.\\
+\code{start\_series}, \code{job\_status}, \code{cancel\_job}, \code{continue\_job} & Series and job control, including user steps.\\
+\code{get\_spectrum} & Spectrum summary and thinned points (at most 512); optional full CSV.\\
+\code{analyze\_color}, \code{find\_peaks}, \code{analyze\_filter} & CCT, Duv, CRI, lux, wavelengths; peaks; filter transmission.\\
+\code{list\_profiles}, \code{select\_profile}, \code{calibration\_status} & Calibration profiles.\\
+\code{list\_references}, \code{start\_calibration} & Lamps; calibration run (job with user steps).\\
+\code{export\_measurement}, \code{create\_report} & CSV\slash JSON export; colour, filter or measurement report (PDF, PNG, CSV).\\
+\bottomrule
+\end{longtable}
+\noindent Resources: \code{spectrometer://status}, \code{spectrometer://config},
+\code{spectrometer://profiles}.
+
+\subsection{Limits}
+There are no deleting tools (no removal of profiles, dark spectra or lamps). Every
+tool answer is at most 8\,KB of JSON; longer content is shortened and marked
+\code{"truncated": true}, full data is written to files in \code{SPECTRO\_DATA\_DIR}
+and the path is returned. The server writes files only there. A user step of a job
+(cover\slash uncover) is reported as \code{waiting\_for\_user}; the assistant must ask
+the user and call \code{continue\_job} only after the user confirmed.
+
+\subsection{Environment variables}
+\begin{longtable}{@{}p{4.3cm}p{6.5cm}p{3.9cm}@{}}
+\toprule \textbf{Variable} & \textbf{Meaning} & \textbf{Default}\\ \midrule\endhead
+\code{SPECTRO\_API\_URL} & Base URL of the app & \code{http://127.0.0.1:8000}\\
+\code{SPECTRO\_API\_TOKEN} & Bearer token (required for LAN or when the app requires it) & none\\
+\code{SPECTRO\_CLIENT\_ID} & Client name (control owner \code{remote:<id>}) & \code{mcp}\\
+\code{SPECTRO\_DATA\_DIR} & Folder for full spectra, exports, reports & temp folder \code{ps2600-mcp}\\
+\code{SPECTRO\_PYTHON} & Plugin launcher: interpreter with \code{mcp} and \code{httpx} & \code{python}\\
+\code{SPECTRO\_MCP\_DIR} & Plugin launcher: folder containing \code{mcp\_server/} (needed after a marketplace install) & checkout next to the plugin\\
+\bottomrule
+\end{longtable}
+
+\subsection{Claude Code plugin}
+\file{claude-plugin/} contains the MCP configuration (\file{.mcp.json}), three agents
+and four skills.
+\begin{itemize}
+  \item \textbf{Agents:} \code{measurement} (plans and runs measurement procedures,
+        checks saturation, signal level and valid range), \code{calibration} (runs a
+        calibration run step by step with the user, asks for the cover\slash uncover
+        steps), \code{test-report} (factual test report with device, serial, optics,
+        profile, conditions and results).
+  \item \textbf{Skills:} \code{light-source-characterization} (spectrum, CCT, CRI,
+        lux), \code{filter-transmission}, \code{stability-measurement},
+        \code{test-report-template}.
+\end{itemize}
+Set-up from a checkout:
+\begin{quote}\ttfamily\small\raggedright
+claude --plugin-dir <repo>/claude-plugin\\[2pt]
+claude plugin marketplace add <repo>\\
+claude plugin install ps2600-spectrometer@ps2600-local
+\end{quote}
+A marketplace installation copies the plugin; then set \code{SPECTRO\_MCP\_DIR} to the
+repository. Set \code{SPECTRO\_API\_TOKEN} (and \code{SPECTRO\_API\_URL}) in the
+environment Claude Code is started from. Without the plugin, register the server
+directly:
+\code{claude mcp add spectrometer --env SPECTRO\_API\_TOKEN=<token> -- python <repo>/claude-plugin/scripts/run\_mcp\_server.py}.
+
+\subsection{Claude desktop app}
+Add an \code{mcpServers} entry to \file{claude\_desktop\_config.json}
+(Windows: \file{\%APPDATA\%\textbackslash Claude\textbackslash claude\_desktop\_config.json};
+macOS: \file{\textasciitilde/Library/Application Support/Claude/}) with the absolute
+path of \file{claude-plugin/scripts/run\_mcp\_server.py} as the argument of
+\code{python} and the variables \code{SPECTRO\_API\_URL}, \code{SPECTRO\_API\_TOKEN},
+\code{SPECTRO\_CLIENT\_ID}, \code{SPECTRO\_DATA\_DIR} in \code{env}; an example is
+\file{claude-plugin/examples/claude\_desktop\_config.example.json}. Restart the app
+afterwards. Agents and skills are Claude Code features; the desktop app only gets
+the tools. Because the API is unencrypted HTTP, use a TLS reverse proxy for anything
+beyond a trusted network, and keep the token secret.
 
 % =====================================================================
 \section{Configuration reference}
@@ -1126,6 +1530,14 @@ defaults at load. Edit it while the app is closed, or change values from the UI
 \key{fusion\_change\_sigma} & 4.0 & $\sigma$ at which smoothing backs off.\\
 \key{fusion\_noise\_floor / gain} & 8.0 / 1.0 & Read / shot-noise model.\\
 \key{fusion\_emit\_hz / max / min} & 0 / 60 / 2 & Output rate (0 = auto).\\
+\multicolumn{3}{@{}l}{\textit{Remote access / API (\S\ref{sec:remote})}}\\
+\key{remote\_enabled} & false & Start the server with the app (set by the panel switch).\\
+\key{remote\_port} & 8000 & TCP port of the server.\\
+\key{remote\_lan} & false & false = \code{127.0.0.1} only; true = all interfaces (token forced).\\
+\key{remote\_token} & \code{""} & API token; generated on first use, renewed from the panel.\\
+\key{remote\_require\_token\_local} & false & Also require the token on a local bind.\\
+\multicolumn{3}{@{}l}{\textit{Reports}}\\
+\key{report\_language} & de & Language of report contents (API reports, test reports): \code{de} or \code{en}.\\
 \multicolumn{3}{@{}l}{\textit{Filter / peaks / cursors}}\\
 \key{filter\_baseline\_frames} & 16 & Frames averaged into the 100\,\% reference.\\
 \key{filter\_display\_smoothing} & 0 & Display-only curve smoothing window (0 = off).\\

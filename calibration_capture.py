@@ -596,8 +596,13 @@ def list_darks(backend: str, serial: str | None) -> list[dict]:
     out = []
     for d in _load_darks():
         if _same_device(d, backend, serial):
-            out.append({k: d.get(k) for k in ("integration_us", "n_frames",
-                                              "timestamp", "wl_fingerprint")})
+            item = {k: d.get(k) for k in ("integration_us", "n_frames",
+                                          "timestamp", "wl_fingerprint")}
+            try:
+                item["mean_counts"] = float(np.mean(np.asarray(d["mean"], float)))
+            except (KeyError, TypeError, ValueError):
+                item["mean_counts"] = None
+            out.append(item)
     out.sort(key=_ts_key, reverse=True)
     return out
 
