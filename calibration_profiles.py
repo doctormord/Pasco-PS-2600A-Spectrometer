@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
@@ -521,7 +522,10 @@ def compute_calibration(
     return {
         "wl": wl, "C": C, "E": E, "S": S, "K": K, "valid": valid,
         "masks": {"device": m_dev, "reference": m_ref, "snr": m_snr,
-                  "saturation": m_sat, "gain": m_gain | ~valid0},
+                  "saturation": m_sat, "gain": m_gain | ~valid0,
+                  # pixels where a calibration is expected at all
+                  # (device spec range ∩ reference range): coverage basis
+                  "base": m_dev & m_ref},
         "valid_range_nm": [float(vw.min()), float(vw.max())],
         "gain_span": float(np.max(gain_vals) / np.min(gain_vals)),
         "n_valid": int(np.count_nonzero(valid)),
@@ -584,11 +588,171 @@ def derive_relative_from_ratio(wl, s_known, c_new, c_known, *, valid_known=None,
     valid = m & g
     S = np.where(valid, S, np.nan)
     vw = wl[valid]
+    base = np.isfinite(sk) & (sk > 0)
+    if valid_known is not None:
+        base &= np.asarray(valid_known, bool)
     return {"wl": wl, "S": S, "K": None, "valid": valid,
-            "masks": {"overlap": m, "gain": g | ~m},
+            "masks": {"overlap": m, "gain": g | ~m, "base": base},
             "valid_range_nm": [float(vw.min()), float(vw.max())],
             "gain_span": float(1.0 / np.nanmin(S[valid])),
             "n_valid": int(np.count_nonzero(valid)), "type": TYPE_RELATIVE}
+
+
+# ── Plausibility of a calibration result (broadband check) ───────────────
+#
+# A response calibration is only meaningful with a smooth, broadband source on
+# BOTH sides (lamp under test and reference). Measuring a line source (Ne, Hg …)
+# against a continuous reference passes the per-pixel SNR mask only at the line
+# peaks: S is then defined on a few isolated islands, jumps within each line,
+# and the outer "valid range" spans large masked gaps. These checks detect that
+# before a profile is stored.
+
+@dataclass(frozen=True)
+class PlausibilityLimits:
+    min_coverage: float = 0.5        # valid / (device ∩ reference) pixels
+    max_gain_span: float = 40.0      # max/min gain over the valid pixels
+    max_roughness: float = 0.05      # p95 |S / S_smoothed − 1|
+    max_isolated_frac: float = 0.2   # share of valid pixels in short islands
+    min_segment_nm: float = 5.0      # a valid run shorter than this is an island
+    max_gap_nm: float = 2.0          # masked gaps up to this width are bridged
+    min_largest_segment_frac: float = 0.5   # widest segment / base width
+    roughness_px: int = 21           # smoothing window of the roughness metric
+
+    @classmethod
+    def from_config(cls) -> "PlausibilityLimits":
+        try:
+            from app_config import Config as C
+        except Exception:                                   # noqa: BLE001
+            return cls()
+        d = cls()
+
+        def num(key, default, typ=float):
+            try:                         # null / garbage in the config → default
+                v = typ(C.get(key, default))
+                return v if np.isfinite(v) and v >= 0 else default
+            except (TypeError, ValueError):
+                return default
+        return cls(
+            min_coverage=num("calibration_min_coverage", d.min_coverage),
+            max_gain_span=num("calibration_max_gain_span", d.max_gain_span),
+            max_roughness=num("calibration_max_roughness", d.max_roughness),
+            max_isolated_frac=num("calibration_max_isolated_frac", d.max_isolated_frac),
+            min_segment_nm=num("calibration_min_segment_nm", d.min_segment_nm),
+            max_gap_nm=num("calibration_max_gap_nm", d.max_gap_nm),
+            min_largest_segment_frac=num("calibration_min_largest_segment_frac",
+                                         d.min_largest_segment_frac),
+            roughness_px=max(3, num("calibration_roughness_px", d.roughness_px, int)),
+        )
+
+
+def _runs(mask) -> list[tuple[int, int]]:
+    """Inclusive index runs of True values."""
+    idx = np.flatnonzero(np.asarray(mask, bool))
+    if idx.size == 0:
+        return []
+    br = np.flatnonzero(np.diff(idx) > 1)
+    starts = np.r_[idx[0], idx[br + 1]]
+    ends = np.r_[idx[br], idx[-1]]
+    return [(int(a), int(b)) for a, b in zip(starts, ends)]
+
+
+def valid_segments(wl, valid, max_gap_nm: float = 0.0) -> list[list[float]]:
+    """Contiguous valid wavelength segments [[lo, hi], …].
+
+    Masked gaps whose width (distance between the neighbouring valid pixels,
+    minus one pixel pitch) is at most `max_gap_nm` are bridged, i.e. reported as
+    part of one segment. Bridging only affects this report — the masked pixels
+    stay masked and are never applied."""
+    wl = np.asarray(wl, float)
+    runs = _runs(valid)
+    if not runs:
+        return []
+    pitch = float(np.median(np.abs(np.diff(wl)))) if wl.size > 1 else 0.0
+    segs = [[runs[0][0], runs[0][1]]]
+    for a, b in runs[1:]:
+        gap = float(wl[a] - wl[segs[-1][1]]) - pitch
+        if gap <= float(max_gap_nm) + 1e-9:
+            segs[-1][1] = b
+        else:
+            segs.append([a, b])
+    return [[float(wl[a]), float(wl[b])] for a, b in segs]
+
+
+def format_segments(segments, max_items: int = 4) -> str:
+    """'585–590, 602–610 nm (+n more)' — for status lines and the protocol."""
+    if not segments:
+        return "none"
+    parts = [f"{lo:.0f}–{hi:.0f}" for lo, hi in segments[:max_items]]
+    more = len(segments) - max_items
+    return ", ".join(parts) + " nm" + (f" (+{more} more)" if more > 0 else "")
+
+
+def broadband_check(result: dict, limits: PlausibilityLimits | None = None) -> dict:
+    """Plausibility of a compute_calibration / derive_relative_from_ratio result.
+
+    Metrics (all reported, each with its limit):
+      coverage            valid pixels / pixels where a calibration is expected
+                          (masks['base']: device spec ∩ reference range)
+      gain_span           max/min gain over the valid pixels
+      roughness           p95 of |S / S_smoothed − 1| (line sources: S jumps
+                          within every line)
+      isolated_frac       share of valid pixels in runs < min_segment_nm
+      largest_segment_frac widest bridged segment / width of the base range
+    Returns {"pass", "failures": [str], "metrics", "limits", "segments_nm"}."""
+    lim = limits or PlausibilityLimits()
+    wl = np.asarray(result["wl"], float)
+    valid = np.asarray(result["valid"], bool)
+    S = np.asarray(result["S"], float)
+    base = np.asarray((result.get("masks") or {}).get("base", np.ones(wl.size, bool)), bool)
+    n_base = int(np.count_nonzero(base))
+    n_valid = int(np.count_nonzero(valid))
+    coverage = n_valid / n_base if n_base else 0.0
+
+    S_sm = _nan_moving_average(np.where(valid, S, np.nan), valid, lim.roughness_px)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dev = np.abs(S[valid] / S_sm[valid] - 1.0)
+    dev = dev[np.isfinite(dev)]
+    roughness = float(np.percentile(dev, 95)) if dev.size else float("inf")
+
+    isolated = 0
+    for a, b in _runs(valid):
+        if float(wl[b] - wl[a]) < lim.min_segment_nm:
+            isolated += b - a + 1
+    isolated_frac = isolated / n_valid if n_valid else 1.0
+
+    segs = valid_segments(wl, valid, lim.max_gap_nm)
+    bw = wl[base]
+    base_width = float(bw.max() - bw.min()) if bw.size > 1 else 0.0
+    widest = max((hi - lo for lo, hi in segs), default=0.0)
+    largest_frac = widest / base_width if base_width > 0 else 0.0
+    gain_span = float(result.get("gain_span", float("nan")))
+
+    failures = []
+    if coverage < lim.min_coverage:
+        failures.append(f"coverage {coverage * 100:.0f} % < {lim.min_coverage * 100:.0f} % "
+                        f"of the expected range")
+    if not np.isfinite(gain_span) or gain_span > lim.max_gain_span:
+        failures.append(f"gain span {gain_span:.1f}× > {lim.max_gain_span:.1f}×")
+    if roughness > lim.max_roughness:
+        failures.append(f"roughness {roughness * 100:.1f} % > {lim.max_roughness * 100:.1f} % "
+                        f"(not a smooth broadband response)")
+    if isolated_frac > lim.max_isolated_frac:
+        failures.append(f"{isolated_frac * 100:.0f} % of the valid pixels lie in isolated "
+                        f"peaks narrower than {lim.min_segment_nm:.0f} nm "
+                        f"(limit {lim.max_isolated_frac * 100:.0f} %)")
+    if largest_frac < lim.min_largest_segment_frac:
+        failures.append(f"widest contiguous segment covers {largest_frac * 100:.0f} % of the "
+                        f"expected range (limit {lim.min_largest_segment_frac * 100:.0f} %)")
+    return {
+        "pass": not failures,
+        "failures": failures,
+        "metrics": {"coverage": coverage, "gain_span": gain_span,
+                    "roughness": roughness, "isolated_frac": isolated_frac,
+                    "largest_segment_frac": largest_frac,
+                    "n_segments": len(segs), "n_valid": n_valid, "n_base": n_base},
+        "limits": asdict(lim),
+        "segments_nm": segs,
+    }
 
 
 def relative_from_absolute(K, valid):
@@ -892,9 +1056,18 @@ def profile_label(p: dict) -> str:
     t = p.get("type", TYPE_RELATIVE)
     date = str(p.get("created", ""))[:10]
     tag = " · legacy" if p.get("apply") == APPLY_LEGACY_GAIN else ""
+    if is_implausible(p):
+        tag += " · NOT PLAUSIBLE"
     if not (p.get("device") or {}).get("serial") and p.get("apply") != APPLY_LEGACY_GAIN:
         tag += " · unbound"
     return f"{o} · {t} · v{p.get('version', 1)} · {date}{tag}"
+
+
+def is_implausible(p: dict) -> bool:
+    """True for a profile saved although its plausibility check failed
+    (explicit user override)."""
+    pl = p.get("plausibility") or {}
+    return pl.get("pass") is False
 
 
 def is_absolute_reference_unit(unit: str) -> bool:
@@ -927,11 +1100,15 @@ def _validate_profile(p: dict) -> None:
 
 def new_profile(*, kind: str, backend: str, serial: str | None, optics: dict,
                 reference: dict, wl_fingerprint: str, result: dict,
-                acquisition: dict, checks: dict, ref_unit: str = "") -> dict:
-    """Assemble a schema-2 profile from a compute_calibration() result."""
+                acquisition: dict, checks: dict, ref_unit: str = "",
+                plausibility: dict | None = None) -> dict:
+    """Assemble a schema-2 profile from a compute_calibration() result.
+
+    plausibility: broadband_check() output (+ "override": True when the user
+    saved a failed result explicitly); stored so the profile stays flagged."""
     unit = (UNIT_RELATIVE if kind == TYPE_RELATIVE
             else f"{ref_unit or reference.get('unit', '')} per count/s")
-    return {
+    out = {
         "schema": SCHEMA_VERSION,
         "type": kind,
         "device": {"backend": backend, "serial": serial},
@@ -950,6 +1127,11 @@ def new_profile(*, kind: str, backend: str, serial: str | None, optics: dict,
         "gain_span": float(result.get("gain_span", float("nan"))),
         "apply": APPLY_V2,
     }
+    if result.get("segments_nm") is not None:
+        out["valid_segments_nm"] = [list(map(float, s)) for s in result["segments_nm"]]
+    if plausibility is not None:
+        out["plausibility"] = dict(plausibility)
+    return out
 
 
 def add_profile(p: dict) -> dict:
@@ -1369,6 +1551,11 @@ class CalibrationRuntime:
                 self.applier = CalibrationApplier(p, self.wl, out_u)
                 st["unit"] = self.applier.unit
                 st["valid_range_nm"] = list(self.applier.valid_range_nm)
+                if p.get("valid_segments_nm"):
+                    st["valid_segments_nm"] = [list(map(float, x))
+                                               for x in p["valid_segments_nm"]]
+                if is_implausible(p):
+                    st["implausible"] = True
             except Exception as e:
                 st.update(state="error", message=f"Profile could not be applied: {e}")
         self.status = st

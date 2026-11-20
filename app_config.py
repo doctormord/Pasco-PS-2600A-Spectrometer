@@ -88,6 +88,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "calibration_stability_delay_s": 5.0,
     "calibration_stability_threshold_pct": 1.0,
     "calibration_itime_threshold_pct": 2.0,
+    # Plausibility (broadband) check before a profile is saved
+    # (calibration_profiles.broadband_check). A failed check blocks saving
+    # unless the user confirms explicitly; such a profile is flagged and not
+    # activated automatically.
+    "calibration_min_coverage": 0.5,          # valid / (device ∩ reference) pixels
+    "calibration_max_gain_span": 40.0,        # max/min gain over the valid range
+    "calibration_max_roughness": 0.05,        # p95 |S/S_smoothed - 1|
+    "calibration_max_isolated_frac": 0.2,     # share of valid pixels in isolated peaks
+    "calibration_min_segment_nm": 5.0,        # narrower valid runs count as isolated
+    "calibration_max_gap_nm": 2.0,            # masked gaps up to this width are bridged
+    "calibration_min_largest_segment_frac": 0.5,
+    "calibration_roughness_px": 21,           # smoothing window of the roughness metric
+    # Calibration dialog geometry [x, y, w, h] (clamped to the current screen).
+    "calibration_dialog_geometry": None,
+    "main_window_geometry": None,
     # Display unit of the main plot when NO v2 profile is active:
     # "counts" (unchanged legacy behaviour) or "counts_per_s".
     "display_unit": "counts",

@@ -30,6 +30,10 @@ def isolated_config(tmp_path, monkeypatch):
     cfg._data["calibration_profiles_file"] = str(tmp_path / "calibration_profiles.json")
     cfg._data["reference_sources_file"] = str(tmp_path / "reference_sources.json")
     cfg._data["dark_spectra_file"] = str(tmp_path / "dark_spectra.json")
+    # Protocol fallback folder (user data dir) → tmp, never the real profile.
+    import export_paths
+    monkeypatch.setattr(export_paths, "user_data_dir",
+                        lambda: str(tmp_path / "userdata" / "PS-2600A"))
     try:
         yield cfg
     finally:

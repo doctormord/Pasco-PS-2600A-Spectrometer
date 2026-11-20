@@ -9,3 +9,6 @@ dist/
 ASEQ_*
 .claude/
 docs/KICKOFF_PROMPT.md
+
+# Calibration protocols (written to <export_dir>/calibration, never here)
+calib_*

@@ -256,6 +256,8 @@ class DemoSpectrometer(BaseSpectrometer):
 
         spec_name = str(Config.get("demo_spectrum", "led_white"))
         sens = str(Config.get("demo_sensitivity", "none"))
+        self._sensitivity = sens
+        self._spectrum_name = spec_name
         self._shape = _resolve_spectrum(spec_name, self._wl, sens)
         self.serial = str(Config.get("demo_serial", "DEMO-0001"))
 
@@ -282,6 +284,20 @@ class DemoSpectrometer(BaseSpectrometer):
     def disconnect(self) -> None:
         self.stop()
         self._connected = False
+
+    # ── Runtime spectrum switch (calibration wizard, demo sources) ──────────
+    @property
+    def spectrum_name(self) -> str:
+        return getattr(self, "_spectrum_name", "led_white")
+
+    def set_spectrum(self, name: str) -> str:
+        """Switch the simulated source at runtime (not persisted to the config).
+        Returns the previous spectrum name so the caller can restore it."""
+        prev = self.spectrum_name
+        self._shape = _resolve_spectrum(name, self._wl,
+                                        getattr(self, "_sensitivity", "none"))
+        self._spectrum_name = str(name)
+        return prev
 
     def set_integration_time_us(self, us: int) -> None:
         self.current_integration_time_us = max(

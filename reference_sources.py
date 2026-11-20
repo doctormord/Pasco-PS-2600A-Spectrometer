@@ -26,6 +26,9 @@ INPUT_OPTICS = ("CC", "bare", "sphere")
 _TO_W_M2_NM = {UNIT_UW_CM2_NM: 0.01, UNIT_W_M2_NM: 1.0, UNIT_MW_M2_NM: 1e-3}
 
 DEMO_SOURCE_ID = "demo-cal-3000k"
+# Demo backend: the simulated spectrum that physically matches each built-in
+# demo reference source (the calibration wizard switches to it for the run).
+DEMO_SPECTRUM_FOR_SOURCE = {DEMO_SOURCE_ID: "cal_lamp"}
 
 
 def convert_irradiance(values, from_unit: str, to_unit: str) -> np.ndarray:
