@@ -180,6 +180,9 @@ def _sample_hue_brushes(n: int) -> list:
 # ════════════════════════════════════════════════════════════
 # Sub-tab 1: OVERVIEW
 # ════════════════════════════════════════════════════════════
+
+_COMPUTE = object()      # sentinel: update_measurement computes the metrics itself
+
 class _OverviewPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1058,12 +1061,18 @@ class CIETab(QWidget):
 
     def update_measurement(self, wavelengths_nm: np.ndarray,
                            intensities: np.ndarray,
-                           lux_calibration: float | None = None) -> None:
+                           lux_calibration: float | None = None,
+                           metrics=_COMPUTE) -> None:
         """lux_calibration: None → use radiometric_calibration_factor from the
         config (legacy). With an ABSOLUTE calibration profile active the
         dashboard passes E(λ) in W/(m²·nm) and lux_calibration=1.0, so lux is
         computed directly from the spectral irradiance and the scalar factor is
-        ignored."""
+        ignored.
+
+        metrics: colour metrics already computed by the shared engine
+        (engine.Engine.color_metrics_for, throttled there). None = no fresh
+        metrics for this frame (pages keep their values). Omitted = compute
+        here (standalone use / tests)."""
         self._lux_override = lux_calibration
         self._latest = (np.asarray(wavelengths_nm, dtype=float),
                         np.asarray(intensities, dtype=float))
@@ -1084,6 +1093,19 @@ class CIETab(QWidget):
             self._tm30_request.emit(
                 np.asarray(wavelengths_nm, dtype=float).copy(),
                 np.asarray(intensities, dtype=float).copy())
+
+        if metrics is not _COMPUTE:
+            if metrics is None:
+                return
+            from app_config import Config
+            override = getattr(self, "_lux_override", None)
+            calib = (float(override) if override is not None
+                     else float(Config.get("radiometric_calibration_factor", 0.0) or 0.0))
+            self._calib = calib
+            self.overview_page.apply(metrics, calibrated=(calib > 0.0))
+            self.chrom_page.apply(metrics)
+            self.rendering_page.apply(metrics)
+            return
 
         # Overview / chromaticity / rendering pages — heavier to redraw, so keep
         # the frame-count throttle (the demo's low rate is fine for these).

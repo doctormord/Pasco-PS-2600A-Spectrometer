@@ -25,13 +25,9 @@ import sys
 
 import numpy as np
 
-# ── Optional Qt imports (only needed for ContextHelp) ─────────────────────
-try:
-    from PyQt6.QtWidgets import QToolTip
-    from PyQt6.QtCore import QObject, QTimer, QEvent
-    _QT_AVAILABLE = True
-except ImportError:
-    _QT_AVAILABLE = False
+# NOTE: this module is Qt-free (imported by engine.py / api.py, which must
+# never pull in PyQt). The delayed-tooltip widget lives in gui_help.py and is
+# only imported lazily by add_help() below.
 
 # ── Application-wide display constants ────────────────────────────────────
 
@@ -420,43 +416,16 @@ def load_reference_library(target_wavelengths=None):
 # USB BACKEND — WinUSB on Windows, libusb (pyusb) elsewhere.
 # ============================================================
 
-# ── ContextHelp delayed tooltip ────────────────────────────────────────────
+# ── ContextHelp delayed tooltip (Qt, lazily imported) ─────────────────────
 
-if _QT_AVAILABLE:
-    class ContextHelp(QObject):
-        """Installs a 2-second delayed tooltip on any QWidget."""
+def add_help(widget, text: str, delay_ms: int = 2000):
+    """Attach a delayed context tooltip to a widget. Returns widget.
 
-        def __init__(self, widget, text: str, delay_ms: int = 2000):
-            super().__init__(widget)
-            self._widget = widget
-            self._text   = text
-            self._timer  = QTimer(self)
-            self._timer.setSingleShot(True)
-            self._timer.setInterval(delay_ms)
-            self._timer.timeout.connect(self._show)
-            widget.installEventFilter(self)
-
-        def eventFilter(self, obj, event) -> bool:
-            t = event.type()
-            if t == QEvent.Type.Enter:
-                self._timer.start()
-            elif t in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress):
-                self._timer.stop()
-                QToolTip.hideText()
-            return False
-
-        def _show(self) -> None:
-            if self._widget.underMouse():
-                pos = self._widget.mapToGlobal(
-                    self._widget.rect().bottomLeft())
-                QToolTip.showText(pos, self._text, self._widget)
-
-    def add_help(widget, text: str, delay_ms: int = 2000):
-        """Attach a delayed context tooltip to a widget.  Returns widget."""
-        ContextHelp(widget, text, delay_ms)
+    The Qt implementation lives in gui_help.py and is imported only here, so
+    importing spectrometer_core never imports PyQt (headless server / engine).
+    No-op when PyQt6 is unavailable."""
+    try:
+        from gui_help import add_help as _qt_add_help
+    except ImportError:
         return widget
-
-else:
-    def add_help(widget, text: str, delay_ms: int = 2000):
-        """No-op when PyQt6 is unavailable (e.g. web server context)."""
-        return widget
+    return _qt_add_help(widget, text, delay_ms)
