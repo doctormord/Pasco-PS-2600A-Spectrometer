@@ -158,6 +158,7 @@ class FrameAccumulator:
         self._sat = None
         self.n = 0
         self._skipped = 0
+        self._dark_sum = 0.0
         self.rejected: dict[str, int] = {}
 
     def _reject(self, why: str) -> None:
@@ -184,12 +185,24 @@ class FrameAccumulator:
                 self._sumsq = np.zeros_like(px)
                 self._sat = np.zeros(px.shape, bool)
                 self.n = 0
+                self._dark_sum = 0.0
+            try:
+                self._dark_sum += float(np.mean(dark))
+            except (TypeError, ValueError):
+                pass
             self._sum += px
             self._sumsq += px * px
             self._sat |= px >= self.saturation_level
             self.n += 1
             if self.n >= self.n_target:
                 self.done.set()
+
+    @property
+    def dark_mean(self) -> float:
+        """Mean of the driver's per-frame dark scalar (optical-black mean /
+        baseline estimate) over the accepted frames; 0.0 if none."""
+        with self._lock:
+            return self._dark_sum / self.n if self.n else 0.0
 
     def stats(self):
         """(mean, std, saturated, n) of what was accumulated so far."""
@@ -583,8 +596,13 @@ def list_darks(backend: str, serial: str | None) -> list[dict]:
     out = []
     for d in _load_darks():
         if _same_device(d, backend, serial):
-            out.append({k: d.get(k) for k in ("integration_us", "n_frames",
-                                              "timestamp", "wl_fingerprint")})
+            item = {k: d.get(k) for k in ("integration_us", "n_frames",
+                                          "timestamp", "wl_fingerprint")}
+            try:
+                item["mean_counts"] = float(np.mean(np.asarray(d["mean"], float)))
+            except (KeyError, TypeError, ValueError):
+                item["mean_counts"] = None
+            out.append(item)
     out.sort(key=_ts_key, reverse=True)
     return out
 

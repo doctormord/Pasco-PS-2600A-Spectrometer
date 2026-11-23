@@ -39,3 +39,14 @@ matplotlib>=3.7
 fastapi>=0.110
 uvicorn>=0.27
 websockets>=12.0
+# REST API: typed request/response models (FastAPI already pulls pydantic in;
+# listed explicitly because /api/v1 relies on pydantic v2).
+pydantic>=2.0
+# HTTP client: examples/api_client.py, the MCP server and the API tests
+# (fastapi.testclient). Not needed to run the server itself.
+httpx>=0.27
+
+# Optional — MCP server (mcp_server/, Claude plugin) that lets Claude operate the
+# app through the REST API. Not needed for the app, the web UI or the REST API.
+# Requires Python 3.10+ and httpx (above). See mcp_server/README.md.
+# mcp>=2.3

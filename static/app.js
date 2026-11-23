@@ -81,12 +81,15 @@ function toast(msg, ms = 1800) {
 // ── WebSocket ────────────────────────────────────────────────
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  State.ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
-  State.ws.onopen = () => {
+  const tk = Access.token();
+  const q = tk ? `?token=${encodeURIComponent(tk)}` : '';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/stream${q}`);
+  State.ws = ws;
+  ws.onopen = () => {
     State.wsConnected = true;
     $('#sb-ws').textContent = 'connected';
   };
-  State.ws.onmessage = (ev) => {
+  ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'hello') handleHello(msg);
@@ -96,17 +99,37 @@ function connectWS() {
         // reflect in the UI without echoing back to the server.
         Object.assign(State.cfg, msg.config);
         applyConfigToUI(State.cfg);
+        Hm.onConfig(msg.config);
+      }
+      else if (msg.type === 'job') Jobs.onWsJob(msg.data);
+      else if (msg.type === 'control') Access.setControl(msg.data);
+      else if (msg.type === 'calibration') Cal.onFrameStatus(msg.data, true);
+      else if (msg.type === 'autosave') Hm.onAutosave(msg.data);
+      else if (msg.type === 'status') refreshStatus();
+      else if (msg.type === 'auth') Access.setAuthorized(!!msg.authorized);
+      else if (msg.type === 'error') {
+        if (msg.code === 'unauthorized') Access.setAuthorized(false, 'Token required.');
+        else toast(friendlyError(msg.code, msg.message), 3500);
       }
     } catch (e) {
       console.warn('Bad WS message', e);
     }
   };
-  State.ws.onclose = () => {
+  ws.onclose = () => {
+    if (State.ws !== ws) return;           // superseded by a reconnect with a new token
     State.wsConnected = false;
     $('#sb-ws').textContent = 'reconnecting…';
     setTimeout(connectWS, 1500);
   };
-  State.ws.onerror = () => State.ws.close();
+  ws.onerror = () => ws.close();
+}
+
+// Re-open the stream (new token).
+function reconnectWS() {
+  const old = State.ws;
+  State.ws = null;
+  if (old) { try { old.close(); } catch (e) { /* ignore */ } }
+  connectWS();
 }
 
 function sendWS(obj) {
@@ -118,9 +141,13 @@ function sendWS(obj) {
 function handleHello(msg) {
   State.cfg = msg.config || {};
   State.hardwareConnected = !!msg.connected;
+  Access.onHello(msg);
+  if (Array.isArray(msg.int_bounds_us)) applyIntBounds(msg.int_bounds_us);
   applyConfigToUI(State.cfg);
+  Hm.onConfig(State.cfg);
   updateConnectButton();
   loadReferenceNames();
+  Hm.sync();
 
   // Populate backend dropdown
   const bsel = $('#backend-select');
@@ -203,6 +230,8 @@ function handleFrame(msg) {
   if (msg.spec_max !== undefined) State.specRange.max = msg.spec_max;
   // Calibration: unit of the data + valid range of the active v2 profile.
   State.validRange = Array.isArray(msg.valid_range_nm) ? msg.valid_range_nm : null;
+  State.validSegments = Array.isArray(msg.valid_segments_nm) ? msg.valid_segments_nm : null;
+  State.luxCal = msg.lux_calibration || null;
   if (msg.unit !== undefined && (msg.unit !== State.unit || msg.unit_label !== State.unitLabel)) {
     State.unit = msg.unit;
     State.unitLabel = msg.unit_label || msg.unit;
@@ -493,6 +522,18 @@ function validRangePlugin() {
     if (xmin == null || xmax == null) return;
     ctx.save();
     ctx.fillStyle = 'rgba(128,128,128,0.16)';
+    // Gaps BETWEEN valid segments (valid_segments_nm) are shaded the same way.
+    const segs = State.validSegments;
+    if (Array.isArray(segs) && segs.length > 1) {
+      for (let i = 0; i + 1 < segs.length; i++) {
+        const g0 = Number(segs[i][1]), g1 = Number(segs[i + 1][0]);
+        if (!isFinite(g0) || !isFinite(g1) || g1 <= g0) continue;
+        if (g1 <= xmin || g0 >= xmax) continue;
+        const xa = Math.round(u.valToPos(Math.max(g0, xmin), 'x', true));
+        const xb = Math.round(u.valToPos(Math.min(g1, xmax), 'x', true));
+        if (xb > xa) ctx.fillRect(xa, top, xb - xa, height);
+      }
+    }
     if (lo != null && lo > xmin) {
       const x1 = Math.round(u.valToPos(Math.min(lo, xmax), 'x', true));
       if (x1 > left) ctx.fillRect(left, top, x1 - left, height);
@@ -577,7 +618,7 @@ async function loadReferenceNames() {
   const sel = $('#cfg-reference_library');
   if (!sel) return;
   try {
-    const r = await fetch('/api/references').then(r => r.json());
+    const r = await apiFetch('/api/references').then(r => r.json());
     const names = r.names || [];
     const current = State.cfg.reference_library || 'None';
     sel.innerHTML = '';
@@ -596,7 +637,7 @@ async function applyReference(name) {
     return;
   }
   try {
-    const r = await fetch('/api/reference?name=' + encodeURIComponent(name))
+    const r = await apiFetch('/api/reference?name=' + encodeURIComponent(name))
       .then(r => r.json());
     State.referenceValues = (r.values && r.values.length)
       ? Float64Array.from(r.values) : null;
@@ -1037,10 +1078,14 @@ function measureModePlugin() {
 // frame's wavelength axis, so the waterfall shows the device's native line
 // resolution. The canvas is fully redrawn from this history every frame, so
 // resizing never wipes data and the buffer always scrolls.
-const HM_ROWS = 240;        // frames of history kept (taller waterfall)
+// Rows kept = server buffer size (State.hmSize, Hm module); default until known.
+const HM_ROWS_DEFAULT = 100;
+const hmRows = () => Math.max(10, State.hmSize || HM_ROWS_DEFAULT);
 
 function initHeatmap() {
+  if (State.hm && State.hm.inited) return;      // may already exist (Hm.sync / first frame)
   State.hm = {
+    inited: true,
     rows: [],               // [{vals:Float32Array(N) normalized, } ...] newest first
     xMin: null, xMax: null, // wavelength span the rows were normalized against
     cursor: null,           // {x,y} in CSS px while hovering, else null
@@ -1091,8 +1136,15 @@ function rollHeatmap(intensities) {
   for (let i = 0; i < N; i++) norm[i] = Math.max(0, Math.min(1, ys[i] / yMax));
 
   State.hm.xMin = xMin; State.hm.xMax = xMax;
-  State.hm.rows.unshift({ norm, raw: ys, xs });   // index 0 = newest (drawn at bottom)
-  if (State.hm.rows.length > HM_ROWS) State.hm.rows.length = HM_ROWS;
+  // Same logging rule as the server buffer: one column per measurement
+  // interval (0 = every frame).
+  const iv = Number(State.cfg.heatmap_measure_interval_ms) || 0;
+  const nowMs = performance.now();
+  if (iv > 0 && State.hm.rows.length && nowMs - (State.hm.lastPush || 0) < iv) return;
+  State.hm.lastPush = nowMs;
+  State.hm.rows.unshift({ norm, raw: ys, xs, t: nowMs });   // index 0 = newest (drawn at bottom)
+  if (State.hm.rows.length > hmRows()) State.hm.rows.length = hmRows();
+  Hm.onRows();
 
   if (State.activeTab === 'heatmap') redrawHeatmap();
 }
@@ -1131,7 +1183,7 @@ function redrawHeatmap() {
   if (rows.length === 0) return;
 
   const xMin = State.hm.xMin, xMax = State.hm.xMax;
-  const bandH = ch / HM_ROWS;
+  const bandH = ch / hmRows();
   for (let r = 0; r < rows.length; r++) {
     // Newest row (index 0) at the BOTTOM, history scrolling upward — matches the
     // desktop app's waterfall direction.
@@ -1153,6 +1205,16 @@ function redrawHeatmap() {
     ctx.putImageData(band, 0, y0);
   }
 
+  // Rewind marker: the frame picked with the slider (index 0 = newest).
+  if (State.hm.pin != null && State.hm.pin < hmRows()) {
+    const py = Math.round(ch - (State.hm.pin + 0.5) * bandH);
+    ctx.save();
+    ctx.strokeStyle = getCss('--warn') || '#d8b46a';
+    ctx.lineWidth = Math.max(1, dpr);
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(cw, py); ctx.stroke();
+    ctx.restore();
+  }
+
   // Measuring crosshair + readout (CSS-pixel coords from the hover handler).
   const cur = State.hm.cursor;
   if (cur && cur.w > 0) {
@@ -1171,7 +1233,7 @@ function redrawHeatmap() {
     // Which frame (row) and wavelength is under the cursor? Newest is at the
     // bottom, so invert the vertical position.
     const rIdx = Math.min(rows.length - 1,
-                          Math.max(0, Math.floor((1 - cur.y / cssH) * HM_ROWS)));
+                          Math.max(0, Math.floor((1 - cur.y / cssH) * hmRows())));
     const row = rows[rIdx];
     let label = '';
     if (row) {
@@ -1228,11 +1290,12 @@ function infernoColor(t) {
 function saveColorReport(fmt) {
   const wl = State.scopeData[SI.X], ys = State.scopeData[SI.LIVE];
   if (!wl || !wl.length) { toast('No spectrum yet'); return; }
-  fetch('/api/color/report', {
+  apiFetch('/api/color/report', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ format: fmt,
-      wavelengths: Array.from(wl), intensities: Array.from(ys) }),
+      wavelengths: Array.from(wl), intensities: Array.from(ys),
+      lux_calibration: State.luxCal || 0 }),
   })
     .then(r => r.ok ? r.blob() : Promise.reject(r.status))
     .then(blob => {
@@ -1246,9 +1309,14 @@ function saveColorReport(fmt) {
       ? 'Report needs matplotlib on the server' : 'Report export failed'));
 }
 
+function fmtLux(v) {
+  const a = Math.abs(v);
+  return a >= 100 ? v.toFixed(0) : (a >= 1 ? v.toFixed(1) : v.toPrecision(3));
+}
+
 function updateColorTab(c) {
   const f = (k, fmt = (v) => v.toFixed(2)) =>
-    (c[k] == null ? '—' : fmt(c[k]));
+    (c[k] == null || !isFinite(c[k]) ? '—' : fmt(c[k]));
   $('#c-cct').innerHTML  = `${f('cct', v => v.toFixed(0))}<span class="unit"> K</span>`;
   $('#c-ra').textContent = f('Ra',  v => v.toFixed(1));
   $('#c-duv').textContent = f('duv', v => (v >= 0 ? '+' : '') + v.toFixed(4));
@@ -1263,6 +1331,13 @@ function updateColorTab(c) {
   $('#c-fwhm').innerHTML  = `${f('fwhm_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
   $('#c-cent').innerHTML  = `${f('centroid_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
   $('#c-sp').textContent  = f('sp_ratio', v => v.toFixed(3));
+  $('#c-lux').innerHTML   = `${f('lux', v => fmtLux(v))}<span class="unit"> lx</span>`;
+  $('#c-fc').innerHTML    = `${f('fc', v => fmtLux(v))}<span class="unit"> fc</span>`;
+  $('#c-central').innerHTML = `${f('central_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
+  $('#c-u60').textContent = f('u60', v => v.toFixed(4));
+  $('#c-v60').textContent = f('v60', v => v.toFixed(4));
+  $('#c-r9').textContent  = (Array.isArray(c.Ri) && c.Ri[8] != null && isFinite(c.Ri[8]))
+                            ? Number(c.Ri[8]).toFixed(1) : '—';
   $('#c-r').innerHTML = `${f('red_pct',   v => v.toFixed(1))}<span class="unit"> %</span>`;
   $('#c-g').innerHTML = `${f('green_pct', v => v.toFixed(1))}<span class="unit"> %</span>`;
   $('#c-b').innerHTML = `${f('blue_pct',  v => v.toFixed(1))}<span class="unit"> %</span>`;
@@ -1621,6 +1696,8 @@ function applyConfigToUI(cfg) {
       const scale = cfgScaleOf(el);
       let dv = (typeof v === 'number' && scale !== 1) ? killFloatDust(v / scale) : v;
       if (el.type === 'checkbox') el.checked = !!dv;
+      else if (key === 'exposure_ms' && typeof dv === 'number') el.value = dv.toFixed(2);
+      else if (dv === null || dv === undefined) el.value = '';
       else                        el.value = dv;
     }
     const tog = document.querySelector(`.toggle[data-key="${key}"]`);
@@ -1641,8 +1718,10 @@ function applyConfigToUI(cfg) {
 // Reset integration time to 20 ms (mirrors the desktop GUI's "20 ms" button).
 function resetExposure() {
   const el = $('#cfg-exposure_ms');
-  if (el) el.value = 20;
-  pushCfg({ exposure_ms: 20 });
+  let ms = 20;
+  if (State.intBounds) ms = Math.max(State.intBounds[0] / 1000, Math.min(State.intBounds[1] / 1000, ms));
+  if (el) el.value = ms.toFixed(2);
+  pushCfg({ exposure_ms: ms });
 }
 
 // Snap Y max to the current frame peak and turn Auto-scale Y off (mirrors the
@@ -1663,7 +1742,9 @@ function snapYToPeak() {
 
 function pushCfg(partial) {
   Object.assign(State.cfg, partial);
-  sendWS({ type: 'set_config', payload: partial });
+  // Without an accepted token the server refuses set_config: display-only
+  // settings still work locally (they live in State.cfg).
+  if (Access.canWrite()) sendWS({ type: 'set_config', payload: partial });
   // Editing the display X range clears any active wheel/drag zoom so the new
   // limits actually take effect.
   if ('x_min_nm' in partial || 'x_max_nm' in partial) State.xView = null;
@@ -1752,7 +1833,7 @@ function syncPauseButton() {
 // ── Toolbar handlers ─────────────────────────────────────────
 async function scanDevices() {
   const backend = $('#backend-select').value || '';
-  const r = await fetch('/api/devices?backend=' + encodeURIComponent(backend)).then(r => r.json());
+  const r = await apiFetch('/api/devices?backend=' + encodeURIComponent(backend)).then(r => r.json());
   const sel = $('#device-select');
   sel.innerHTML = '';
   if ((r.devices || []).length === 0) {
@@ -1766,23 +1847,25 @@ async function scanDevices() {
 
 async function toggleConnection() {
   if (State.hardwareConnected) {
-    await fetch('/api/disconnect', { method: 'POST' });
+    const r = await apiFetch('/api/disconnect', { method: 'POST' });
+    if (!r.ok) { toast(await responseError(r), 3500); return; }
     State.hardwareConnected = false;
   } else {
     const path = $('#device-select').value || null;
     try {
       const backend = $('#backend-select').value || null;
-      const r = await fetch('/api/connect', {
+      const r = await apiFetch('/api/connect', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ device_path: path, backend: backend }),
       });
-      if (!r.ok) throw new Error((await r.json()).detail);
+      if (!r.ok) throw new Error(await responseError(r));
       State.hardwareConnected = true;
       State.paused = false;          // a fresh connect starts running
       // Re-fetch the active reference: the server interpolates onto the
       // connected device's wavelength axis, which differs per device.
       applyReference($('#cfg-reference_library')?.value || State.referenceName);
-    } catch (e) { toast('Connect failed: ' + e.message); }
+      refreshStatus();
+    } catch (e) { toast('Connect failed: ' + e.message, 3500); }
   }
   updateConnectButton();
 }
@@ -1838,8 +1921,8 @@ function switchTab(tab) {
 
 // ── Export ──────────────────────────────────────────────────
 function downloadCsv() {
-  const tab = State.activeTab === 'heatmap' ? 'heatmap' : 'spectrum';
-  window.location.href = `/api/export/csv?tab=${tab}`;
+  if (State.activeTab === 'heatmap') { Hm.exportCsv('full'); return; }
+  apiDownload('/api/export/csv?tab=spectrum', 'spectrum.csv');
 }
 
 function downloadPng() {
@@ -1905,9 +1988,18 @@ function exportColorReport() {
 
 function copyClipboard() {
   if (!State.lastFrame) { toast('No data yet'); return; }
-  const lines = ['Wavelength_nm\tIntensity_ADC'];
-  for (let i = 0; i < State.lastFrame.wavelengths.length; i++) {
-    lines.push(`${State.lastFrame.wavelengths[i].toFixed(2)}\t${State.lastFrame.intensities[i].toFixed(2)}`);
+  // Masked pixels (outside the calibration's valid range) arrive as null.
+  const fin = (v, d) => (v == null || !isFinite(v)) ? '' : Number(v).toFixed(d);
+  const isCount = State.unit === 'counts' || State.unit === 'counts/s';
+  const unitHdr = State.unit === 'counts' ? 'Intensity_ADC' : `Value_${State.unit}`;
+  const TAB = String.fromCharCode(9);
+  const lines = [`Wavelength_nm${TAB}${unitHdr}`];
+  const wl = State.lastFrame.wavelengths || [];
+  const iv = State.lastFrame.intensities || [];
+  for (let i = 0; i < wl.length; i++) {
+    const v = iv[i];
+    const txt = isCount ? fin(v, 2) : ((v == null || !isFinite(v)) ? '' : Number(v).toPrecision(6));
+    lines.push(`${fin(wl[i], 2)}${TAB}${txt}`);
   }
   navigator.clipboard.writeText(lines.join('\n'))
     .then(() => toast(`Copied ${lines.length - 1} samples`))
@@ -1916,6 +2008,7 @@ function copyClipboard() {
 
 // ── Bootstrap ────────────────────────────────────────────────
 async function init() {
+  Access.loadToken();       // ?token= → localStorage; before any request / the stream
   // Wire buttons + open the WebSocket FIRST so the connection controls and
   // dropdown population (via the hello frame) never depend on the plot
   // libraries initialising. A throw in makeScopePlot() must not leave the
@@ -1965,18 +2058,22 @@ async function init() {
       $('#sidebar').classList.toggle('open');
     });
     wireConfigInputs();
+    tagLocks();
+    Access.init();
+    Jobs.init();
+    Hm.init();
+    Dark.init();
+    CalMgr.init();
+    CalRun.init();
+    DataSec.init();
+    WlCal.init();
     Cal.init();
   } catch (e) {
     console.error('init: wiring controls failed', e);
   }
 
   // Status (best-effort)
-  try {
-    const s = await fetch('/api/status').then(r => r.json());
-    $('#sb-backend').textContent = s.backend;
-    State.hardwareConnected = !!s.connected;
-    updateConnectButton();
-  } catch (e) { console.warn('init: /api/status failed', e); }
+  try { await refreshStatus(true); } catch (e) { console.warn('init: /api/status failed', e); }
 
   // WebSocket — populates backend/device dropdowns from the hello frame.
   try { connectWS(); } catch (e) { console.error('init: connectWS failed', e); }
@@ -1999,7 +2096,7 @@ const Cal = (() => {
   let items = [];
 
   const api = async (url, opts) => {
-    const r = await fetch(url, opts);
+    const r = await apiFetch(url, opts);
     let j = null;
     try { j = await r.json(); } catch (e) { /* non-JSON body */ }
     return { r, j };
@@ -2008,7 +2105,7 @@ const Cal = (() => {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body || {}),
   });
-  const err = (j, r) => (j && (j.detail || j.message)) || `HTTP ${r.status}`;
+  const err = (j, r) => errText(j, r);
 
   function showStatus(st) {
     const el = $('#cal-status');
@@ -2020,8 +2117,15 @@ const Cal = (() => {
     if ((s === 'wl_changed' || s === 'nl_changed') && !txt) txt = 'Calibration conditions changed – recalibrate.';
     else if (!txt && s === 'none') txt = 'No calibration active (counts).';
     else if (!txt && s === 'ok') txt = 'OK';
-    if (st.valid_range_nm) {
-      txt += ` Valid ${st.valid_range_nm[0].toFixed(0)}–${st.valid_range_nm[1].toFixed(0)} nm.`;
+    if (Array.isArray(st.valid_segments_nm) && st.valid_segments_nm.length > 1) {
+      txt += ' Valid ' + st.valid_segments_nm.map(
+        (g) => `${Number(g[0]).toFixed(0)}–${Number(g[1]).toFixed(0)}`).join(', ') + ' nm.';
+    } else if (Array.isArray(st.valid_range_nm) && st.valid_range_nm.length >= 2) {
+      txt += ` Valid ${Number(st.valid_range_nm[0]).toFixed(0)}–${Number(st.valid_range_nm[1]).toFixed(0)} nm.`;
+    }
+    if (st.implausible) {
+      txt += ' ⚠ Saved although the plausibility check failed.';
+      if (el.className.indexOf('wl_changed') < 0) el.className += ' wl_changed';
     }
     if (st.dark_source === 'stored') txt += ' Dark: stored (this t_int).';
     else if (st.dark_source === 'stored_model') txt += ' Dark: per-pixel model b+r·t.';
@@ -2033,13 +2137,17 @@ const Cal = (() => {
   }
 
   // Frames carry the status; only re-render when it changes.
-  function onFrameStatus(st) {
+  function onFrameStatus(st, fromEvent) {
     if (!st) return;
     const key = JSON.stringify([st.state, st.profile_id, st.label, st.unit,
-                                st.dark_source, st.dark_warning]);
+                                st.dark_source, st.dark_warning, st.implausible,
+                                st.valid_range_nm, st.valid_segments_nm]);
     if (key === lastKey) return;
     lastKey = key;
+    State.calStatus = st;
     showStatus(st);
+    updateRcState();
+    if (fromEvent) refresh();       // profile list may have changed (new / activated)
   }
 
   async function refresh() {
@@ -2051,6 +2159,7 @@ const Cal = (() => {
     catch (e) { return; }
     if (!j || !Array.isArray(j.items)) return;
     items = j.items;
+    State.calSelection = j.selection;
     sel.innerHTML = '';
     for (const it of items) {
       const warn = it.state === 'wl_changed' || it.state === 'nl_changed';
@@ -2064,6 +2173,9 @@ const Cal = (() => {
     for (const o of (j.other_units || [])) oth.appendChild(new Option(`${o.serial} · ${o.label}`, o.id));
     $('#cal-copy').disabled = !(j.other_units || []).length;
     showStatus(j.status);
+    if (j.status) State.calStatus = j.status;
+    updateRcState();
+    CalMgr.setProfiles(j);
   }
 
   async function select(value, confirm) {
@@ -2134,8 +2246,1317 @@ const Cal = (() => {
     refresh();
   }
 
-  return { init, refresh, onFrameStatus };
+  return { init, refresh, onFrameStatus, select, getItems: () => items };
 })();
+
+// ════════════════════════════════════════════════════════════════════
+//  Web parity (docs/PARITAET_Desktop_Web.md §13): access token, control
+//  owner + jobs, heatmap controls, calibration manager / runs, data settings.
+//  Everything below only talks to the server; the browser computes nothing
+//  the engine already delivers.
+// ════════════════════════════════════════════════════════════════════
+const WEB_OWNER = 'remote:web';
+
+// Keys the engine accepts only from the control owner (engine.CONTROL_KEYS).
+const CONTROL_KEYS = new Set([
+  'exposure_ms', 'auto_exposure', 'frames_to_average', 'pause',
+  'fast_preview_enabled', 'fast_preview_short_pct',
+  'dark_correction', 'dark_mode', 'dark_bias_adc', 'dark_rate_adc_per_s',
+  'hot_pixel_filter', 'smoothing_width', 'spatial_smoothing',
+  'spatial_smoothing_width', 'display_unit', 'irradiance_unit',
+  'radiometric_calibration_factor', 'response_correction_active',
+  'fusion_enabled', 'fusion_smoothing', 'fusion_change_sigma', 'fusion_noise_floor',
+  'fusion_noise_gain', 'fusion_emit_hz', 'fusion_emit_max_hz', 'fusion_emit_min_hz',
+]);
+// Display-only settings of this page: they keep working without a token.
+const DISPLAY_KEYS = new Set([
+  'x_min_nm', 'x_max_nm', 'y_max_adc', 'auto_y', 'theme', 'show_peaks',
+  'measure_mode', 'measure_a_nm', 'measure_b_nm', 'reference_library',
+]);
+
+const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function showModal(id, on) {
+  const m = document.getElementById(id);
+  if (m) m.hidden = !on;
+}
+
+// ── fetch wrapper: bearer token + client id on every call ────
+function apiFetch(url, opts) {
+  const o = Object.assign({}, opts || {});
+  const h = new Headers(o.headers || {});
+  const tok = Access.token();
+  if (tok && !h.has('Authorization')) h.set('Authorization', 'Bearer ' + tok);
+  if (!h.has('X-Client-Id')) h.set('X-Client-Id', 'web');
+  o.headers = h;
+  return window.fetch(url, o).then((r) => {
+    if (r.status === 401) Access.onUnauthorized();
+    return r;
+  });
+}
+
+async function apiJson(url, opts) {
+  const r = await apiFetch(url, opts);
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* empty / non-JSON body */ }
+  return { r, j };
+}
+const apiSend = (method, url, body) => apiJson(url, {
+  method, headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+const apiPost = (url, body) => apiSend('POST', url, body === undefined ? {} : body);
+const apiPut = (url, body) => apiSend('PUT', url, body);
+const apiDelete = (url) => apiJson(url, { method: 'DELETE' });
+
+// Readable message for an error response ({error:{code,message}} or {detail}).
+function errText(j, r) {
+  let code = null, msg = null;
+  if (j && j.error && typeof j.error === 'object') { code = j.error.code; msg = j.error.message; }
+  else if (j && typeof j.detail === 'string') msg = j.detail;
+  else if (j && Array.isArray(j.detail)) msg = j.detail.map((d) => d.msg).join('; ');
+  else if (j && typeof j.message === 'string') msg = j.message;
+  const status = r ? r.status : 0;
+  return friendlyError(code, msg || (status ? `HTTP ${status}` : 'Request failed'), status);
+}
+async function responseError(r) {
+  let j = null;
+  try { j = await r.clone().json(); } catch (e) { /* ignore */ }
+  return errText(j, r);
+}
+function friendlyError(code, msg, status) {
+  msg = msg || 'Request failed';
+  if (code === 'unauthorized' || status === 401) {
+    return 'Not authorized: the API token is missing or invalid.';
+  }
+  if (code === 'control_busy' || (status === 409 && /control is held/i.test(msg))) {
+    return `Busy: ${msg} Wait until it is finished, or cancel that job.`;
+  }
+  return msg;
+}
+
+// Download a (possibly authenticated) URL as a file.
+async function apiDownload(url, fallbackName) {
+  try {
+    const r = await apiFetch(url);
+    if (!r.ok) { toast(await responseError(r), 3500); return false; }
+    const blob = await r.blob();
+    let name = fallbackName || 'download';
+    const cd = r.headers.get('Content-Disposition') || '';
+    const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+    if (m) { try { name = decodeURIComponent(m[1]); } catch (e) { name = m[1]; } }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    return true;
+  } catch (e) {
+    toast('Download failed');
+    return false;
+  }
+}
+
+// ── Access: token, read-only state, control owner ────────────
+const Access = (() => {
+  const KEY = 'ps2600_token';
+  let token = null, required = false, authorized = true;
+  let control = { owner: null, reason: '' };
+  let dialogOpen = false;
+
+  function loadToken() {
+    try {
+      const u = new URL(location.href);
+      const t = u.searchParams.get('token');
+      if (t) {
+        token = t;
+        try { localStorage.setItem(KEY, t); } catch (e) { /* private mode */ }
+        u.searchParams.delete('token');           // keep the secret out of history / copies
+        history.replaceState(null, '', u.pathname + u.search + u.hash);
+      }
+    } catch (e) { /* ignore */ }
+    if (!token) {
+      try { token = localStorage.getItem(KEY) || null; } catch (e) { token = null; }
+    }
+  }
+  function clearToken() {
+    token = null;
+    try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+  }
+  const canWrite = () => !required || authorized;
+  const foreign = () => !!(control && control.owner && control.owner !== WEB_OWNER);
+
+  function controlText(c) {
+    if (!c || !c.owner) return 'free';
+    const why = c.reason ? ` (${c.reason})` : '';
+    return `${c.owner}${why}`;
+  }
+
+  function lockedFor(kind) {
+    if (!canWrite()) return true;
+    return kind === 'control' && foreign();
+  }
+
+  function applyLocks() {
+    const why = !canWrite() ? 'Read-only: an API token is required.'
+      : `Control is held by ${controlText(control)}.`;
+    document.querySelectorAll('[data-lock]').forEach((el) => {
+      const l = lockedFor(el.dataset.lock);
+      el.classList.toggle('locked', l);
+      if (l) {
+        el.setAttribute('aria-disabled', 'true');
+        el.tabIndex = -1;
+        if (!('title0' in el.dataset)) el.dataset.title0 = el.title || '';
+        el.title = why;
+      } else {
+        el.removeAttribute('aria-disabled');
+        el.removeAttribute('tabindex');
+        if ('title0' in el.dataset) { el.title = el.dataset.title0; delete el.dataset.title0; }
+      }
+    });
+  }
+
+  function refresh() {
+    const ro = required && !authorized;
+    document.body.classList.toggle('readonly', ro);
+    const chip = $('#sb-access');
+    if (chip) {
+      chip.hidden = !required;
+      chip.className = 'chip ' + (ro ? 'warn' : 'ok');
+      chip.textContent = ro ? 'read-only' : 'token ok';
+      chip.style.cursor = ro ? 'pointer' : '';
+      chip.title = ro ? 'No valid API token: click to enter one.' : 'API token accepted.';
+    }
+    const el = $('#sb-control');
+    if (el) {
+      el.textContent = controlText(control);
+      el.style.color = foreign() ? 'var(--warn)' : '';
+    }
+    applyLocks();
+  }
+
+  function promptToken(msg) {
+    dialogOpen = true;
+    showModal('token-dialog', true);
+    const e = $('#token-error'); if (e) e.textContent = msg || '';
+    setTimeout(() => { const i = $('#token-input'); if (i) i.focus(); }, 30);
+  }
+  function closeDialog() { dialogOpen = false; showModal('token-dialog', false); }
+
+  function onHello(msg) {
+    required = !!msg.token_required;
+    authorized = msg.authorized !== false;
+    if (msg.control) control = msg.control;
+    if (required && !authorized) {
+      const had = !!token;
+      if (had) clearToken();
+      promptToken(had ? 'The token was rejected. Enter a valid token.' : '');
+    } else {
+      closeDialog();
+    }
+    refresh();
+  }
+  function onStatus(s) {
+    if (!s) return;
+    if ('token_required' in s) {
+      required = !!s.token_required;
+      authorized = !required || !!token;       // confirmed by the stream's hello
+      if (required && !token && !dialogOpen) promptToken('');
+    }
+    if (s.control) control = s.control;
+    refresh();
+  }
+  function setAuthorized(a, msg) {
+    authorized = !!a;
+    if (!authorized) promptToken(msg || 'The token was rejected.');
+    refresh();
+  }
+  function onUnauthorized() {
+    required = true; authorized = false;
+    const had = !!token;
+    if (had) clearToken();
+    promptToken(had ? 'The token was rejected. Enter a valid token.' : '');
+    refresh();
+  }
+  function setControl(c) { control = c || { owner: null, reason: '' }; refresh(); }
+
+  function submit() {
+    const inp = $('#token-input');
+    const v = ((inp && inp.value) || '').trim();
+    if (!v) { $('#token-error').textContent = 'Enter the token.'; return; }
+    token = v;
+    try { localStorage.setItem(KEY, v); } catch (e) { /* ignore */ }
+    inp.value = '';
+    closeDialog();
+    reconnectWS();               // the stream authorizes via ?token=
+    refreshStatus();
+  }
+
+  function init() {
+    $('#token-ok').addEventListener('click', submit);
+    $('#token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    $('#token-skip').addEventListener('click', closeDialog);
+    $('#sb-access').addEventListener('click', () => { if (required && !authorized) promptToken(''); });
+    refresh();
+  }
+
+  return { init, loadToken, onHello, onStatus, setControl, setAuthorized, onUnauthorized,
+           canWrite, foreign, applyLocks, controlText, token: () => token,
+           control: () => control };
+})();
+
+// Mark config-bound controls with the kind of permission they need.
+function tagLocks() {
+  const els = [...$$('[id^="cfg-"]'), ...$$('input[data-key], select[data-key]'), ...$$('.toggle[data-key]')];
+  for (const el of els) {
+    const key = cfgKeyOf(el);
+    if (!key || DISPLAY_KEYS.has(key) || el.dataset.lock) continue;
+    el.dataset.lock = CONTROL_KEYS.has(key) ? 'control' : 'auth';
+  }
+  Access.applyLocks();
+}
+
+// ── Status / bounds / response-compensation indicator ────────
+function applyIntBounds(b) {
+  const lo = Number(b[0]), hi = Number(b[1]);
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return;
+  State.intBounds = [lo, hi];
+  const el = $('#cfg-exposure_ms');
+  if (el) {
+    el.min = (lo / 1000).toFixed(2);
+    el.max = (hi / 1000).toFixed(2);
+    el.step = '0.01';
+    el.title = `Integration time ${(lo / 1000).toFixed(2)} – ${(hi / 1000).toFixed(2)} ms (device limits)`;
+    const v = parseFloat(el.value);
+    if (isFinite(v)) el.value = Math.max(lo / 1000, Math.min(hi / 1000, v)).toFixed(2);
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const { r, j: s } = await apiJson('/api/status');
+    if (!r.ok || !s) return;
+    $('#sb-backend').textContent = s.backend;
+    State.hardwareConnected = !!s.connected;
+    updateConnectButton();
+    const v = $('#sb-version');
+    if (v) v.textContent = s.version && s.version !== 'unknown' ? `v${String(s.version).replace(/^v/i, '')}` : '';
+    if (Array.isArray(s.int_bounds_us)) applyIntBounds(s.int_bounds_us);
+    if (s.heatmap_size) Hm.setSize(s.heatmap_size);
+    Access.onStatus(s);
+    if (s.autosave) Hm.onAutosave(s.autosave);
+  } catch (e) { console.warn('status refresh failed', e); }
+}
+
+// "Response compensation" is no switch: it follows the profile selection.
+function updateRcState() {
+  const el = $('#rc-state');
+  if (!el) return;
+  const st = State.calStatus || {};
+  const on = st.state === 'ok' && st.label && st.label !== 'None';
+  const bad = st.state === 'wl_changed' || st.state === 'nl_changed';
+  el.className = 'chip ' + (bad ? 'warn' : (on ? 'ok' : 'neutral'));
+  el.textContent = bad ? 'conditions changed' : (on ? `active · ${st.label}` : 'off');
+}
+
+// ── Jobs: status bar, user-step prompt, tracking ─────────────
+const Jobs = (() => {
+  const FINAL = new Set(['done', 'failed', 'cancelled']);
+  const active = new Map();
+  const trackers = new Map();             // id → { cb, timer }
+  let promptId = null, promptMsg = '';
+
+  const TITLES = {
+    cover: 'Cover the light path', uncover: 'Uncover the light path',
+    mount_known: 'Mount the known optics', swap_optics: 'Swap to the new optics',
+  };
+
+  function renderBar() {
+    const wrap = $('#sb-job-wrap'), el = $('#sb-job');
+    if (!wrap || !el) return;
+    const list = [...active.values()];
+    if (!list.length) { wrap.hidden = true; return; }
+    const j = list[list.length - 1];
+    const pct = Math.round(100 * (Number(j.progress) || 0));
+    let txt = `${j.kind} ${pct}%`;
+    if (j.step) txt += ` · ${String(j.step).replace(/_/g, ' ')}`;
+    if (j.status === 'waiting_for_user') txt += ` · waiting: ${(j.prompt && j.prompt.message) || 'user action'}`;
+    else if (j.message) txt += ` · ${j.message}`;
+    if (j.owner && j.owner !== WEB_OWNER) txt += ` [${j.owner}]`;
+    if (list.length > 1) txt += ` (+${list.length - 1})`;
+    el.textContent = txt;
+    el.title = txt;
+    wrap.hidden = false;
+  }
+
+  function showPrompt(j) {
+    promptId = j.id;
+    promptMsg = (j.prompt && j.prompt.message) || '';
+    $('#job-dialog-title').textContent = TITLES[j.prompt && j.prompt.action] || 'Action required';
+    $('#job-dialog-msg').textContent = promptMsg;
+    $('#job-dialog-job').textContent = `${j.kind}${j.step ? ' · ' + String(j.step).replace(/_/g, ' ') : ''}`;
+    showModal('job-dialog', true);
+    const b = $('#job-continue'); if (b) b.focus();
+  }
+  function hidePrompt() { promptId = null; promptMsg = ''; showModal('job-dialog', false); }
+
+  function updatePrompt(j) {
+    if (j.status === 'waiting_for_user' && j.owner === WEB_OWNER && j.prompt) {
+      if (promptId !== j.id || promptMsg !== j.prompt.message) showPrompt(j);
+    } else if (promptId === j.id) {
+      hidePrompt();
+    }
+  }
+
+  function ingest(j) {
+    if (!j || !j.id) return;
+    if (FINAL.has(j.status)) active.delete(j.id); else active.set(j.id, j);
+    renderBar();
+    updatePrompt(j);
+  }
+
+  // A job of this page: poll the full job (log, result) until it is final.
+  function track(id, cb) {
+    const old = trackers.get(id);
+    if (old) clearTimeout(old.timer);
+    const t = { cb, timer: null };
+    trackers.set(id, t);
+    const poll = async () => {
+      let full = null;
+      try {
+        const { r, j } = await apiJson(`/api/v1/jobs/${encodeURIComponent(id)}`);
+        if (r.ok) full = j;
+      } catch (e) { /* retry */ }
+      if (trackers.get(id) !== t) return;          // superseded by a newer track()
+      if (full) {
+        ingest(full);
+        const fin = FINAL.has(full.status);
+        try { cb(full, fin); } catch (e) { console.error('job callback failed', e); }
+        if (fin) { trackers.delete(id); return; }
+      }
+      t.timer = setTimeout(poll, 800);
+    };
+    poll();
+  }
+
+  function onWsJob(j) {
+    ingest(j);
+    const t = j && trackers.get(j.id);
+    if (t) { clearTimeout(t.timer); t.timer = setTimeout(() => track(j.id, t.cb), 0); }
+  }
+
+  async function answer(action) {
+    if (!promptId) return;
+    const id = promptId;
+    const { r, j } = await apiPost(`/api/v1/jobs/${encodeURIComponent(id)}/${action}`);
+    if (!r.ok) { toast(errText(j, r), 3500); return; }
+    if (j) ingest(j);
+    hidePrompt();
+  }
+
+  async function cancel(id) {
+    const { r, j } = await apiPost(`/api/v1/jobs/${encodeURIComponent(id)}/cancel`);
+    if (!r.ok) toast(errText(j, r), 3500);
+    return r.ok;
+  }
+
+  async function init() {
+    $('#job-continue').addEventListener('click', () => answer('continue'));
+    $('#job-cancel').addEventListener('click', () => answer('cancel'));
+    try {
+      const { r, j } = await apiJson('/api/v1/jobs?active=true');
+      if (r.ok && Array.isArray(j)) j.slice().reverse().forEach(ingest);
+    } catch (e) { /* ignore */ }
+  }
+
+  return { init, onWsJob, track, ingest, cancel };
+})();
+
+// ── Heatmap controls (buffer, interval, clear, autosave, export, rewind) ──
+const Hm = (() => {
+  const el = (id) => document.getElementById(id);
+  let interval = 0, lastSpanAt = 0, fetchTimer = null, lastFetchAt = 0;
+
+  function fmtDur(s) {
+    if (!isFinite(s)) return '—';
+    if (s < 90) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
+    if (s < 5400) return `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
+    return `${(s / 3600).toFixed(1)} h`;
+  }
+  function updateSpan() {
+    const e = el('hm-span');
+    if (!e) return;
+    const fps = State.lastFrame && State.lastFrame.fps;
+    const per = interval > 0 ? interval / 1000 : (fps > 0 ? 1 / fps : null);
+    e.textContent = per ? `Span ≈ ${fmtDur(hmRows() * per)}` : 'Span —';
+  }
+
+  function clearRows() {
+    if (State.hm) { State.hm.rows.length = 0; State.hm.pin = null; State.hm.lastPush = 0; }
+    const sl = el('hm-rewind');
+    if (sl) { sl.value = 0; sl.max = 0; sl.disabled = true; }
+    setRewindLabel('Live');
+    if (State.hm) redrawHeatmap();
+  }
+
+  function setSize(n) {
+    n = Number(n);
+    if (!isFinite(n) || n < 10) return;
+    const changed = State.hmSize != null && State.hmSize !== n;
+    State.hmSize = n;
+    const b = el('hm-buffer');
+    if (b && document.activeElement !== b) b.value = n;
+    if (changed) clearRows();               // the server buffer is cleared by a size change
+    updateSpan();
+  }
+
+  function onConfig(cfg) {
+    if (!cfg) return;
+    if (cfg.heatmap_buffer_size != null) setSize(cfg.heatmap_buffer_size);
+    if (cfg.heatmap_measure_interval_ms != null) {
+      interval = Math.max(0, Number(cfg.heatmap_measure_interval_ms) || 0);
+      const i = el('hm-interval');
+      if (i && document.activeElement !== i) i.value = interval;
+      updateSpan();
+    }
+  }
+
+  function setRewindLabel(t) { const l = el('hm-rewind-lbl'); if (l) l.textContent = t; }
+
+  async function fetchFrame() {
+    lastFetchAt = performance.now();
+    const pin = State.hm && State.hm.pin;
+    if (pin == null) { setRewindLabel('Live'); return; }
+    const { r, j } = await apiJson(`/api/v1/heatmap/frame?index=${pin}`);
+    if (State.hm.pin !== pin && State.hm.pin != null) return;   // moved on meanwhile
+    if (!r.ok || !j) { setRewindLabel(`Frame ${pin}`); return; }
+    let peak = '';
+    const v = j.values || [], w = j.wavelengths || [];
+    let bi = -1, bv = -Infinity;
+    for (let i = 0; i < v.length; i++) if (v[i] != null && isFinite(v[i]) && v[i] > bv) { bv = v[i]; bi = i; }
+    if (bi >= 0 && w[bi] != null) peak = ` · peak ${Number(w[bi]).toFixed(1)} nm`;
+    const age = (j.age_s == null || !isFinite(j.age_s)) ? '' : `T-${Number(j.age_s).toFixed(1)} s ago · `;
+    setRewindLabel(`${age}frame ${j.index}${peak}`);
+  }
+  function scheduleFetch() {
+    clearTimeout(fetchTimer);
+    fetchTimer = setTimeout(fetchFrame, 120);
+  }
+
+  function onRows() {
+    const hm = State.hm;
+    if (!hm) return;
+    const n = hm.rows.length;
+    const sl = el('hm-rewind');
+    if (hm.pin != null) {                    // DVR: keep following the pinned frame
+      hm.pin = Math.min(hm.pin + 1, Math.max(0, n - 1));
+      if (performance.now() - lastFetchAt > 1000) scheduleFetch();
+    }
+    if (sl) {
+      sl.max = Math.max(0, n - 1);
+      sl.disabled = n < 2;
+      if (hm.pin != null) sl.value = hm.pin;
+    }
+    const now = performance.now();
+    if (now - lastSpanAt > 1000) { lastSpanAt = now; updateSpan(); }
+  }
+
+  function onRewind(v) {
+    if (!State.hm) return;
+    State.hm.pin = v > 0 ? v : null;
+    redrawHeatmap();
+    if (v > 0) scheduleFetch(); else setRewindLabel('Live');
+  }
+
+  function live() {
+    const sl = el('hm-rewind');
+    if (sl) sl.value = 0;
+    onRewind(0);
+  }
+
+  async function putSettings(body, what) {
+    const { r, j } = await apiPut('/api/v1/heatmap', body);
+    if (!r.ok) { toast(errText(j, r), 3500); sync(); return false; }
+    if (j) {
+      setSize(j.size);
+      interval = Number(j.measure_interval_ms) || 0;
+      updateSpan();
+    }
+    if (what === 'size') { clearRows(); toast('Buffer resized (buffer cleared)'); }
+    return true;
+  }
+
+  async function clearBuffer() {
+    const { r, j } = await apiPost('/api/v1/heatmap/clear');
+    if (!r.ok) { toast(errText(j, r), 3500); return; }
+    clearRows();
+    toast('Heatmap buffer cleared');
+  }
+
+  function onAutosave(info) {
+    if (!info) return;
+    const c = el('hm-autosave'), p = el('hm-autosave-path');
+    if (c) c.checked = !!info.active;
+    if (p) {
+      p.textContent = info.active && info.path ? `server: ${info.path}` : '';
+      p.title = info.active ? `File on the server: ${info.path || ''}${info.warning ? ' — ' + info.warning : ''}`
+                            : 'File on the server';
+    }
+  }
+
+  async function setAutosave(on) {
+    const { r, j } = await apiPost('/api/v1/heatmap/autosave', { active: !!on });
+    if (!r.ok) { toast(errText(j, r), 3500); sync(); return; }
+    onAutosave(j);
+    toast(on ? 'Autosave started (file on the server)' : 'Autosave stopped');
+  }
+
+  async function exportCsv(scope) {
+    scope = scope || el('hm-export-scope').value;
+    let q = `scope=${encodeURIComponent(scope)}`;
+    if (scope === 'range') {
+      const a = el('hm-export-start').value, b = el('hm-export-end').value;
+      if (a !== '') q += `&start=${encodeURIComponent(a)}`;
+      if (b !== '') q += `&end=${encodeURIComponent(b)}`;
+    } else if (scope === 'frame') {
+      q += `&index=${(State.hm && State.hm.pin) || 0}`;
+    }
+    await apiDownload(`/api/v1/heatmap/export?${q}`, 'heatmap.csv');
+  }
+
+  // Rebuild the local view from the server buffer after a page load.
+  async function prefill(filled) {
+    if (!State.hm || State.hm.rows.length || !(filled > 0)) return;
+    const { r, j } = await apiJson('/api/heatmap');
+    if (!r.ok || !j || !Array.isArray(j.frames) || !Array.isArray(j.wavelengths)) return;
+    if (State.hm.rows.length) return;                   // live frames arrived meanwhile
+    const xs = Float64Array.from(j.wavelengths);
+    const n = Math.min(filled, j.frames.length, hmRows());
+    for (let i = 0; i < n; i++) {
+      const ys = j.frames[i].map((v) => (v == null || !isFinite(v) ? 0 : v));
+      let mx = 0;
+      for (const v of ys) if (v > mx) mx = v;
+      const yMax = State.cfg.auto_y === false ? (State.cfg.y_max_adc || 4000) : Math.max(50, mx * 1.1);
+      const norm = new Float32Array(ys.length);
+      for (let k = 0; k < ys.length; k++) norm[k] = Math.max(0, Math.min(1, ys[k] / yMax));
+      State.hm.rows.push({ norm, raw: ys, xs, t: 0 });
+    }
+    State.hm.xMin = isFinite(State.cfg.x_min_nm) ? State.cfg.x_min_nm : xs[0];
+    State.hm.xMax = isFinite(State.cfg.x_max_nm) ? State.cfg.x_max_nm : xs[xs.length - 1];
+    onRows();
+    redrawHeatmap();
+  }
+
+  async function sync() {
+    const { r, j } = await apiJson('/api/v1/heatmap');
+    if (!r.ok || !j) return;
+    setSize(j.size);
+    interval = Number(j.measure_interval_ms) || 0;
+    const i = el('hm-interval'); if (i && document.activeElement !== i) i.value = interval;
+    updateSpan();
+    onAutosave(j.autosave);
+    if (!State.hm) { try { initHeatmap(); } catch (e) { return; } }
+    prefill(j.filled);
+  }
+
+  function init() {
+    el('hm-buffer').addEventListener('change', () => {
+      let n = Math.round(parseFloat(el('hm-buffer').value) / 10) * 10;
+      if (!isFinite(n) || n < 10) n = 10;
+      el('hm-buffer').value = n;
+      putSettings({ buffer_size: n }, 'size');
+    });
+    el('hm-interval').addEventListener('change', () => {
+      let n = Math.max(0, Math.round(parseFloat(el('hm-interval').value) || 0));
+      el('hm-interval').value = n;
+      putSettings({ measure_interval_ms: n }, 'interval');
+    });
+    el('hm-clear').addEventListener('click', clearBuffer);
+    el('hm-autosave').addEventListener('change', (e) => setAutosave(e.target.checked));
+    el('hm-export-scope').addEventListener('change', () => {
+      el('hm-export-range').hidden = el('hm-export-scope').value !== 'range';
+    });
+    el('hm-export').addEventListener('click', () => exportCsv());
+    el('hm-rewind').addEventListener('input', (e) => onRewind(parseInt(e.target.value, 10) || 0));
+    el('hm-live').addEventListener('click', live);
+  }
+
+  return { init, sync, setSize, onConfig, onRows, onAutosave, exportCsv };
+})();
+
+// ── Dark capture (P-09) ──────────────────────────────────────
+const Dark = (() => {
+  const setStatus = (t) => { const e = $('#dark-status'); if (e) e.textContent = t; };
+  async function start() {
+    const { r, j } = await apiPost('/api/v1/dark', {});
+    if (!r.ok) { toast(errText(j, r), 3500); return; }
+    setStatus('Capturing dark spectrum…');
+    Jobs.track(j.job.id, (job, fin) => {
+      if (!fin) {
+        const pct = Math.round(100 * (Number(job.progress) || 0));
+        setStatus(job.status === 'waiting_for_user' ? 'Waiting for you (see dialog)…'
+                  : `Capturing dark spectrum… ${pct}%`);
+        return;
+      }
+      if (job.status === 'done') {
+        const res = job.result || {};
+        const ms = res.integration_us != null ? (res.integration_us / 1000).toFixed(2) : '?';
+        const mean = (res.mean_counts != null && isFinite(res.mean_counts))
+          ? `, mean ${Number(res.mean_counts).toFixed(1)} counts` : '';
+        setStatus(`Dark stored: ${ms} ms, ${res.n_frames != null ? res.n_frames : '?'} frames${mean}.`);
+        toast('Dark spectrum stored');
+        CalMgr.loadDarks();
+        Cal.refresh();
+      } else if (job.status === 'cancelled') {
+        setStatus('Dark capture cancelled.');
+      } else {
+        const m = (job.error && job.error.message) || 'failed';
+        setStatus(`Dark capture failed: ${m}`);
+        toast(`Dark capture failed: ${m}`, 3500);
+      }
+    });
+  }
+  function init() { $('#btn-dark').addEventListener('click', start); }
+  return { init };
+})();
+
+// ── Calibration manager: profile / reference / dark tables ───
+const CalMgr = (() => {
+  let profiles = null;
+  let refs = [];
+  const isOpen = () => !$('#calmgr-dialog').hidden;
+
+  const fmtNm = (a) => (a == null || !isFinite(a)) ? '—' : Number(a).toFixed(0);
+  function rangeText(vr, segs) {
+    if (Array.isArray(segs) && segs.length > 1) {
+      return segs.map((g) => `${fmtNm(g[0])}–${fmtNm(g[1])}`).join(', ') + ' nm';
+    }
+    if (Array.isArray(vr) && vr.length >= 2) return `${fmtNm(vr[0])}–${fmtNm(vr[1])} nm`;
+    return '—';
+  }
+  const fmtDate = (s) => {
+    if (!s) return '—';
+    const d = new Date(s);
+    return isNaN(d) ? String(s) : d.toLocaleString();
+  };
+  const fill = (id, head, rows, empty) => {
+    const t = document.getElementById(id);
+    t.tHead.innerHTML = `<tr>${head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr>`;
+    t.tBodies[0].innerHTML = rows.length ? rows.join('')
+      : `<tr><td class="empty" colspan="${head.length}">${esc(empty)}</td></tr>`;
+  };
+
+  function renderProfiles() {
+    const items = (profiles && profiles.items) || [];
+    const sel = profiles && profiles.selection;
+    const note = $('#cal-table-note');
+    if (note) note.textContent = profiles && profiles.device
+      ? `${profiles.device}${profiles.serial ? ' · ' + profiles.serial : ''}` : 'no device';
+    fill('cal-table',
+      ['', 'Profile', 'State', 'Type', 'Unit', 'Valid range', 'Created', 'Plausible'],
+      items.map((it) => {
+        const warn = it.state === 'wl_changed' || it.state === 'nl_changed' || it.state === 'error';
+        const pl = it.type == null ? '—' : (it.plausible === false ? '<span class="warn">⚠ no</span>' : 'yes');
+        return `<tr class="${it.value === sel ? 'active' : ''}">` +
+          `<td>${it.value === sel ? '●' : ''}</td>` +
+          `<td title="${esc(it.message || '')}">${esc(it.label)}</td>` +
+          `<td class="${warn ? 'warn' : ''}">${esc(it.state)}</td>` +
+          `<td>${esc(it.type || '—')}</td><td>${esc(it.unit || '—')}</td>` +
+          `<td>${esc(rangeText(it.valid_range_nm, it.valid_segments_nm))}</td>` +
+          `<td>${esc(fmtDate(it.created))}</td><td>${pl}</td></tr>`;
+      }), 'No profiles (connect a device).');
+  }
+
+  function setProfiles(j) {
+    profiles = j;
+    if (isOpen()) renderProfiles();
+    CalRun.setProfiles(j);
+  }
+
+  function renderRefs() {
+    fill('ref-table', ['Name', 'Serial', 'Unit', 'Range', 'Input', 'Built-in', ''],
+      refs.map((s) => `<tr><td>${esc(s.name)}</td><td>${esc(s.serial || '—')}</td>` +
+        `<td>${esc(s.unit || '—')}</td>` +
+        `<td>${fmtNm(s.valid_min_nm)}–${fmtNm(s.valid_max_nm)} nm</td>` +
+        `<td>${esc(s.input_optic || '—')}</td><td>${s.builtin ? 'yes' : 'no'}</td>` +
+        `<td>${s.builtin ? '' : `<button class="row-btn" data-ref-del="${esc(s.id)}" ` +
+          `data-name="${esc(s.name)}" data-lock="control">Remove</button>`}</td></tr>`),
+      'No reference sources.');
+    Access.applyLocks();
+  }
+
+  async function loadRefs() {
+    const { r, j } = await apiJson('/api/v1/calibration/references');
+    refs = (r.ok && Array.isArray(j)) ? j : [];
+    if (isOpen()) renderRefs();
+    CalRun.setRefs(refs);
+  }
+
+  async function loadDarks() {
+    if (!isOpen()) return;
+    const { r, j } = await apiJson('/api/v1/calibration/darks');
+    const rows = (r.ok && Array.isArray(j)) ? j : [];
+    fill('dark-table', ['Integration time', 'Frames', 'Mean', 'Date'],
+      rows.map((d) => `<tr><td class="num">${d.integration_us != null ? (d.integration_us / 1000).toFixed(2) + ' ms' : '—'}</td>` +
+        `<td class="num">${d.n_frames != null ? d.n_frames : '—'}</td>` +
+        `<td class="num">${(d.mean_counts != null && isFinite(d.mean_counts)) ? Number(d.mean_counts).toFixed(1) + ' counts' : '—'}</td>` +
+        `<td>${esc(fmtDate(d.timestamp))}</td></tr>`), 'No stored dark spectra for this device.');
+  }
+
+  async function removeRef(id, name) {
+    if (!window.confirm(`Remove reference source "${name}"? This cannot be undone.`)) return;
+    const { r, j } = await apiDelete(`/api/v1/calibration/references/${encodeURIComponent(id)}`);
+    if (!r.ok) { toast(errText(j, r), 3500); return; }
+    toast('Reference source removed');
+    loadRefs();
+  }
+
+  function readText(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result));
+      fr.onerror = () => reject(new Error('File read failed'));
+      fr.readAsText(file);
+    });
+  }
+
+  async function importRef() {
+    const f = $('#ref-file').files && $('#ref-file').files[0];
+    if (!f) { toast('Choose a lamp file (.lmp / .csv) first'); return; }
+    let content;
+    try { content = await readText(f); } catch (e) { toast(e.message); return; }
+    const num = (id) => { const v = $(id).value; return v === '' ? null : Number(v); };
+    const name = ($('#ref-name').value || '').trim() || f.name.replace(/\.[^.]+$/, '');
+    const body = {
+      name, serial: $('#ref-serial').value.trim(), unit: $('#ref-unit').value.trim() || 'uW/cm2/nm',
+      valid_min_nm: num('#ref-min'), valid_max_nm: num('#ref-max'),
+      input_optic: $('#ref-input').value.trim(), notes: $('#ref-notes').value.trim(),
+      filename: f.name, content,
+    };
+    const { r, j } = await apiPost('/api/v1/calibration/references', body);
+    if (!r.ok) { toast(errText(j, r), 4000); return; }
+    toast(`Imported: ${j.name}`);
+    $('#ref-import-form').hidden = true;
+    $('#ref-file').value = '';
+    loadRefs();
+  }
+
+  function open() {
+    showModal('calmgr-dialog', true);
+    renderProfiles(); renderRefs();
+    Cal.refresh();
+    loadRefs();
+    loadDarks();
+  }
+  const close = () => showModal('calmgr-dialog', false);
+
+  function init() {
+    $('#cal-manage').addEventListener('click', open);
+    $('#calmgr-close').addEventListener('click', close);
+    $('#calmgr-x').addEventListener('click', close);
+    $('#ref-import-toggle').addEventListener('click', () => {
+      const f = $('#ref-import-form'); f.hidden = !f.hidden;
+    });
+    $('#ref-import-cancel').addEventListener('click', () => { $('#ref-import-form').hidden = true; });
+    $('#ref-import-go').addEventListener('click', importRef);
+    $('#ref-table').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-ref-del]');
+      if (b) removeRef(b.dataset.refDel, b.dataset.name);
+    });
+    loadRefs();
+  }
+
+  return { init, setProfiles, loadRefs, loadDarks, close };
+})();
+
+// ── Calibration run / derivation dialog (P-10) ───────────────
+const CalRun = (() => {
+  let mode = 'lamp';            // 'lamp' | 'derive'
+  let refs = [], profiles = null;
+  let jobId = null, running = false, order = [], lastJob = null;
+
+  const PLAN = {
+    lamp: ['wavelength_check', 'integration', 'dark', 'calibration_capture',
+           'crosscheck', 'compute', 'save', 'protocol'],
+    derive: ['integration', 'known', 'dark_known', 'light_known', 'new',
+             'dark_new', 'light_new', 'compute'],
+  };
+  const LABELS = {
+    wavelength_check: 'Wavelength check', integration: 'Integration time',
+    dark: 'Dark spectra', calibration_capture: 'Calibration spectrum + stability',
+    crosscheck: 'Integration-time cross check', compute: 'Compute', save: 'Save profile',
+    protocol: 'Protocol (PDF + CSV)', known: 'Known optics', new: 'New optics',
+    dark_known: 'Dark (known optics)', light_known: 'Light (known optics)',
+    dark_new: 'Dark (new optics)', light_new: 'Light (new optics)',
+  };
+  const label = (s) => LABELS[s] || String(s).replace(/_/g, ' ');
+
+  function setRefs(r) { refs = r || []; fillRefs(); }
+  function setProfiles(p) { profiles = p; fillKnown(); }
+
+  function fillRefs() {
+    const sel = $('#cr-ref'); if (!sel) return;
+    const keep = sel.value;
+    sel.innerHTML = '';
+    for (const s of refs) {
+      const rng = (s.valid_min_nm != null && s.valid_max_nm != null)
+        ? ` · ${Number(s.valid_min_nm).toFixed(0)}–${Number(s.valid_max_nm).toFixed(0)} nm` : '';
+      sel.appendChild(new Option(`${s.name}${s.serial ? ' · ' + s.serial : ''}${rng}`, s.id));
+    }
+    if (keep) sel.value = keep;
+  }
+  function fillKnown() {
+    const sel = $('#cr-known'); if (!sel) return;
+    const keep = sel.value;
+    sel.innerHTML = '';
+    for (const it of ((profiles && profiles.items) || [])) {
+      if (it.state === 'builtin' || !it.type) continue;
+      sel.appendChild(new Option(`${it.label}${it.plausible === false ? ' ⚠' : ''}`, it.value));
+    }
+    if (keep) sel.value = keep;
+  }
+
+  function setMode(m) {
+    mode = m;
+    $('#cr-mode-lamp').classList.toggle('on', m === 'lamp');
+    $('#cr-mode-derive').classList.toggle('on', m === 'derive');
+    document.querySelectorAll('#calrun-dialog .lamp-only').forEach((e) => { e.hidden = m !== 'lamp'; });
+    document.querySelectorAll('#calrun-dialog .derive-only').forEach((e) => { e.hidden = m !== 'derive'; });
+    $('#calrun-title').textContent = m === 'lamp' ? 'Calibration run' : 'Derive new optics';
+  }
+
+  function updateWarn() {
+    const on = $('#cr-allow-implausible').checked ||
+      (mode === 'lamp' && $('#cr-save-failed').checked);
+    $('#cr-warn').hidden = !on;
+  }
+
+  function showForm() {
+    $('#cr-form').hidden = false;
+    $('#cr-run').hidden = true;
+    $('#cr-result').hidden = true;
+    $('#cr-start').hidden = false; $('#cr-start').textContent = 'Start';
+    $('#cr-cancel').hidden = true; $('#cr-close').hidden = false; $('#cr-x').hidden = false;
+    jobId = null; running = false; lastJob = null;
+  }
+  function showRun() {
+    $('#cr-form').hidden = true;
+    $('#cr-run').hidden = false;
+    $('#cr-result').hidden = true;
+    $('#cr-start').hidden = true;
+    $('#cr-cancel').hidden = false; $('#cr-close').hidden = true; $('#cr-x').hidden = true;
+    $('#cr-bar').style.width = '0%';
+    $('#cr-log').textContent = '';
+    order = PLAN[mode].slice();
+    renderSteps(null);
+  }
+
+  async function open(m) {
+    if (running) { showModal('calrun-dialog', true); return; }
+    setMode(m);
+    showForm();
+    showModal('calrun-dialog', true);
+    await Promise.all([CalMgr.loadRefs(), Cal.refresh()]);
+    fillRefs(); fillKnown();
+  }
+  function close() { if (!running) showModal('calrun-dialog', false); }
+
+  async function start() {
+    const name = $('#cr-name').value.trim();
+    if (!name) { toast('Enter an optics name'); $('#cr-name').focus(); return; }
+    const optics = { name, input: $('#cr-input').value, notes: $('#cr-notes').value.trim() };
+    const fixed = $('#cr-int-mode').value === 'fixed';
+    const ms = parseFloat($('#cr-int-ms').value);
+    if (fixed && !(ms > 0)) { toast('Enter a valid integration time'); return; }
+    const frames = parseInt($('#cr-frames').value, 10);
+    const body = {
+      optics,
+      integration_ms: fixed ? ms : 'auto',
+      allow_implausible: $('#cr-allow-implausible').checked,
+    };
+    if (isFinite(frames)) body.frames = frames;
+    let url;
+    if (mode === 'lamp') {
+      body.kind = $('#cr-kind').value;
+      body.reference_id = $('#cr-ref').value;
+      body.save_on_failed_checks = $('#cr-save-failed').checked;
+      if (!body.reference_id) { toast('Choose a reference source'); return; }
+      url = '/api/v1/calibration/runs';
+    } else {
+      body.known_profile_id = $('#cr-known').value;
+      if (!body.known_profile_id) { toast('Choose the known profile'); return; }
+      url = '/api/v1/calibration/derivations';
+    }
+    if (body.allow_implausible || body.save_on_failed_checks) {
+      if (!window.confirm('Warning: a result that fails the plausibility / stability check will be ' +
+          'saved anyway (flagged as implausible, not activated).\n\nStart with this option?')) return;
+    }
+    $('#cr-start').disabled = true;
+    const { r, j } = await apiPost(url, body);
+    $('#cr-start').disabled = false;
+    if (!r.ok) { toast(errText(j, r), 4000); return; }
+    jobId = j.job.id; running = true;
+    showRun();
+    Jobs.track(jobId, onJob);
+  }
+
+  function renderSteps(job) {
+    const host = $('#cr-steps');
+    const cur = job && job.step ? job.step : null;
+    if (cur && order.indexOf(cur) < 0) order.push(cur);
+    const ci = cur ? order.indexOf(cur) : -1;
+    const fin = job && ['done'].includes(job.status);
+    const waiting = job && job.status === 'waiting_for_user';
+    const failed = job && (job.status === 'failed' || job.status === 'cancelled');
+    host.innerHTML = order.map((s, i) => {
+      let cls = '', mark = '○';
+      if (fin || i < ci) { cls = 'done'; mark = '✓'; }
+      else if (i === ci) {
+        if (failed) { cls = ''; mark = '✗'; }
+        else if (waiting) { cls = 'waiting'; mark = '…'; }
+        else { cls = 'active'; mark = '▶'; }
+      }
+      return `<div class="cr-step ${cls}"><span class="mark">${mark}</span><span>${esc(label(s))}</span></div>`;
+    }).join('');
+  }
+
+  function renderLog(job) {
+    const lines = (job.log || []).map((e) => `${(e.t || '').slice(11, 19)}  ${e.message}`);
+    const pre = $('#cr-log');
+    const txt = lines.join('\n');
+    if (pre.textContent !== txt) { pre.textContent = txt; pre.scrollTop = pre.scrollHeight; }
+  }
+
+  const STATUS_TEXT = {
+    saved: ['ok', 'Saved'],
+    saved_implausible: ['warn', 'Saved, but flagged as implausible (not activated)'],
+    not_saved_implausible: ['bad', 'Not saved: the plausibility check failed'],
+    not_saved_checks_failed: ['bad', 'Not saved: the stability / integration-time checks failed'],
+    failed: ['bad', 'Failed'],
+  };
+
+  function renderResult(job) {
+    const host = $('#cr-result');
+    const res = job.result || {};
+    let cls = 'ok', title = 'Finished', extra = [];
+    if (job.status === 'cancelled') { cls = 'warn'; title = 'Cancelled'; }
+    else if (job.status === 'failed') {
+      cls = 'bad'; title = 'Failed';
+      extra.push(`<div>${esc((job.error && job.error.message) || 'The job failed.')}</div>`);
+    } else {
+      const t = STATUS_TEXT[res.status] || ['warn', res.status || 'Finished'];
+      cls = t[0]; title = t[1];
+      if (res.status === 'saved' && res.activated) title += ' and activated';
+      if (res.status === 'saved' && !res.activated) title += ' (not activated)';
+      if (res.error) extra.push(`<div>${esc(res.error)}</div>`);
+      if (res.status === 'not_saved_implausible') {
+        extra.push('<div class="kv">Run again with “Save even if implausible” to store it flagged.</div>');
+      }
+      if (res.status === 'not_saved_checks_failed') {
+        extra.push('<div class="kv">Run again with “Save although checks failed” to store it anyway.</div>');
+      }
+    }
+    const pl = res.plausibility;
+    if (pl && Array.isArray(pl.failures) && pl.failures.length) {
+      extra.push('<div><b>Plausibility</b></div><ul>' +
+        pl.failures.map((f) => `<li>${esc(f)}</li>`).join('') + '</ul>');
+    } else if (pl && pl.pass) {
+      extra.push('<div class="kv">Plausibility: passed.</div>');
+    }
+    const ck = res.checks;
+    if (ck && typeof ck === 'object') {
+      const pf = (v) => v === true ? 'pass' : (v === false ? 'FAIL' : 'n/a');
+      const pct = (v) => (v == null || !isFinite(v)) ? '—' : `${Number(v).toFixed(2)} %`;
+      extra.push('<div><b>Checks</b></div><div class="kv">' +
+        `Stability: ${pct(ck.stability_pct)} (${pf(ck.stability_pass)})<br>` +
+        `Integration-time cross check: ${pct(ck.itime_crosscheck_pct)} (${pf(ck.itime_pass)})</div>`);
+    }
+    if (Array.isArray(res.valid_segments_nm) && res.valid_segments_nm.length) {
+      extra.push('<div class="kv">Valid segments: ' + res.valid_segments_nm.map(
+        (g) => `${Number(g[0]).toFixed(0)}–${Number(g[1]).toFixed(0)}`).join(', ') + ' nm</div>');
+    }
+    const wc = res.wavelength_check;
+    if (wc && Array.isArray(wc.messages) && wc.messages.length) {
+      extra.push('<div class="kv">' + wc.messages.map(esc).join('<br>') + '</div>');
+    }
+    if (Array.isArray(res.warnings) && res.warnings.length) {
+      extra.push('<div><b>Warnings</b></div><ul>' + res.warnings.map((w) => `<li>${esc(w)}</li>`).join('') + '</ul>');
+    }
+    const prot = Array.isArray(res.protocol) ? res.protocol.map((p) => String(p).toLowerCase()) : [];
+    const links = [];
+    if (job.kind === 'calibration' && job.status === 'done') {
+      if (prot.some((p) => p.endsWith('.pdf'))) links.push(['pdf', 'Protocol (PDF)']);
+      if (prot.some((p) => p.endsWith('.csv'))) links.push(['csv', 'Protocol (CSV)']);
+    }
+    if (links.length) {
+      extra.push('<div style="margin-top:6px">' + links.map(
+        ([f, t]) => `<a data-protocol="${f}">⤓ ${t}</a>`).join('') + '</div>');
+    }
+    if (res.protocol_message) extra.push(`<div class="kv">${esc(res.protocol_message)}</div>`);
+    host.className = `cr-result ${cls}`;
+    host.innerHTML = `<h4>${esc(title)}</h4>${extra.join('')}`;
+    host.hidden = false;
+  }
+
+  function onJob(job, fin) {
+    lastJob = job;
+    $('#cr-bar').style.width = `${Math.round(100 * (Number(job.progress) || 0))}%`;
+    renderSteps(job);
+    renderLog(job);
+    if (!fin) return;
+    running = false;
+    $('#cr-cancel').hidden = true; $('#cr-close').hidden = false; $('#cr-x').hidden = false;
+    $('#cr-start').hidden = false; $('#cr-start').textContent = 'New run';
+    $('#cr-bar').style.width = job.status === 'done' ? '100%' : $('#cr-bar').style.width;
+    renderResult(job);
+    const st = (job.result || {}).status;
+    if (st === 'saved' || st === 'saved_implausible') {
+      Cal.refresh();
+      CalMgr.loadDarks();
+    }
+  }
+
+  async function cancelRun() {
+    if (!jobId) return;
+    if (!window.confirm('Cancel the running job?')) return;
+    await Jobs.cancel(jobId);
+  }
+
+  function init() {
+    $('#cal-run-open').addEventListener('click', () => open('lamp'));
+    $('#cal-derive-open').addEventListener('click', () => open('derive'));
+    $('#cr-mode-lamp').addEventListener('click', () => { if (!running) { setMode('lamp'); updateWarn(); } });
+    $('#cr-mode-derive').addEventListener('click', () => { if (!running) { setMode('derive'); updateWarn(); } });
+    $('#cr-int-mode').addEventListener('change', () => {
+      $('#cr-int-ms').disabled = $('#cr-int-mode').value !== 'fixed';
+    });
+    $('#cr-allow-implausible').addEventListener('change', updateWarn);
+    $('#cr-save-failed').addEventListener('change', updateWarn);
+    $('#cr-start').addEventListener('click', () => {
+      if ($('#cr-form').hidden) showForm(); else start();
+    });
+    $('#cr-cancel').addEventListener('click', cancelRun);
+    $('#cr-close').addEventListener('click', close);
+    $('#cr-x').addEventListener('click', close);
+    $('#cr-result').addEventListener('click', (e) => {
+      const a = e.target.closest('[data-protocol]');
+      if (a && jobId) {
+        apiDownload(`/api/v1/calibration/runs/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.protocol}`,
+                    `calibration_protocol.${a.dataset.protocol}`);
+      }
+    });
+  }
+
+  return { init, setRefs, setProfiles, isRunning: () => running, close };
+})();
+
+// ── Data section: export folder / file-name template (P-07) ──
+const DataSec = (() => {
+  let timer = null;
+  async function preview() {
+    const tpl = $('#cfg-export_filename_template');
+    if (!tpl) return;
+    const { r, j } = await apiJson('/api/v1/export/filename?kind=spectrum&ext=csv&template=' +
+      encodeURIComponent(tpl.value || ''));
+    const out = $('#export-preview');
+    if (!r.ok || !j) { out.textContent = '—'; return; }
+    out.textContent = `Example: ${j.filename}` + (j.export_dir ? `  ·  folder on server: ${j.export_dir}` : '') +
+      (j.warning ? `  ⚠ ${j.warning}` : '');
+    out.className = 'cal-status' + (j.warning ? ' warn' : '');
+    const tk = $('#export-tokens');
+    if (tk && j.tokens) tk.textContent = j.tokens;
+  }
+  const later = (ms) => { clearTimeout(timer); timer = setTimeout(preview, ms); };
+  function init() {
+    $('#cfg-export_filename_template').addEventListener('input', () => later(300));
+    $('#cfg-export_dir').addEventListener('change', () => later(500));
+    $('#sec-data').addEventListener('toggle', (e) => { if (e.target.open) preview(); });
+    preview();
+  }
+  return { init, preview };
+})();
+
+// ── Wavelength calibration dialog (P-11) ─────────────────────
+const WlCal = (() => {
+  let active = false, saved = false, preview = null, peaks = [];
+  const W = '/api/v1/wavelength';
+  const setStatus = (t, cls) => { const e = $('#wl-status'); e.textContent = t; e.className = 'cal-status ' + (cls || ''); };
+
+  function drawPlot() {
+    const p = prepCanvas($('#wl-plot'));
+    if (!p) return;
+    const { ctx, W: cw, H: ch } = p;
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.fillStyle = getCss('--bg-0'); ctx.fillRect(0, 0, cw, ch);
+    if (!preview || !preview.wavelengths.length) return;
+    const xs = preview.wavelengths, ys = preview.values;
+    const x0 = xs[0], x1 = xs[xs.length - 1];
+    let mx = 1; for (const v of ys) if (v != null && isFinite(v) && v > mx) mx = v;
+    const X = (x) => 6 + (x - x0) / Math.max(1e-9, x1 - x0) * (cw - 12);
+    const Y = (v) => ch - 14 - (v / mx) * (ch - 24);
+    ctx.strokeStyle = '#2dd4bf'; ctx.lineWidth = 1.2; ctx.beginPath();
+    xs.forEach((x, i) => { const v = ys[i] == null ? 0 : ys[i]; i ? ctx.lineTo(X(x), Y(v)) : ctx.moveTo(X(x), Y(v)); });
+    ctx.stroke();
+    ctx.fillStyle = getCss('--warn'); ctx.font = '10px JetBrains Mono';
+    for (const pk of peaks) {
+      const px = X(pk.wavelength), py = Y(pk.height);
+      ctx.beginPath(); ctx.arc(px, py, 3, 0, 6.3); ctx.fill();
+      ctx.fillText(Number(pk.wavelength).toFixed(0), px - 10, Math.max(10, py - 6));
+    }
+    ctx.fillStyle = getCss('--fg-3');
+    ctx.fillText(`${x0.toFixed(0)} nm`, 6, ch - 3);
+    ctx.fillText(`${x1.toFixed(0)} nm`, cw - 56, ch - 3);
+  }
+
+  function renderPairs(pairs) {
+    const tb = $('#wl-pairs').tBodies[0];
+    tb.innerHTML = '';
+    (pairs || []).forEach((pr) => addRow(pr[0], pr[1]));
+  }
+  function addRow(px, nm) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><input type="number" step="any" value="${px == null ? '' : esc(Number(px).toFixed(2))}"></td>` +
+      `<td><input type="number" step="any" value="${nm == null ? '' : esc(Number(nm).toFixed(3))}"></td>` +
+      '<td><button class="row-btn">Delete</button></td>';
+    tr.querySelector('button').addEventListener('click', () => tr.remove());
+    $('#wl-pairs').tBodies[0].appendChild(tr);
+  }
+  function readPairs() {
+    const out = [];
+    for (const tr of $('#wl-pairs').tBodies[0].rows) {
+      const i = tr.querySelectorAll('input');
+      const a = parseFloat(i[0].value), b = parseFloat(i[1].value);
+      if (isFinite(a) && isFinite(b)) out.push([a, b]);
+    }
+    return out;
+  }
+
+  const fail = (j, r) => {
+    const code = j && j.error && j.error.code;
+    if (code === 'wavelength_not_supported') {
+      return 'This device does not support wavelength calibration (' + errText(j, r) + ')';
+    }
+    return errText(j, r);
+  };
+
+  async function startSession() {
+    const { r, j } = await apiPost(`${W}/session`);
+    if (!r.ok) { active = false; setStatus(fail(j, r), 'error'); return; }
+    active = true; saved = !!j.saved;
+    setStatus(`Session: ${j.device} · ${j.n_pixels} px · ${Number(j.wavelength_min).toFixed(1)}–${Number(j.wavelength_max).toFixed(1)} nm${j.resumed ? ' (resumed)' : ''}`);
+    renderPairs(j.pairs);
+  }
+
+  async function loadLamps() {
+    const { r, j } = await apiJson(`${W}/lamps`);
+    const sel = $('#wl-lamp'); sel.innerHTML = '';
+    if (r.ok && j) for (const l of j.lamps) sel.appendChild(new Option(`${l.name} (${(l.lines || []).length} lines)`, l.name));
+  }
+
+  async function capture() {
+    const body = { frames: parseInt($('#wl-frames').value, 10) || 16 };
+    const ms = parseFloat($('#wl-int').value);
+    if (ms > 0) body.integration_ms = ms;
+    setStatus('Capturing…');
+    const { r, j } = await apiPost(`${W}/capture`, body);
+    if (!r.ok) { setStatus(fail(j, r), 'error'); return; }
+    preview = j.preview; peaks = j.peaks || [];
+    $('#wl-capture-info').textContent =
+      `${j.n_frames} frames at ${Number(j.integration_ms).toFixed(2)} ms · peak ${Number(j.peak_counts).toFixed(0)} counts · ` +
+      `${j.n_peaks} peaks` + (j.n_saturated ? ` · ${j.n_saturated} saturated` : '') +
+      (j.warning ? `  ⚠ ${j.warning}` : '');
+    $('#wl-capture-info').className = 'cal-status' + (j.has_signal ? '' : ' warn');
+    setStatus('Capture done.');
+    drawPlot();
+  }
+
+  async function match() {
+    const lamp = $('#wl-lamp').value;
+    if (!lamp) { toast('Choose a lamp'); return; }
+    const { r, j } = await apiPost(`${W}/match`, { lamp, accumulate: $('#wl-accumulate').checked });
+    if (!r.ok) { setStatus(fail(j, r), 'error'); return; }
+    renderPairs(j.pairs);
+    setStatus(`Matched ${j.pairs.length} pair(s).`);
+  }
+
+  async function applyPairs() {
+    const { r, j } = await apiPut(`${W}/pairs`, { pairs: readPairs() });
+    if (!r.ok) { setStatus(fail(j, r), 'error'); return false; }
+    renderPairs(j.pairs);
+    setStatus(`${j.n_total} pair(s) set.`);
+    return true;
+  }
+
+  async function fit() {
+    if (!(await applyPairs())) return;
+    const { r, j } = await apiPost(`${W}/fit`, { degree: parseInt($('#wl-degree').value, 10) || 3 });
+    const box = $('#wl-fit-result');
+    const res = r.ok ? j : (j && j.error && j.error.details) || null;
+    if (!r.ok && !(res && res.reasons)) { setStatus(fail(j, r), 'error'); return; }
+    const lines = [];
+    let cls = 'ok', title = 'Fit accepted (live preview applied)';
+    if (!r.ok) {
+      cls = 'bad'; title = 'Fit rejected: previous axis kept';
+      lines.push('<ul>' + (res.reasons || []).map((x) => `<li>${esc(x)}</li>`).join('') + '</ul>');
+    }
+    const f = (v, d) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
+    lines.push(`<div class="kv">degree ${esc(res.degree)} · ${esc(res.n_lines)} lines · max error ${f(res.max_error, 3)} nm · RMS ${f(res.rms, 3)} nm</div>`);
+    if (res.coverage_warning) { lines.push(`<div class="kv">⚠ ${esc(res.coverage_warning)}</div>`); if (cls === 'ok') cls = 'warn'; }
+    if (res.rms_warning) { lines.push(`<div class="kv">⚠ ${esc(res.rms_warning)}</div>`); if (cls === 'ok') cls = 'warn'; }
+    box.className = `cr-result ${cls}`;
+    box.innerHTML = `<h4>${esc(title)}</h4>${lines.join('')}`;
+    box.hidden = false;
+  }
+
+  async function save() {
+    if (!$('#wl-confirm').checked) { toast('Tick “Back up & confirm” first'); return; }
+    const { r, j } = await apiPost(`${W}/save`, { confirm: true });
+    if (!r.ok) { setStatus(fail(j, r), 'error'); toast(fail(j, r), 4000); return; }
+    saved = true;
+    setStatus(`Saved. Backup written on the server: ${j.backup_file}` + (j.extra_note ? ` · ${j.extra_note}` : ''), 'ok');
+    toast('Wavelength calibration saved');
+    $('#wl-confirm').checked = false;
+  }
+
+  async function closeDialog() {
+    showModal('wlcal-dialog', false);
+    if (active) {
+      active = false;
+      const { r, j } = await apiDelete(`${W}/session`);
+      if (r.ok && j && j.rolled_back) toast('Unsaved wavelength preview rolled back');
+    }
+  }
+
+  async function open() {
+    showModal('wlcal-dialog', true);
+    preview = null; peaks = []; saved = false;
+    $('#wl-fit-result').hidden = true; $('#wl-capture-info').textContent = '';
+    drawPlot();
+    await Promise.all([startSession(), loadLamps()]);
+  }
+
+  function init() {
+    $('#wlcal-open').addEventListener('click', open);
+    $('#wlcal-close').addEventListener('click', closeDialog);
+    $('#wlcal-x').addEventListener('click', closeDialog);
+    $('#wl-capture').addEventListener('click', capture);
+    $('#wl-match').addEventListener('click', match);
+    $('#wl-add-row').addEventListener('click', () => addRow(null, null));
+    $('#wl-apply-pairs').addEventListener('click', applyPairs);
+    $('#wl-fit').addEventListener('click', fit);
+    $('#wl-save').addEventListener('click', save);
+  }
+  return { init, close: closeDialog };
+})();
+
+// Esc closes the non-critical dialogs (never a pending user step / token prompt).
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!$('#calmgr-dialog').hidden) CalMgr.close();
+  else if (!$('#wlcal-dialog').hidden) WlCal.close();
+  else if (!$('#calrun-dialog').hidden && !CalRun.isRunning()) CalRun.close();
+});
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
@@ -2608,7 +4029,7 @@ const Filter = (() => {
     pending = true; lastFetch = now;
     const wl = latest.wl;
     const ref = alignedBaseline(wl);
-    fetch('/api/filter', {
+    apiFetch('/api/filter', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2727,7 +4148,7 @@ const Filter = (() => {
   function saveReport(fmt) {
     if (!baseline || !latest) { toast('Set a baseline first'); return; }
     const wl = latest.wl, ref = alignedBaseline(wl);
-    fetch('/api/filter/report', {
+    apiFetch('/api/filter/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2774,7 +4195,7 @@ const Tm30 = (() => {
     const now = performance.now();
     if (pending || now - last < THROTTLE_MS) return;
     pending = true; last = now;
-    fetch('/api/tm30', {
+    apiFetch('/api/tm30', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ wavelengths: Array.from(wl), intensities: Array.from(ys) }),
     })

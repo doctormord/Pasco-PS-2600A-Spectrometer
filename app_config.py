@@ -241,6 +241,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "peak_min_distance_px": 40,
     "peak_max_count": 3,
 
+    # ── Remote access (REST API / web UI / MCP, docs/PLAN_api_mcp.md) ─────
+    # Desktop "Remote access" panel and the headless server read these.
+    "remote_enabled": False,                 # start the server with the app
+    "remote_port": 8000,
+    "remote_lan": False,                     # False = 127.0.0.1 only; True = all interfaces (token forced)
+    "remote_token": "",                      # generated on first use
+    "remote_require_token_local": False,     # also require the token on 127.0.0.1
+    "report_language": "de",                 # de | en (report contents)
+
     # Measure cursors (last positions)
     "measure_a_nm": 500.0,
     "measure_b_nm": 600.0,

@@ -33,7 +33,9 @@ pip install -r requirements.txt
 | Package | Required for | Notes |
 |---|---|---|
 | PyQt6, pyqtgraph, numpy, scipy | core (desktop) | always needed for the desktop GUI |
-| fastapi, uvicorn, websockets | web client | `python web_server.py` |
+| fastapi, uvicorn, websockets, pydantic | web client, REST API (`/api/v1`), headless server | desktop **Remote access**, `python PS-2600A_Pro.py --headless` |
+| httpx | `examples/api_client.py`, MCP server, API tests | not needed to run the server |
+| **mcp** (`pip install "mcp>=2.3"`) | optional: MCP server / Claude plugin | Python 3.10+; see [`mcp_server/README.md`](mcp_server/README.md) |
 | **colour-science** | TM-30/CQS | enables the *TM-30 · CQS* sub-tab and `/api/tm30`; everything else works without it |
 | **matplotlib** | reports + CIE fill | PDF/PNG colour & filter reports, CIE diagram fill; CSV export works without it |
 | pyusb + libusb-package | Ocean HDX | `libusb-package` bundles libusb — no system libusb needed |
@@ -41,6 +43,12 @@ pip install -r requirements.txt
 
 The **Demo** device needs only numpy, so the app always runs even with no
 hardware and no optional packages.
+
+**Headless server without PyQt** (for example a Raspberry Pi or a lab PC without
+a display): `python PS-2600A_Pro.py --headless` never imports PyQt6, so
+`PyQt6` and `pyqtgraph` can be left out of the environment. Install
+`numpy scipy fastapi uvicorn websockets pydantic` (plus `matplotlib`,
+`colour-science` and the device packages as needed).
 
 ---
 
@@ -174,7 +182,8 @@ few minutes to compile on ARM; if it fails, `pip install --upgrade pip` then
 
 ## Web client layout note
 
-`web_server.py` serves the front-end from a `static/` folder next to it
+The server (`api.py`; started from the desktop app, `PS-2600A_Pro.py --headless`
+or `web_server.py`) serves the front-end from a `static/` folder next to it
 (`static/index.html`, `static/app.js`, `static/styles.css`). If you reorganise
 the tree, keep those three files in `static/` or the server cannot find
 `index.html`. See [`README_WEB.md`](README_WEB.md) for the full web setup,

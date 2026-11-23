@@ -128,16 +128,19 @@ def test_desktop_and_web_identical(demo, isolated_config, monkeypatch):
     assert ws.state.current_unit == "uW/cm2/nm"
 
     # ── desktop (real DashboardWindow code path, offscreen) ──
+    # Since the shared engine (docs/PLAN_api_mcp.md) the desktop renders the
+    # frames of its own Engine instance; same device state as the web engine.
     from gui_dashboard import DashboardWindow
     dash = DashboardWindow()
     try:
         dash.combo_backend.setCurrentText(BACKEND)
         dash.hardware_thread = demo
-        dash.active_wavelengths = wl
-        dash.active_pixel_count = wl.size
-        dash.is_dark_correction_enabled = True
-        dash.dark_correction_mode = "stored"
-        dash.is_despeckle_enabled = True
+        dash.engine.connected_backend_name = BACKEND
+        dash.engine.wavelength_array = wl
+        dash.engine.pixel_count = wl.size
+        dash.engine.ob_slope, dash.engine.ob_offset = 1.0, 0.0
+        dash.engine.frames_avg = 1
+        dash.engine.clear_heatmap()
         dash.apply_response_correction()
         assert dash.calib_runtime.active_v2
         dash.spectrum_history.clear()
@@ -146,6 +149,7 @@ def test_desktop_and_web_identical(demo, isolated_config, monkeypatch):
         assert dash._current_unit == "uW/cm2/nm"
     finally:
         dash.hardware_thread = None
+        dash.engine.connected_backend_name = None
         dash.close()
         app.processEvents()
 

@@ -250,6 +250,9 @@ def process_frame(
         arr = apply_despeckle(arr, smoothing_width)
     if spatial_smoothing:
         arr = apply_spatial_smoothing(arr, spatial_smoothing_width)
+    # Dark-corrected, response-UNcorrected signal (what the wavelength wizard
+    # averages); additive output, does not change "pixels".
+    pre_response = arr.copy()
     if calibrated:
         arr = calibration.apply(arr)
         unit = calibration.unit
@@ -269,7 +272,8 @@ def process_frame(
             max_count      = p.get("peak_max_count", 3),
         )
 
-    return {"pixels": arr, "peaks": peaks, "unit": unit, "dark_source": dark_source}
+    return {"pixels": arr, "peaks": peaks, "unit": unit, "dark_source": dark_source,
+            "pre_response": pre_response}
 
 
 def pipeline_kwargs(cfg_get, runtime, *, integration_us: int, ob_slope: float,

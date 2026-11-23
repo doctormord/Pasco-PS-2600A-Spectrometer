@@ -43,6 +43,7 @@ import calibration_capture as cc
 import calibration_profiles as calprof
 import calibration_workflow as cw
 import reference_sources as rs
+import wavelength_calibration as wlcal
 import gui_theme as gt
 import gui_tables as gtab
 from gui_layout import (
@@ -155,16 +156,12 @@ class CalibrationDialog(QDialog):
         self._placed_onscreen = False
 
         # captured data
-        self._wl_capture = None          # (wl, inten) of the line lamp
-        self._wl_peaks = None            # cached sub-pixel peaks of the capture
         self._resume_after_capture = False  # re-pause the device after a capture
-        self._wl_pairs = []              # [(pixel, known_nm)]
-        # Snapshot the axis as it is on open, so Close (without Save) discards any
-        # live preview and a rejected fit can be rolled back — no broken live view.
-        _bk = self._backend()
-        self._wl_open_snap = _bk.wl_calibration_snapshot() if _bk is not None else None
-        self._wl_saved = False
-        self._wl_last_fit = None         # dict from calibrate_from_lines
+        # Wavelength session (shared Qt-free logic). It snapshots the axis as it
+        # is on open, so Close (without Save) discards any live preview and a
+        # rejected fit can be rolled back — no broken live view.
+        self._wl_sess = None
+        self._wl_session()
         self._ref = None                 # (wl, inten) response reference
         self._meas = None                # (wl, inten) response measurement
         self._resp_table = None          # computed Nx2 [[lambda, S]]
@@ -398,6 +395,21 @@ class CalibrationDialog(QDialog):
         v.addWidget(self.lbl_wl_result)
         return w
 
+    def _wl_session(self):
+        """The WavelengthSession of the current backend (created on first use)."""
+        bk = self._backend()
+        if bk is None:
+            return None
+        s = self._wl_sess
+        if s is None or s.backend is not bk:
+            s = self._wl_sess = wlcal.WavelengthSession(bk, self._device_name())
+        return s
+
+    def _wl_fill_table(self, pairs):
+        self.tbl_wl.setRowCount(0)
+        for px, nm in pairs:
+            self._wl_add_row(px, nm)
+
     def _wl_add_row(self, pixel, nm):
         r = self.tbl_wl.rowCount()
         self.tbl_wl.insertRow(r)
@@ -436,60 +448,40 @@ class CalibrationDialog(QDialog):
         self.btn_wl_capture.setEnabled(True)
         self.btn_wl_capture.setText("Capture && detect peaks")
         self._restore_pause_after_capture()
-        self._wl_capture = (wl, inten)
-        if float(np.max(inten)) < 1.0:
-            self._wl_peaks = None
+        sess = self._wl_session()
+        if sess is None:
+            return
+        sess.set_capture(wl, inten)
+        if not sess.has_signal:
             self.lbl_wl_result.setText(
                 "<b>No signal captured.</b> Check the lamp and the integration time.")
             return
         # detect peaks once; keep them so switching the lamp dropdown can
         # re-assign against the SAME capture without re-measuring.
-        self._wl_peaks = calprof.detect_peaks(inten, min_distance_px=10)
+        sess.detect_peaks()
         self._wl_rematch()
-
-    def _wl_merge_pairs(self, pairs, dedup_px: float = 4.0):
-        """Add (pixel, nm) pairs to the table, skipping any whose pixel is within
-        dedup_px of a row already present (so re-matching the same lamp, or an
-        overlapping line from another lamp, doesn't duplicate a row). Returns the
-        number actually added."""
-        existing = [p for p, _ in self._wl_table_pairs()]
-        added = 0
-        for px, nm in pairs:
-            if any(abs(px - e) <= dedup_px for e in existing):
-                continue
-            self._wl_add_row(px, nm)
-            existing.append(px)
-            added += 1
-        return added
 
     def _wl_rematch(self):
         """(Re)assign the selected lamp's known lines to the peaks of the last
         capture. Wired to the lamp dropdown so picking a lamp pulls that lamp's
         lines. With 'Add to existing' checked, the matches are APPENDED (build a
         multi-lamp fit); otherwise they REPLACE the table (single lamp)."""
-        if self._wl_capture is None or not getattr(self, "_wl_peaks", None):
+        sess = self._wl_session()
+        if sess is None or sess.capture is None or not sess.peaks:
             return
-        wl, _inten = self._wl_capture
-        peaks = self._wl_peaks
+        peaks = sess.peaks
         lamp = self.cmb_lamp.currentText()
-        known = [k for k in calprof.CALIBRATION_LINES[lamp]
-                 if wl[0] <= k <= wl[-1]]
-        pairs = calprof.auto_match_lines(peaks, wl, known, tol_nm=8.0)
         accum = self.chk_accum.isChecked()
-        if accum:
-            added = self._wl_merge_pairs(pairs)
-        else:
-            self.tbl_wl.setRowCount(0)
-            for px, nm in pairs:
-                self._wl_add_row(px, nm)
-            added = len(pairs)
+        info = sess.match(lamp, accumulate=accum)
+        self._wl_fill_table(sess.pairs)
         self._wl_redraw_plot(peaks)
-        total = self.tbl_wl.rowCount()
-        dropped = len(known) - len(pairs)
+        total = info["n_total"]
+        dropped = info["n_skipped"]
         note = (f", {dropped} skipped (no clean peak)" if dropped > 0 else "")
-        verb = f"added {added}" if accum else f"assigned {len(pairs)}"
+        verb = (f"added {info['n_added']}" if accum
+                else f"assigned {info['n_assigned']}")
         self.lbl_wl_result.setText(
-            f"Detected {len(peaks)} peaks; {verb} of {len(known)} {lamp} "
+            f"Detected {len(peaks)} peaks; {verb} of {info['n_known']} {lamp} "
             f"lines in range{note}. Table now holds {total} line(s). "
             + ("Capture further lamps to add lines, then fit. "
                if accum else
@@ -501,9 +493,9 @@ class CalibrationDialog(QDialog):
         """Reset the line table and the current capture so the user can start
         the lamp selection over (e.g. after picking the wrong lamp)."""
         self.tbl_wl.setRowCount(0)
-        self._wl_capture = None
-        self._wl_peaks = None
-        self._wl_last_fit = None
+        sess = self._wl_session()
+        if sess is not None:
+            sess.clear()
         self.btn_wl_save.setEnabled(False)
         self.plot_wl.clear()
         self.lbl_wl_result.setText("Cleared. Select a lamp and capture again.")
@@ -517,19 +509,18 @@ class CalibrationDialog(QDialog):
             ev.ignore()
             return
         try:
-            bk = self._backend()
-            if (bk is not None and not getattr(self, "_wl_saved", False)
-                    and self._wl_open_snap is not None):
-                bk.wl_calibration_restore(self._wl_open_snap)
+            if self._wl_sess is not None:
+                self._wl_sess.discard()
         except Exception:
             pass
         super().closeEvent(ev)
 
     def _wl_redraw_plot(self, peaks=None, wl_fit=None):
         self.plot_wl.clear()
-        if self._wl_capture is None:
+        sess = self._wl_session()
+        if sess is None or sess.capture is None:
             return
-        wl, inten = self._wl_capture
+        wl, inten = sess.capture
         self.plot_wl.plot(wl, inten, pen=pg.mkPen((120, 180, 255), width=1))
         # assigned lines as vertical markers
         for _, nm in self._wl_table_pairs():
@@ -538,68 +529,46 @@ class CalibrationDialog(QDialog):
         self.plot_wl.autoRange()
 
     def _wl_fit_clicked(self):
-        backend = self._backend()
-        pairs = self._wl_table_pairs()
+        sess = self._wl_session()
         deg = self.spn_degree.value()
-        if backend is None:
+        if sess is None:
             QMessageBox.warning(self, "Not connected", "Connect a device first.")
             return
-        if len(pairs) < deg + 1:
+        sess.set_pairs(self._wl_table_pairs())
+        if len(sess.pairs) < deg + 1:
             QMessageBox.warning(self, "Too few lines",
                                 f"A degree-{deg} fit needs at least {deg + 1} "
-                                f"assigned lines (have {len(pairs)}). Add lines "
+                                f"assigned lines (have {len(sess.pairs)}). Add lines "
                                 f"or lower the degree.")
             return
-        pxs = [p for p, _ in pairs]
-        nms = [n for _, n in pairs]
-        # Snapshot so we can roll back if the fit is bad.
-        snap = backend.wl_calibration_snapshot()
         try:
-            res = backend.calibrate_from_lines(nms, pixel_positions=pxs, degree=deg)
-        except Exception as e:
-            QMessageBox.critical(self, "Fit failed", str(e))
-            return
-        if not isinstance(res, dict) or "coeffs" not in res:
+            res = sess.fit(deg)
+        except wlcal.NotSupported:
             QMessageBox.information(
                 self, "Not supported",
                 "This device does not support wavelength calibration "
                 "(its axis is fixed/virtual).")
             return
-
-        # ── Sanity guard ──────────────────────────────────────────────────
-        # A degree-3 fit through mis-assigned lines (wrong lamp, stray peak) can
-        # produce a wildly wrong axis — non-monotonic or with coefficients that
-        # flip the start wavelength to something absurd (e.g. +200 → −150 nm).
-        # Applying that breaks the live view. Validate first; roll back if bad.
-        wl_new = np.asarray(backend.wavelength_array, dtype=float)
-        max_res = float(res["max_error"])
-        monotonic = bool(np.all(np.diff(wl_new) > 0))
-        in_band = (120.0 < wl_new[0] < 1350.0) and (200.0 < wl_new[-1] < 1400.0)
-        if (not monotonic) or (not in_band) or (max_res > 8.0):
-            backend.wl_calibration_restore(snap)
+        except Exception as e:
+            QMessageBox.critical(self, "Fit failed", str(e))
+            return
+        wl_new = res["wavelengths"]
+        if not res["accepted"]:
+            # Plausibility guard rejected the fit; the session already rolled the
+            # device back. Re-sync the display to the restored axis.
             if hasattr(self.dash, "sync_active_axis"):
-                self.dash.sync_active_axis(backend.wavelength_array)
-            self._wl_last_fit = None
+                self.dash.sync_active_axis(wl_new)
             self.btn_wl_save.setEnabled(False)
-            reasons = []
-            if not monotonic:
-                reasons.append("the wavelength axis comes out non-monotonic")
-            if not in_band:
-                reasons.append(f"the axis runs {wl_new[0]:.0f}–{wl_new[-1]:.0f} nm "
-                               f"(outside a plausible range)")
-            if max_res > 8.0:
-                reasons.append(f"the max residual is {max_res:.1f} nm")
             self.lbl_wl_result.setText(
-                f"<b style='color:{_T().DANGER}'>Fit rejected</b> — " + "; ".join(reasons)
+                f"<b style='color:{_T().DANGER}'>Fit rejected</b> — "
+                + "; ".join(res["reasons"])
                 + ". Typical cause: a mis-assigned line (wrong lamp or a peak "
                 "matched to the wrong wavelength). The previous axis is kept. "
                 "Correct the line table, then fit again.")
             self._wl_redraw_plot()
             return
 
-        self._wl_last_fit = res
         self.btn_wl_save.setEnabled(True)
-
         # Live preview on the main scope. Route through sync_active_axis so the
         # reference library is re-interpolated onto the new axis in the SAME
         # step — otherwise the reference lines slide along with the spectrum in
@@ -608,55 +577,29 @@ class CalibrationDialog(QDialog):
             self.dash.sync_active_axis(wl_new)
         else:
             self.dash.active_wavelengths = wl_new
-        self._wl_capture = (wl_new, self._wl_capture[1])  # re-plot on new axis
         self._wl_redraw_plot()
 
-        line_lo, line_hi = min(nms), max(nms)
-        dev_lo, dev_hi = float(wl_new[0]), float(wl_new[-1])
-        rms = float(np.sqrt(np.mean(np.square(res["residuals"]))))
         warn = ""
-        # warn if lines leave large unconstrained spans at either end
-        if line_lo - dev_lo > 60 or dev_hi - line_hi > 60:
+        if res["coverage_warning"]:
+            lo, hi = res["line_range"]
+            dlo, dhi = res["device_range"]
             warn = (f"<br><span style='color:{_T().WARN}'><b>Coverage warning:</b> "
-                    f"lines span {line_lo:.0f}–{line_hi:.0f} nm but the device "
-                    f"covers {dev_lo:.0f}–{dev_hi:.0f} nm. The axis is "
+                    f"lines span {lo:.0f}–{hi:.0f} nm but the device "
+                    f"covers {dlo:.0f}–{dhi:.0f} nm. The axis is "
                     f"<b>extrapolated</b> outside the line span — small residuals "
                     f"do not guarantee accuracy there. Add lines from other "
                     f"lamps for full coverage.</span>")
-        elif rms > 0.5:
-            warn = (f"<br><span style='color:{_T().WARN}'>RMS {rms:.2f} nm is a bit "
+        elif res["rms_warning"]:
+            warn = (f"<br><span style='color:{_T().WARN}'>RMS {res['rms']:.2f} nm is a bit "
                     f"high — check for a mis-assigned line before saving.</span>")
         self.lbl_wl_result.setText(
-            f"<b>Fit (degree {self.spn_degree.value()}, {len(nms)} lines):</b> "
-            f"max residual {max_res:.3f} nm, RMS {rms:.3f} nm. "
+            f"<b>Fit (degree {deg}, {res['n_lines']} lines):</b> "
+            f"max residual {res['max_error']:.3f} nm, RMS {res['rms']:.3f} nm. "
             f"Applied live. {warn}")
 
-    def _backup_calibration(self) -> str | None:
-        """Write a timestamped snapshot of the current calibration-related config
-        keys next to the config file, so an overwrite can always be rolled back.
-        Returns the backup path (or None on failure)."""
-        import os, json, datetime
-        from app_config import Config
-        keys = ["pasco_wl_poly_coeffs", "lr2t_wl_poly_coeffs", "ocean_wl_poly_coeffs",
-                "lr2t_wl_offset_nm", "ocean_wl_offset_nm", "ocean_use_device_wavelength"]
-        snap = {k: Config.get(k, None) for k in keys}
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        snap["_backed_up_at"] = ts
-        snap["_note"] = "Calibration snapshot taken before the wizard overwrote it."
-        try:
-            cfg_dir = os.path.dirname(os.path.abspath(Config.path)) or "."
-            path = os.path.join(cfg_dir, f"old_calib_data_{ts}.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(snap, f, indent=2, sort_keys=True)
-            return path
-        except Exception as e:
-            QMessageBox.warning(self, "Backup failed",
-                                f"Could not write the calibration backup: {e}\n"
-                                f"Nothing was saved.")
-            return None
-
     def _wl_save_clicked(self):
-        if not self._wl_last_fit:
+        sess = self._wl_session()
+        if sess is None or not sess.last_fit:
             return
         if not self.chk_wl_confirm.isChecked():
             QMessageBox.warning(
@@ -664,40 +607,25 @@ class CalibrationDialog(QDialog):
                 "Enable 'Back up & confirm' first. Saving replaces the current "
                 "wavelength calibration; a timestamped backup is written before.")
             return
-        dev = self._device_name()
-        key = {
-            "PASCO PS-2600A": "pasco_wl_poly_coeffs",
-            "ASEQ / Lasertrack LR-2T": "lr2t_wl_poly_coeffs",
-            "Ocean HDX-UV-VIS": "ocean_wl_poly_coeffs",
-        }.get(dev)
-        if key is None:
+        if sess.config_key() is None:
             QMessageBox.information(
                 self, "Not persistable",
-                f"No wavelength-coefficient config key for '{dev}'. "
+                f"No wavelength-coefficient config key for '{sess.backend_name}'. "
                 f"The fit is applied for this session but not saved.")
             return
-        # Back up BEFORE overwriting; abort if the backup couldn't be written.
-        backup_path = self._backup_calibration()
-        if backup_path is None:
+        try:
+            out = sess.save(True)
+        except wlcal.WavelengthError as e:
+            QMessageBox.warning(self, "Backup failed", str(e))
             return
-        from app_config import Config
-        Config.set(key, list(self._wl_last_fit["coeffs"]))
-        self._wl_saved = True
         self.chk_wl_confirm.setChecked(False)   # require a fresh tick next time
-        extra = ""
-        # The Ocean HDX defaults to its on-device factory axis; saving a
-        # calibration means "use mine now", so flip it to the config poly.
-        if dev == "Ocean HDX-UV-VIS":
-            Config.set("ocean_use_device_wavelength", False)
-            extra = ("<br>Switched 'ocean_use_device_wavelength' → false so "
-                     "this calibration is used instead of the device's factory "
-                     "axis. Set it back to true to revert to the device axis.")
+        extra = f"<br>{out['extra_note']}" if out["extra_note"] else ""
         import os
         QMessageBox.information(
             self, "Saved",
-            f"Wavelength calibration saved to '{key}'. It will load "
+            f"Wavelength calibration saved to '{out['key']}'. It will load "
             f"automatically on the next connect.<br>Backup of the previous "
-            f"calibration: <b>{os.path.basename(backup_path)}</b>.{extra}")
+            f"calibration: <b>{os.path.basename(out['backup_path'])}</b>.{extra}")
 
     # ══════════════════════════════════════════════════════════════════════
     #  RESPONSE TAB
