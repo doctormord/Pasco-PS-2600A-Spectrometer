@@ -86,6 +86,21 @@ CONTROL_KEYS = frozenset({
     "heatmap_buffer_size", "heatmap_measure_interval_ms",
     *fusion.DEFAULTS.keys(),
 })
+DISPLAY_MODE_VALUES = (processing.DISPLAY_AUTO,) + processing.DISPLAY_MODES
+
+
+class _WithoutProfile:
+    """The calibration runtime seen WITHOUT its v2 profile ('Raw ADC' display
+    while a profile is active): same stored darks, no applier, no gain."""
+    applier = None
+    legacy_gain = None
+    active_v2 = False
+
+    def __init__(self, rt):
+        self._rt = rt
+
+    def dark_for(self, integration_us):
+        return self._rt.dark_for(integration_us)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -162,6 +177,12 @@ class FrameEvent:
     heatmap_pushed: bool
     heatmap_column: np.ndarray | None    # the pushed column (linear axis)
     heatmap_time: float | None           # monotonic time of the push
+    # display representation (processing.display_transform); pixels/unit stay
+    # the corrected data every evaluation uses
+    display: np.ndarray | None = None
+    display_unit: str | None = None
+    display_mode: str | None = None
+    exposure: dict | None = None         # drive level in ADC (processing.exposure_level)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -523,6 +544,9 @@ class Engine:
         self.current_pre_response = np.zeros(self.pixel_count)
         self.current_peaks: list = []
         self.current_unit = "counts"
+        self.current_display = np.zeros(self.pixel_count)
+        self.current_display_unit = "counts"
+        self.current_display_mode = processing.DISPLAY_RAW
         self.current_dark_source: str | None = None
         self.latest_ob_mean = 0.0
         self.latest_integration_us = int(START_INTEGRATION_TIME_US)
@@ -902,6 +926,12 @@ class Engine:
                 eff["auto_exposure"] = False
             if "frames_to_average" in eff:
                 eff["frames_to_average"] = max(1, int(eff["frames_to_average"]))
+            if "display_mode" in eff:
+                dm = str(eff["display_mode"] or processing.DISPLAY_AUTO).strip().lower()
+                if dm not in DISPLAY_MODE_VALUES:
+                    raise EngineError(f"Unknown display mode '{dm}' "
+                                      f"(allowed: {', '.join(DISPLAY_MODE_VALUES)}).")
+                eff["display_mode"] = dm
             if "fast_preview_short_pct" in eff:
                 eff["fast_preview_short_pct"] = max(1, min(50, int(eff["fast_preview_short_pct"])))
             if "heatmap_buffer_size" in eff:
@@ -952,6 +982,10 @@ class Engine:
                     self.calib.refresh()
             if "heatmap_buffer_size" in eff:
                 self.set_heatmap_size(eff["heatmap_buffer_size"], persist=False)
+            if "display_mode" in eff:
+                # the time-lapse holds display values: never mix units/modes
+                with self._frame_lock:
+                    self._reset_heatmap()
             if "heatmap_measure_interval_ms" in eff:
                 self._heatmap_measure_ms = max(0, int(eff["heatmap_measure_interval_ms"] or 0))
         self._emit("config", json_safe(eff))
@@ -1040,6 +1074,15 @@ class Engine:
         st = self.calibration_status()
         self._emit("calibration", st)
         return st
+
+    def display_modes(self) -> list[dict]:
+        """Selectable display modes now ({value, label, available})."""
+        ap = self.calib.applier
+        avail = set(processing.available_display_modes(None if ap is None else ap.type))
+        out = [{"value": processing.DISPLAY_AUTO, "label": "Auto", "available": True}]
+        out += [{"value": m, "label": processing.DISPLAY_LABELS[m], "available": m in avail}
+                for m in processing.DISPLAY_MODES]
+        return out
 
     def calibration_status(self) -> dict:
         st = json_safe(dict(self.calib.status))
@@ -1272,7 +1315,31 @@ class Engine:
             self.current_peaks = result["peaks"]
             self.current_unit = result["unit"]
             self.current_dark_source = result["dark_source"]
-            disp = np.nan_to_num(self.current_pixels, nan=0.0)
+            # display representation (only what is plotted; evaluations use
+            # current_pixels = corrected data)
+            applier = self.calib.applier
+            mode = processing.effective_display_mode(
+                self.cfg.get("display_mode", processing.DISPLAY_AUTO),
+                None if applier is None else applier.type,
+                str(self.cfg.get("display_unit", "counts")))
+            raw_counts = None
+            if mode == processing.DISPLAY_RAW and applier is not None:
+                rr, _ = self._process(averaged, ob_mean, integration_us, wl,
+                                      runtime=_WithoutProfile(self.calib))
+                raw_counts = rr["pixels"]
+            dvals, dunit = processing.display_transform(
+                mode, values=result["pixels"], unit=result["unit"],
+                integration_us=integration_us, calibration=applier, raw_counts=raw_counts)
+            self.current_display = dvals
+            self.current_display_unit = dunit
+            self.current_display_mode = mode
+            b = self.acquisition
+            exposure = processing.exposure_level(
+                averaged, full_scale=float(getattr(b, "adc_full_scale", 0.0) or 0.0)
+                if b is not None else 0.0,
+                saturation_level=float(getattr(b, "adc_saturation_level", self.adc_saturation))
+                if b is not None else self.adc_saturation)
+            disp = np.nan_to_num(dvals, nan=0.0)
 
             # heatmap (optional measurement-interval decimation)
             pushed, col, ptime = False, None, None
@@ -1322,7 +1389,9 @@ class Engine:
                 lux_calibration=self.lux_calibration(self.current_unit),
                 heatmap_pushed=pushed,
                 heatmap_column=None if col is None else col.copy(),
-                heatmap_time=ptime)
+                heatmap_time=ptime,
+                display=np.array(dvals, float), display_unit=dunit,
+                display_mode=mode, exposure=exposure)
             self.last_frame = ev
         if notify:
             self._emit("frame", ev)
@@ -1379,6 +1448,10 @@ class Engine:
             "dark_correction": bool(cfg.get("dark_correction", False)),
             "dark_mode": cfg.get("dark_mode", "optical_black"),
             "display_unit": cfg.get("display_unit", "counts"),
+            "display_mode": cfg.get("display_mode", processing.DISPLAY_AUTO),
+            "display_mode_effective": self.current_display_mode,
+            "display_modes": self.display_modes(),
+            "display_value_unit": self.current_display_unit,
             "irradiance_unit": cfg.get("irradiance_unit", "uW/cm2/nm"),
             "unit": self.current_unit,
             "unit_label": processing.unit_label(self.current_unit),

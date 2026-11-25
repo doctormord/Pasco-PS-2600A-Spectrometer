@@ -300,5 +300,5 @@ def test_dashboard_has_overlay_controls():
     src = inspect.getsource(gui_dashboard.DashboardWindow)
     assert "self.button_scope_ref = ToggleSwitch" in src
     assert '"Reference overlay"' in src
-    assert "self.engine.reference_overlay(rid, ev.wavelengths, ev.pixels, ev.unit)" in src
+    assert "self.engine.reference_overlay(rid, ev.wavelengths, vals, unit)" in src
     assert "self._update_scope_reference(ev)" in src

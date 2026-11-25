@@ -74,6 +74,11 @@
       <!-- Scope -->
       <div class="tab-pane on" data-pane="scope">
         <div class="scope-tools">
+          <select id="scope-display-mode" class="scope-ref-select" aria-label="Display mode"
+                  title="What the scope shows: raw ADC, corrected, normalised, count rate or absolute. Auto picks the best available mode."></select>
+          <button id="btn-raw-curve" class="tool-toggle"
+                  title="Show the averaged raw ADC curve (faint, right axis) behind corrected data.">RAW CURVE</button>
+          <span class="scope-tools-sep"></span>
           <button id="btn-freeze" class="tool-toggle"
                   title="Freeze the current trace as a grey snapshot (absolute ADC). Click again to clear.">❄&nbsp; FREEZE</button>
           <button id="btn-diff" class="tool-toggle"
@@ -95,6 +100,10 @@
           <select id="scope-ref-select" class="scope-ref-select" aria-label="Reference source for the overlay"
                   title="Reference source for the overlay"></select>
         </div>
+        <div id="exposure-bar" class="exposure-bar" title="Peak of the raw signal relative to the detector full scale">
+          <span id="exposure-text" class="exposure-text">—</span>
+          <span class="exposure-track"><span id="exposure-fill" class="exposure-fill"></span></span>
+        </div>
         <div id="scope-plot" class="plot scope-plot"></div>
       </div>
 
@@ -106,6 +115,10 @@
           <label class="hm-f" title="Log one column per interval (0 = every frame).">Interval
             <input type="number" id="hm-interval" min="0" step="100" value="0" data-lock="auth"><span class="hm-u">ms</span></label>
           <span id="hm-span" class="hm-span" title="Time covered by a full buffer (size × interval, or ÷ frame rate)">Span —</span>
+          <label class="hm-f" title="Heatmap colour scale: automatic (per frame) or a fixed upper limit. Stored per display mode.">
+            <input type="checkbox" id="hm-ymax-auto" checked data-lock="auth"> Auto max
+            <input type="number" id="hm-ymax" min="0" step="any" disabled data-lock="auth">
+            <span class="hm-u" id="hm-ymax-unit">ADC</span></label>
           <button id="hm-clear" class="mini-btn" data-lock="auth" title="Clear the time-lapse buffer">⟲ Clear</button>
           <span class="scope-tools-sep"></span>
           <label class="hm-f" title="Write every logged column to a CSV file on the SERVER (crash-safe)."><input type="checkbox" id="hm-autosave" data-lock="auth"> Autosave to disk</label>
@@ -339,10 +352,10 @@
           <input type="number" id="cfg-x_max_nm" min="100" max="1500" step="10" value="1050" /></div>
         <div class="row"><label>Auto-scale Y</label>
           <span class="toggle on" data-key="auto_y"></span></div>
-        <div class="row"><label>Y max <span>ADC</span></label>
+        <div class="row"><label>Y max <span id="y-unit-lbl">ADC</span></label>
           <span class="ctl-group">
             <button id="btn-y-snap" class="mini-btn" title="Snap Y max to the current frame peak (also disables Auto-scale Y)">▲</button>
-            <input type="number" id="cfg-y_max_adc" min="10" max="65000" step="100" value="4000" />
+            <input type="number" id="cfg-y_max_adc" min="0" step="any" value="4000" />
           </span></div>
       </details>
 

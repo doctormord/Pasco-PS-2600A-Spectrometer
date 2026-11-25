@@ -977,6 +977,21 @@ def _span(color_token: str, html: str) -> str:
     return f"<span style='color:{color_token}'>{html}</span>"
 
 
+class _ResultPane(FixedTextPane):
+    """Result text with its own space in the plot splitter: never fixed to a
+    height the plots could squeeze, at least `lines` lines tall, longer content
+    scrolls inside the pane (the top line is always the first one shown)."""
+
+    def __init__(self, lines: int = 6, parent=None):
+        super().__init__(lines, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _update_height(self) -> None:
+        fw = 2 * self.frameWidth()
+        self.setMinimumHeight(self.fontMetrics().lineSpacing() * self._lines + 10 + fw)
+        self.setMaximumHeight(16777215)
+
+
 class _SpectralWizardTab(QWidget):
     def __init__(self, dlg):
         super().__init__()
@@ -1094,10 +1109,16 @@ class _SpectralWizardTab(QWidget):
         self._reset_plots()
         plots.addWidget(self.plot_in)
         plots.addWidget(self.plot_out)
+        # The result pane is the third pane of the splitter: it keeps its own
+        # space (minimum height of 6 lines) and is never covered by the plots.
+        self.lbl_result = _ResultPane(6)
+        plots.addWidget(self.lbl_result)
+        plots.setStretchFactor(0, 2)
+        plots.setStretchFactor(1, 2)
+        plots.setStretchFactor(2, 2)
+        plots.setSizes([200, 200, 200])
+        self.plots_split = plots
         rv.addWidget(plots, 1)
-        # Fixed-height result pane — no layout jumps.
-        self.lbl_result = FixedTextPane(9)
-        rv.addWidget(self.lbl_result)
         self.split.addWidget(right)
         self.split.setStretchFactor(0, 0)
         self.split.setStretchFactor(1, 1)

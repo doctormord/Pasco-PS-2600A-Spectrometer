@@ -225,6 +225,22 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
     wl = np.nan_to_num(np.asarray(wl, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
     calib_status = json_safe(dict(engine.calib.status))
     spec = engine.spec_range_nm
+    disp = getattr(ev, "display", None) if ev is not None else None
+    dunit = (getattr(ev, "display_unit", None) if ev is not None else None) or unit
+    if disp is not None and np.asarray(disp).size == np.asarray(ev.pixels).size:
+        d = np.asarray(disp, dtype=float)
+        if downsample > 1 and d.size > downsample:
+            d = d[::downsample]
+        drnd = _round_counts if dunit in _COUNT_UNITS + ("counts_corrected",) else _round_sig
+        display = [drnd(float(v)) if np.isfinite(v) else None for v in d]
+    else:
+        display = list(intens)
+    raw = None
+    if ev is not None and ev.raw_averaged is not None:
+        r = np.asarray(ev.raw_averaged, dtype=float)
+        if downsample > 1 and r.size > downsample:
+            r = r[::downsample]
+        raw = [round(float(v), 1) if np.isfinite(v) else None for v in r]
     return {
         "type": "frame",
         "wavelengths": [round(float(w), 2) for w in wl],
@@ -248,6 +264,15 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
         "color": None if color is None else json_safe(
             {k: v for k, v in color.items()}),
         "lux_calibration": json_safe(ev.lux_calibration) if ev is not None else None,
+        # display mode (what to plot); "intensities" stay the corrected data
+        "display": display,
+        "display_unit": dunit,
+        "display_unit_label": processing.unit_label(dunit),
+        "display_mode": (getattr(ev, "display_mode", None) if ev is not None else None)
+        or engine.current_display_mode,
+        "display_modes": engine.display_modes(),
+        "raw": raw,
+        "exposure": json_safe(getattr(ev, "exposure", None)) if ev is not None else None,
     }
 
 

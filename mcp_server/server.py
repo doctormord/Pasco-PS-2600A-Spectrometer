@@ -392,7 +392,9 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
           "exposure_ms: integration time in ms (clamped to the device range); auto_exposure: "
           "continuous auto exposure of the live view; frames_to_average: 1-1000; paused; "
           "dark_correction; dark_mode: optical_black|parametric|stored; display_unit: "
-          "counts|counts_per_s; irradiance_unit: uW/cm2/nm|W/m2/nm|mW/m2/nm; hot_pixel_filter; "
+          "counts|counts_per_s; display_mode: auto|raw|corrected|normalised|count_rate|absolute "
+          "(only what is plotted; evaluations always use corrected data); "
+          "irradiance_unit: uW/cm2/nm|W/m2/nm|mW/m2/nm; hot_pixel_filter; "
           "spatial_smoothing; fusion_enabled (multi-exposure fusion). Returns what was applied "
           "plus the compact status.", idempotent=True)
     async def set_acquisition(
@@ -401,6 +403,8 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
             dark_correction: bool | None = None,
             dark_mode: Literal["optical_black", "parametric", "stored"] | None = None,
             display_unit: Literal["counts", "counts_per_s"] | None = None,
+            display_mode: Literal["auto", "raw", "corrected", "normalised", "count_rate",
+                                  "absolute"] | None = None,
             irradiance_unit: Literal["uW/cm2/nm", "W/m2/nm", "mW/m2/nm"] | None = None,
             hot_pixel_filter: bool | None = None, spatial_smoothing: bool | None = None,
             fusion_enabled: bool | None = None) -> dict:
@@ -408,7 +412,7 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
             exposure_ms=exposure_ms, auto_exposure=auto_exposure,
             frames_to_average=frames_to_average, paused=paused,
             dark_correction=dark_correction, dark_mode=dark_mode, display_unit=display_unit,
-            irradiance_unit=irradiance_unit, hot_pixel_filter=hot_pixel_filter,
+            display_mode=display_mode, irradiance_unit=irradiance_unit, hot_pixel_filter=hot_pixel_filter,
             spatial_smoothing=spatial_smoothing, fusion_enabled=fusion_enabled).items()
             if v is not None}
         if not body:

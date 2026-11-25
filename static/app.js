@@ -20,8 +20,9 @@ const SI = {
   ENV:    6,                    // peak-hold envelope (yellow, absolute ADC)
   TRAIL0: 7,                    // persistence trail 0..PERSIST_N-1 (faded teal)
   SRC:    7 + PERSIST_N,        // reference-source overlay (server-scaled, violet dashed)
+  RAW:    8 + PERSIST_N,        // averaged raw ADC curve (faint, own right-hand axis)
 };
-const SERIES_COUNT = SI.SRC + 1;   // 14 total (1 x + 13 y)
+const SERIES_COUNT = SI.RAW + 1;   // 15 total (1 x + 14 y)
 const emptyScopeData = () => Array.from({ length: SERIES_COUNT }, () => []);
 
 // ── Global state ─────────────────────────────────────────────
@@ -41,6 +42,12 @@ const State = {
                              // (null = none); outside it is shaded grey.
   unit: 'counts',            // unit of msg.intensities (from the frame)
   unitLabel: 'counts',
+  dispUnit: 'counts',        // unit of the plotted `display` values
+  dispUnitLabel: 'counts',
+  displayModeEff: null,      // effective display mode of the last frame
+  displayModes: [],          // [{value,label,available}] from the frame
+  rawData: null,             // averaged raw ADC per pixel (frame.raw)
+  exposure: null,            // frame.exposure {peak_pct_fs, saturated, ...}
   // Overlay cluster (client-only, reset on reload — these hold captured data
   // that can't meaningfully persist across a page load).
   overlay: { diff: false, peakHold: false, persist: false },
@@ -225,7 +232,11 @@ function handleFrame(msg) {
   // Keep the latest spectrum in scopeData regardless of active tab (the
   // heatmap and CSV export read it too).
   State.scopeData[0] = msg.wavelengths;
-  State.scopeData[1] = msg.intensities;
+  // The scope plots the DISPLAY values (mode dependent); evaluations (colour,
+  // filter, CSV) keep using msg.intensities.
+  const disp = Array.isArray(msg.display) ? msg.display : msg.intensities;
+  State.scopeData[1] = disp;
+  DisplayMode.onFrame(msg);
   // Manufacturer-guaranteed range for out-of-spec shading (may be null).
   if (msg.spec_min !== undefined) State.specRange.min = msg.spec_min;
   if (msg.spec_max !== undefined) State.specRange.max = msg.spec_max;
@@ -243,10 +254,10 @@ function handleFrame(msg) {
   // the current Y maximum so it always fits the displayed signal. Aligned to
   // the device axis at fetch time; null-filled (drawn as a gap) when off or on
   // a length mismatch (e.g. mid device-switch, before re-fetch).
-  State.scopeData[SI.REF] = buildReferenceSeries(msg.intensities);
+  State.scopeData[SI.REF] = buildReferenceSeries(disp);
   // CSV background, freeze, difference, peak-hold envelope and the persistence
   // trail — all computed here so a single setData() draws everything in step.
-  updateOverlays(msg.intensities);
+  updateOverlays(disp);
   try { RefOverlay.request(false); } catch (e) { /* overlay is optional */ }
 
   // Scope plot
@@ -275,7 +286,7 @@ function handleFrame(msg) {
 
   // Heatmap — accumulate history every frame so switching to the tab shows
   // recent data; rollHeatmap only repaints when the heatmap tab is active.
-  rollHeatmap(msg.intensities);
+  rollHeatmap(disp);
 
   // Color tab
   if (State.activeTab === 'color' && msg.color) {
@@ -315,6 +326,9 @@ function buildScopeSeries() {
   };
   s[SI.SRC] = {                 // reference-source overlay (lamp file), already in display unit
     stroke: '#c084fc', width: 1.5, dash: [8, 4], spanGaps: true, points: { show: false },
+  };
+  s[SI.RAW] = {                 // raw ADC (averaged), faint, on the right-hand 'raw' axis
+    stroke: 'rgba(154,160,166,0.5)', width: 1, spanGaps: true, scale: 'raw', points: { show: false },
   };
   s[SI.FREEZE] = {              // frozen snapshot: grey solid, absolute ADC
     stroke: '#9aa0a6', width: 1.5, spanGaps: true, points: { show: false },
@@ -364,6 +378,15 @@ function makeScopePlot() {
         labelFont: '10px Inter',
         label: 'Intensity (ADC)',
       },
+      {
+        scale: 'raw', side: 1, show: false,
+        stroke: getCss('--fg-4'),
+        grid: { show: false },
+        ticks: { stroke: getCss('--border-2') },
+        font: '11px JetBrains Mono',
+        labelFont: '10px Inter',
+        label: 'Raw (ADC)',
+      },
     ],
     series: buildScopeSeries(),
     scales: {
@@ -372,6 +395,7 @@ function makeScopePlot() {
       // every point.
       x: { time: false, range: () => xRange() },
       y: { range: () => autoYRange() },
+      raw: { range: () => rawRange() },
     },
     plugins: [
       outOfSpecPlugin(),
@@ -409,13 +433,8 @@ function makeScopePlot() {
   window.addEventListener('resize', fitScope);
 }
 
-// Y-axis title follows the unit of the frame (counts -> ADC, else unit_label).
-function yAxisTitle() {
-  if (State.unit === 'counts') return 'Intensity (ADC)';
-  if (State.unit === 'counts/s') return 'Count rate (counts/s)';
-  if (State.unit === 'relative') return 'Relative intensity';
-  return `Spectral irradiance (${State.unitLabel})`;
-}
+// Y-axis title follows the display unit and mode of the frame.
+function yAxisTitle() { return DisplayMode.yTitle(); }
 function updateYAxisLabel() {
   const u = State.scopePlot;
   if (!u || !u.axes[1]) return;
@@ -442,18 +461,26 @@ function autoYRange() {
   if (State.freeze)           consider(State.scopeData[SI.FREEZE]);
   if (State.overlay.peakHold) consider(State.scopeData[SI.ENV]);
   if (State.overlay.diff)     consider(State.scopeData[SI.DIFF]);   // may be negative
-  // Calibrated (irradiance) values can be << 1: no ADC-sized floor/ceiling.
-  const calUnit = State.unit !== 'counts' && State.unit !== 'counts/s';
-  if (calUnit && State.cfg.auto_y !== false) {
-    return [Math.min(0, mn * 1.1), (mx > 0 ? mx : 1) * 1.1];
+  // Non-count units (irradiance, relative, ...) can be << 1: no ADC-sized floor.
+  const isCount = DisplayMode.isCountUnit(State.dispUnit);
+  const fs = (State.exposure && Number(State.exposure.full_scale)) || 4000;
+  const manualMax = Number(State.cfg.y_max_adc);
+  if (State.cfg.auto_y === false && manualMax > 0) {
+    return [isCount ? Math.min(-20, mn * 1.1) : Math.min(0, mn * 1.1), manualMax];
   }
+  if (!isCount) return [Math.min(0, mn * 1.1), (mx > 0 ? mx : 1) * 1.1];
   const lo = Math.min(-20, mn * 1.1);
-  if (State.cfg.auto_y === false) {
-    return [lo, State.cfg.y_max_adc || 4000];
-  }
   const live = State.scopeData[SI.LIVE];
-  if ((!live || live.length === 0) && !State.freeze) return [lo, 4000];
+  if ((!live || live.length === 0) && !State.freeze) return [lo, fs];
   return [lo, Math.max(50, mx * 1.1)];
+}
+
+// Range of the secondary raw-ADC axis (follows the raw curve itself).
+function rawRange() {
+  const arr = State.scopeData[SI.RAW];
+  let mx = 0;
+  if (arr) for (let i = 0; i < arr.length; i++) { const v = arr[i]; if (v != null && isFinite(v) && v > mx) mx = v; }
+  return [-20, Math.max(50, mx * 1.1)];
 }
 
 function configXRange() {
@@ -915,16 +942,16 @@ function hoverReadoutPlugin() {
         if (u.cursor.idx == null) {
           $('#ro-pixel').textContent = '—';
           $('#ro-wave').innerHTML  = '—<span class="unit"> nm</span>';
-          $('#ro-int').innerHTML   = '—<span class="unit"> ADC</span>';
+          $('#ro-int').innerHTML   = `—<span class="unit"> ${esc(DisplayMode.unitText())}</span>`;
           return;
         }
         const idx = u.cursor.idx;
         const wl = State.scopeData[0]?.[idx];
         const it = State.scopeData[1]?.[idx];
-        if (wl == null || it == null) return;
+        if (wl == null) return;
         $('#ro-pixel').textContent = idx;
         $('#ro-wave').innerHTML  = `${wl.toFixed(1)}<span class="unit"> nm</span>`;
-        $('#ro-int').innerHTML   = `${it.toFixed(0)}<span class="unit"> ADC</span>`;
+        $('#ro-int').innerHTML   = DisplayMode.fmtUnit(it);   // "–" for masked pixels
       },
     },
   };
@@ -940,7 +967,15 @@ function drawPeaksOverlay(peaks) {
   if (!State.peaksOn) return;
   for (const p of peaks) {
     const x = u.valToPos(p.wavelength_nm, 'x');
-    const y = u.valToPos(p.intensity_adc, 'y');
+    // Markers sit on the plotted (display) curve, whatever the display mode.
+    const dxs = State.scopeData[0], dys = State.scopeData[1];
+    let pv = p.intensity_adc;
+    if (dxs && dys && dxs.length === dys.length && dxs.length) {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < dxs.length; i++) { const d = Math.abs(dxs[i] - p.wavelength_nm); if (d < bd) { bd = d; bi = i; } }
+      if (dys[bi] != null && isFinite(dys[bi])) pv = dys[bi]; else continue;
+    }
+    const y = u.valToPos(pv, 'y');
     const dot = document.createElement('div');
     dot.className = 'peak-label';
     dot.style.cssText = `
@@ -1058,16 +1093,17 @@ function measureModePlugin() {
     measureBox.style.display = '';
     const dx = Math.abs(State.measureB - State.measureA);
     const ws = State.scopeData[0], vs = State.scopeData[1];
-    let yA = 0, yB = 0;
+    let yA = NaN, yB = NaN;
     if (ws && vs) {
       const findY = (wl) => {
-        if (!ws.length) return 0;
+        if (!ws.length) return NaN;
         let bestI = 0, bestD = Math.abs(ws[0] - wl);
         for (let i = 1; i < ws.length; i++) {
           const d = Math.abs(ws[i] - wl);
           if (d < bestD) { bestD = d; bestI = i; }
         }
-        return vs[bestI];
+        const v = vs[bestI];
+        return (v == null || !isFinite(v)) ? NaN : v;
       };
       yA = findY(State.measureA);
       yB = findY(State.measureB);
@@ -1075,7 +1111,7 @@ function measureModePlugin() {
     const dy = Math.abs(yB - yA);
     measureBox.innerHTML =
       `A ${State.measureA.toFixed(1)} · B ${State.measureB.toFixed(1)} · ` +
-      `Δλ ${dx.toFixed(2)} nm · Δy ${dy.toFixed(0)} ADC`;
+      `Δλ ${dx.toFixed(2)} nm · Δy ${DisplayMode.fmt(dy)} ${DisplayMode.unitText()}`;
   }
 }
 
@@ -1119,7 +1155,7 @@ function initHeatmap() {
     State.hm.cursor = null;
     $('#ro-pixel').textContent = '—';
     $('#ro-wave').innerHTML = '—<span class="unit"> nm</span>';
-    $('#ro-int').innerHTML  = '—<span class="unit"> ADC</span>';
+    $('#ro-int').innerHTML  = `—<span class="unit"> ${esc(DisplayMode.unitText())}</span>`;
     redrawHeatmap();
   });
 }
@@ -1132,15 +1168,10 @@ function rollHeatmap(intensities) {
 
   const xMin = (isFinite(State.cfg.x_min_nm) ? State.cfg.x_min_nm : xs[0]);
   const xMax = (isFinite(State.cfg.x_max_nm) ? State.cfg.x_max_nm : xs[xs.length - 1]);
-  const yMax = State.cfg.auto_y === false
-    ? (State.cfg.y_max_adc || 4000)
-    : Math.max(50, Math.max(...ys) * 1.1);
-
-  // Store the full-resolution normalized row plus its raw values + axis so the
-  // crosshair can report true ADC and wavelength.
-  const N = ys.length;
-  const norm = new Float32Array(N);
-  for (let i = 0; i < N; i++) norm[i] = Math.max(0, Math.min(1, ys[i] / yMax));
+  // Store the full-resolution normalized row plus its display values + axis so
+  // the crosshair can report the true value and wavelength. The upper limit is
+  // per display mode (auto per frame, or manual).
+  const norm = HmLimits.norm(ys);
 
   State.hm.xMin = xMin; State.hm.xMax = xMax;
   // Same logging rule as the server buffer: one column per measurement
@@ -1247,11 +1278,11 @@ function redrawHeatmap() {
       const idx = _hmIndexForX(cx, cw, row.xs, xMin, xMax);
       const wl = row.xs[idx], adc = row.raw[idx];
       const age = rIdx;   // 0 = most recent (bottom); older rows increase upward
-      label = `${wl.toFixed(1)} nm · ${Math.round(adc)} ADC · −${age} frame${age === 1 ? '' : 's'}`;
+      label = `${wl.toFixed(1)} nm · ${DisplayMode.fmt(adc)} ${DisplayMode.unitText()} · −${age} frame${age === 1 ? '' : 's'}`;
       // Also drive the top-bar readout, like the scope tab.
       $('#ro-pixel').textContent = idx;
       $('#ro-wave').innerHTML = `${wl.toFixed(1)}<span class="unit"> nm</span>`;
-      $('#ro-int').innerHTML  = `${Math.round(adc)}<span class="unit"> ADC</span>`;
+      $('#ro-int').innerHTML  = DisplayMode.fmtUnit(adc);
     }
     if (label) {
       ctx.font = `${12 * dpr}px JetBrains Mono, monospace`;
@@ -1295,7 +1326,8 @@ function infernoColor(t) {
 // Colour / CRI report + raw-data CSV. Posts the current spectrum to the shared
 // server renderer (same engine as the desktop CIE tab) and downloads the result.
 function saveColorReport(fmt) {
-  const wl = State.scopeData[SI.X], ys = State.scopeData[SI.LIVE];
+  const wl = State.scopeData[SI.X];
+  const ys = (State.lastFrame && State.lastFrame.intensities) || State.scopeData[SI.LIVE];
   if (!wl || !wl.length) { toast('No spectrum yet'); return; }
   apiFetch('/api/color/report', {
     method: 'POST',
@@ -1720,6 +1752,8 @@ function applyConfigToUI(cfg) {
   State.measureMode = !!cfg.measure_mode;
   $('#btn-peaks').classList.toggle('on', State.peaksOn);
   $('#btn-measure').classList.toggle('on', State.measureMode);
+  if ('display_mode' in cfg) { try { DisplayMode.syncSelect(); } catch (e) { /* not ready */ } }
+  if ('heatmap_limits_by_mode' in cfg) { try { HmLimits.syncUi(); HmLimits.renorm(); } catch (e) { /* not ready */ } }
   if ('scope_reference_overlay' in cfg || 'scope_reference_id' in cfg) {
     try { RefOverlay.sync(); RefOverlay.request(true); } catch (e) { /* overlay is optional */ }
   }
@@ -1738,9 +1772,10 @@ function resetExposure() {
 // desktop GUI's ▲ button). Reads the latest spectrum already held in scopeData.
 function snapYToPeak() {
   const ys = State.scopeData[1] || [];
-  let peak = 10;
-  for (const v of ys) if (isFinite(v) && v > peak) peak = v;
-  peak = Math.max(10, Math.round(peak));
+  const isCount = DisplayMode.isCountUnit(State.dispUnit);
+  let peak = 0;
+  for (const v of ys) if (v != null && isFinite(v) && v > peak) peak = v;
+  peak = isCount ? Math.max(10, Math.round(peak)) : Number((peak > 0 ? peak : 1).toPrecision(4));
   const yEl = $('#cfg-y_max_adc');
   if (yEl) yEl.value = peak;
   const autoTog = document.querySelector('.toggle[data-key="auto_y"]');
@@ -1752,6 +1787,14 @@ function snapYToPeak() {
 
 function pushCfg(partial) {
   Object.assign(State.cfg, partial);
+  // Manual Y limits are remembered per display mode.
+  if (!State._applyingMode && State.displayModeEff && ('y_max_adc' in partial || 'auto_y' in partial)) {
+    const by = Object.assign({}, State.cfg.y_limits_by_mode || {});
+    const mx = Number(State.cfg.y_max_adc);
+    by[State.displayModeEff] = { auto: State.cfg.auto_y !== false, min: null, max: mx > 0 ? mx : null };
+    partial.y_limits_by_mode = by;
+    State.cfg.y_limits_by_mode = by;
+  }
   // Without an accepted token the server refuses set_config: display-only
   // settings still work locally (they live in State.cfg).
   if (Access.canWrite()) sendWS({ type: 'set_config', payload: partial });
@@ -2079,6 +2122,8 @@ async function init() {
     WlCal.init();
     Cal.init();
     Lin.init();
+    DisplayMode.init();
+    HmLimits.init();
     RefOverlay.init();
   } catch (e) {
     console.error('init: wiring controls failed', e);
@@ -2283,6 +2328,7 @@ const CONTROL_KEYS = new Set([
 // Display-only settings of this page: they keep working without a token.
 const DISPLAY_KEYS = new Set([
   'x_min_nm', 'x_max_nm', 'y_max_adc', 'auto_y', 'theme', 'show_peaks',
+  'y_limits_by_mode', 'heatmap_limits_by_mode',
   'measure_mode', 'measure_a_nm', 'measure_b_nm', 'reference_library',
 ]);
 
@@ -2846,12 +2892,8 @@ const Hm = (() => {
     const xs = Float64Array.from(j.wavelengths);
     const n = Math.min(filled, j.frames.length, hmRows());
     for (let i = 0; i < n; i++) {
-      const ys = j.frames[i].map((v) => (v == null || !isFinite(v) ? 0 : v));
-      let mx = 0;
-      for (const v of ys) if (v > mx) mx = v;
-      const yMax = State.cfg.auto_y === false ? (State.cfg.y_max_adc || 4000) : Math.max(50, mx * 1.1);
-      const norm = new Float32Array(ys.length);
-      for (let k = 0; k < ys.length; k++) norm[k] = Math.max(0, Math.min(1, ys[k] / yMax));
+      const ys = j.frames[i].map((v) => (v == null || !isFinite(v) ? null : v));
+      const norm = HmLimits.norm(ys);
       State.hm.rows.push({ norm, raw: ys, xs, t: 0 });
     }
     State.hm.xMin = isFinite(State.cfg.x_min_nm) ? State.cfg.x_min_nm : xs[0];
@@ -3673,7 +3715,7 @@ const RefOverlay = (() => {
   function request(force) {
     if (!enabled() || !refId()) return;
     const now = Date.now();
-    const k = `${refId()}|${State.unit}|${State.unitLabel}`;
+    const k = `${refId()}|${State.displayModeEff}|${State.dispUnit}|${State.dispUnitLabel}`;
     if (!force && k === key && now - lastAt < MIN_GAP_MS * 2) return;
     if (busy || now - lastAt < MIN_GAP_MS) {
       if (!timer) timer = setTimeout(() => { timer = null; request(force); }, MIN_GAP_MS);
@@ -3725,6 +3767,245 @@ const RefOverlay = (() => {
   }
 
   return { init, sync, request, series };
+})();
+
+// ── Display modes: selector, units, exposure bar, raw curve, per-mode limits ──
+const DisplayMode = (() => {
+  const isCountUnit = (u) => u === 'counts' || u === 'counts/s' || u === 'counts_corrected';
+  let modesKey = '', lastTitle = '', rawUser = null;
+  try { const v = localStorage.getItem('scope_raw_curve'); if (v === '1' || v === '0') rawUser = v === '1'; }
+  catch (e) { /* storage unavailable */ }
+
+  const modeLabel = (v) => {
+    const m = State.displayModes.find((x) => x.value === v);
+    return m ? m.label : (v || '');
+  };
+  const unitText = () => {
+    if (State.dispUnit === 'counts' || State.dispUnit === 'counts_corrected') return 'ADC';
+    if (State.dispUnit === 'counts/s') return 'counts/s';
+    if (State.dispUnit === 'relative') return 'rel.';
+    return State.dispUnitLabel || State.dispUnit || '';
+  };
+  // Display value for readouts: "–" for masked / non-finite pixels.
+  function fmt(v) {
+    if (v == null || typeof v !== 'number' || !isFinite(v)) return '–';
+    if (State.dispUnit === 'counts' || State.dispUnit === 'counts_corrected') return v.toFixed(0);
+    if (State.dispUnit === 'counts/s') return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2);
+    const a = Math.abs(v);
+    return a >= 100 ? v.toFixed(1) : (a === 0 ? '0' : v.toPrecision(4));
+  }
+  const fmtUnit = (v) => `${fmt(v)}<span class="unit"> ${esc(unitText())}</span>`;
+
+  function yTitle() {
+    let t;
+    if (State.dispUnit === 'counts' || State.dispUnit === 'counts_corrected') t = 'Intensity (ADC)';
+    else if (State.dispUnit === 'counts/s') t = 'Count rate (counts/s)';
+    else if (State.dispUnit === 'relative') t = 'Relative intensity';
+    else t = `Spectral irradiance (${State.dispUnitLabel || State.dispUnit})`;
+    const ml = modeLabel(State.displayModeEff);
+    return ml ? `${t} · ${ml}` : t;
+  }
+
+  function rawVisible() {
+    if (State.displayModeEff === 'raw') return false;
+    return rawUser == null ? true : rawUser;
+  }
+
+  function syncSelect() {
+    const sel = $('#scope-display-mode');
+    if (!sel) return;
+    const want = State.cfg.display_mode || 'auto';
+    if ([...sel.options].some((o) => o.value === want)) sel.value = want;
+    sel.title = 'Display mode' + (want === 'auto' && State.displayModeEff
+      ? ` (auto: ${modeLabel(State.displayModeEff)})` : '');
+    const b = $('#btn-raw-curve');
+    if (b) {
+      b.classList.toggle('on', rawVisible());
+      b.disabled = State.displayModeEff === 'raw';
+    }
+    const u = $('#y-unit-lbl');
+    if (u) u.textContent = unitText();
+    const hu = $('#hm-ymax-unit');
+    if (hu) hu.textContent = unitText();
+  }
+
+  function buildSelect(modes) {
+    const sel = $('#scope-display-mode');
+    if (!sel || !Array.isArray(modes)) return;
+    const list = modes.slice().sort((a, b) => (b.value === 'auto') - (a.value === 'auto'));
+    const key = JSON.stringify(list);
+    if (key === modesKey) return;
+    modesKey = key;
+    State.displayModes = list;
+    sel.innerHTML = '';
+    for (const m of list) {
+      const o = new Option(m.label || m.value, m.value);
+      o.disabled = m.available === false && m.value !== 'auto';
+      if (o.disabled) o.title = 'Not available for the current calibration / device';
+      sel.appendChild(o);
+    }
+    syncSelect();
+  }
+
+  function syncYControls() {
+    const el = $('#cfg-y_max_adc');
+    if (el && State.cfg.y_max_adc != null && document.activeElement !== el) el.value = State.cfg.y_max_adc;
+    const tog = document.querySelector('.toggle[data-key="auto_y"]');
+    if (tog) tog.classList.toggle('on', State.cfg.auto_y !== false);
+  }
+
+  // Manual limits are stored per mode; a mode without them autoscales.
+  function onModeChange(eff) {
+    const first = State.displayModeEff == null;
+    State.displayModeEff = eff;
+    const lim = (State.cfg.y_limits_by_mode || {})[eff];
+    const manual = lim && lim.auto === false && isFinite(Number(lim.max)) && Number(lim.max) > 0;
+    if (manual || !first) {
+      State._applyingMode = true;
+      try { pushCfg(manual ? { auto_y: false, y_max_adc: Number(lim.max) } : { auto_y: true }); }
+      finally { State._applyingMode = false; }
+      syncYControls();
+    }
+    HmLimits.onModeChange();
+    syncSelect();
+  }
+
+  function updateRawSeries() {
+    const n = (State.scopeData[SI.LIVE] || []).length;
+    const on = rawVisible() && Array.isArray(State.rawData) && State.rawData.length === n && n > 0;
+    State.scopeData[SI.RAW] = on ? State.rawData : new Array(n).fill(null);
+    const u = State.scopePlot;
+    if (u && u.axes[2] && u.axes[2].show !== on) {
+      u.axes[2].show = on;
+      u.redraw(true, true);
+    }
+  }
+
+  function updateExposure() {
+    const bar = $('#exposure-bar'), txt = $('#exposure-text'), fill = $('#exposure-fill');
+    if (!bar) return;
+    const ex = State.exposure;
+    if (State.displayModeEff === 'raw' || !ex || ex.peak_pct_fs == null || !isFinite(ex.peak_pct_fs)) {
+      bar.className = 'exposure-bar off';
+      txt.textContent = State.displayModeEff === 'raw' ? 'Raw ADC' : '—';
+      fill.style.width = '0%';
+      return;
+    }
+    const pct = Number(ex.peak_pct_fs);
+    const sat = !!ex.saturated || pct >= 100;
+    bar.className = 'exposure-bar ' + (sat ? 'danger' : (pct >= 90 ? 'warn' : ''));
+    let t = `Peak ${pct.toFixed(0)} % FS`;
+    if (ex.n_saturated > 0) t += ` · ${ex.n_saturated} px saturated`;
+    else if (sat) t += ' · saturated';
+    txt.textContent = t;
+    fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+
+  function onFrame(msg) {
+    State.dispUnit = msg.display_unit != null ? msg.display_unit : (msg.unit || 'counts');
+    State.dispUnitLabel = msg.display_unit_label || msg.unit_label || State.dispUnit;
+    State.exposure = msg.exposure || null;
+    State.rawData = Array.isArray(msg.raw) ? msg.raw : null;
+    buildSelect(msg.display_modes);
+    const eff = msg.display_mode || null;
+    if (eff !== State.displayModeEff) onModeChange(eff);
+    updateRawSeries();
+    updateExposure();
+    const t = yTitle();
+    if (t !== lastTitle) {
+      lastTitle = t;
+      syncSelect();
+      updateYAxisLabel();
+    }
+  }
+
+  async function select(v) {
+    const { r, j } = await apiPut('/api/v1/acquisition', { display_mode: v });
+    if (!r.ok) { toast(errText(j, r), 3500); syncSelect(); return; }
+    State.cfg.display_mode = v;
+    syncSelect();
+  }
+
+  function toggleRaw() {
+    rawUser = !rawVisible();
+    try { localStorage.setItem('scope_raw_curve', rawUser ? '1' : '0'); } catch (e) { /* ignore */ }
+    syncSelect();
+    updateRawSeries();
+    if (State.scopePlot && State.activeTab === 'scope') State.scopePlot.setData(State.scopeData);
+  }
+
+  function init() {
+    $('#scope-display-mode')?.addEventListener('change', (e) => select(e.target.value));
+    $('#btn-raw-curve')?.addEventListener('click', toggleRaw);
+  }
+
+  return { init, onFrame, fmt, fmtUnit, unitText, yTitle, syncSelect, isCountUnit };
+})();
+
+// Heatmap upper limit (auto per frame, or manual), stored per display mode.
+const HmLimits = (() => {
+  const lim = () => (State.cfg.heatmap_limits_by_mode || {})[State.displayModeEff] || null;
+  const manualMax = () => { const l = lim(); return (l && l.auto === false && Number(l.max) > 0) ? Number(l.max) : null; };
+
+  // Upper colour limit for one row of display values.
+  function yMax(ys) {
+    const m = manualMax();
+    if (m != null) return m;
+    let mx = 0;
+    for (const v of ys) if (v != null && isFinite(v) && v > mx) mx = v;
+    if (mx <= 0) return 1;
+    return DisplayMode.isCountUnit(State.dispUnit) ? Math.max(50, mx * 1.1) : mx * 1.1;
+  }
+  function norm(ys) {
+    const top = yMax(ys), n = ys.length, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = ys[i];
+      out[i] = (v == null || !isFinite(v)) ? 0 : Math.max(0, Math.min(1, v / top));
+    }
+    return out;
+  }
+  function renorm() {
+    if (!State.hm) return;
+    for (const r of State.hm.rows) r.norm = norm(r.raw);
+    if (State.activeTab === 'heatmap') redrawHeatmap();
+  }
+  function syncUi() {
+    const a = $('#hm-ymax-auto'), n = $('#hm-ymax');
+    if (!a || !n) return;
+    const m = manualMax();
+    a.checked = m == null;
+    n.disabled = m == null;
+    if (m != null && document.activeElement !== n) n.value = m;
+    if (m == null && document.activeElement !== n) n.value = '';
+  }
+  function store(auto, max) {
+    const by = Object.assign({}, State.cfg.heatmap_limits_by_mode || {});
+    if (State.displayModeEff) by[State.displayModeEff] = { auto, max };
+    pushCfg({ heatmap_limits_by_mode: by });
+    renorm();
+    syncUi();
+  }
+  function onModeChange() {
+    // Buffered rows hold values of the previous mode: restart the local view.
+    if (State.hm) { State.hm.rows.length = 0; State.hm.pin = null; State.hm.lastPush = 0; }
+    try { Hm.onRows(); } catch (e) { /* not ready */ }
+    syncUi();
+    if (State.hm && State.activeTab === 'heatmap') redrawHeatmap();
+  }
+  function init() {
+    $('#hm-ymax-auto')?.addEventListener('change', (e) => {
+      if (e.target.checked) { store(true, null); return; }
+      const top = State.hm && State.hm.rows.length ? yMax(State.hm.rows[0].raw) : 1;
+      const n = $('#hm-ymax');
+      n.value = Number(top.toPrecision(3));
+      store(false, Number(n.value));
+    });
+    $('#hm-ymax')?.addEventListener('change', (e) => {
+      const v = parseFloat(e.target.value);
+      if (v > 0) store(false, v); else syncUi();
+    });
+  }
+  return { init, yMax, norm, renorm, syncUi, onModeChange };
 })();
 
 // ── Data section: export folder / file-name template (P-07) ──
@@ -4283,10 +4564,14 @@ const Filter = (() => {
         return;
       }
       const wl = latest.wl?.[idx], it = latest.ys?.[idx];
-      if (wl == null || it == null) return;
+      if (wl == null) return;
       $('#ro-pixel').textContent = idx;
       $('#ro-wave').innerHTML = `${wl.toFixed(1)}<span class="unit"> nm</span>`;
-      $('#ro-int').innerHTML  = `${it.toFixed(0)}<span class="unit"> ADC</span>`;
+      // The filter tab works on the corrected data (frame.intensities).
+      const u2 = State.unit === 'counts' ? 'ADC' : (State.unitLabel || State.unit);
+      const txt = (it == null || !isFinite(it)) ? '–'
+        : (State.unit === 'counts' ? it.toFixed(0) : Number(it).toPrecision(4));
+      $('#ro-int').innerHTML  = `${txt}<span class="unit"> ${esc(u2)}</span>`;
     }}};
   }
 

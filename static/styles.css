@@ -762,3 +762,20 @@ body.light .cr-result.bad { background: #fbe6e2; border-color: #e5b4ac; }
 #lin-factory-note { margin-bottom: 8px; }
 #lin-state { margin-top: 0; margin-bottom: 8px; }
 #lin-run[hidden], #lin-form[hidden] { display: none; }
+
+/* ── Display modes: exposure bar, raw curve, heatmap limit ── */
+.exposure-bar {
+  display: flex; align-items: center; gap: 10px; min-height: 20px; padding: 2px 12px;
+  background: var(--bg-0); border-bottom: 1px solid var(--border-1);
+  font: 500 11px var(--font-mono); color: var(--fg-3);
+}
+.exposure-text { flex: none; min-width: 150px; white-space: nowrap; }
+.exposure-track { flex: 1 1 auto; min-width: 40px; height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
+.exposure-fill { display: block; height: 100%; width: 0; background: var(--ok); }
+.exposure-bar.warn .exposure-text { color: var(--warn); }
+.exposure-bar.warn .exposure-fill { background: var(--warn); }
+.exposure-bar.danger .exposure-text { color: var(--danger); }
+.exposure-bar.danger .exposure-fill { background: var(--danger); }
+.exposure-bar.off .exposure-fill { width: 0 !important; }
+#scope-display-mode { max-width: 170px; }
+#hm-ymax { width: 84px; min-width: 0; }

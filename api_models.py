@@ -138,6 +138,10 @@ class AcquisitionSettings(_M):
     spatial_smoothing: Optional[bool] = None
     spatial_smoothing_width: Optional[int] = Field(None, ge=3, le=51)
     display_unit: Optional[Literal["counts", "counts_per_s"]] = None
+    display_mode: Optional[Literal["auto", "raw", "corrected", "normalised", "count_rate",
+                                   "absolute"]] = Field(
+        None, description="Display mode of scope/heatmap (only what is plotted; "
+                          "evaluations and exports always use the corrected data)")
     irradiance_unit: Optional[Literal["uW/cm2/nm", "W/m2/nm", "mW/m2/nm"]] = None
     fusion_enabled: Optional[bool] = None
     fusion_smoothing: Optional[float] = Field(None, ge=0, le=0.99)
