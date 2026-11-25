@@ -1418,6 +1418,117 @@ class Engine:
             "Linearity correction": callin.onoff_na(self.linearity_info),
         }
 
+    # ── export (shared desktop + web; see module-level spectrum_csv) ──────
+    def _dark_applied_text(self, src: str | None) -> str:
+        return {None: "none (no dark subtracted)",
+                "stored": "stored per-pixel dark (same t_int)",
+                "stored_model": "stored per-pixel dark (b + r·t model)",
+                "optical_black": "optical-black / baseline scalar",
+                "parametric": "parametric scalar (bias + rate·t)"}.get(src, str(src))
+
+    def _smoothing_text(self) -> str:
+        c = self.cfg
+        parts = []
+        if c.get("fusion_enabled", False):
+            parts.append(f"temporal (strength {float(c.get('fusion_smoothing', 0.85)):.2f})")
+        if c.get("hot_pixel_filter", False):
+            parts.append(f"median despeckle {int(c.get('smoothing_width', 5))} px")
+        if c.get("spatial_smoothing", False):
+            parts.append(f"spatial boxcar {int(c.get('spatial_smoothing_width', 5))} px")
+        return ", ".join(parts) if parts else "off"
+
+    def export_meta_rows(self, ev: "FrameEvent | None" = None) -> list:
+        """Header rows of an export: the settings ACTUALLY applied to the data
+        of frame `ev` (default: the latest frame)."""
+        ev = ev if ev is not None else self.last_frame
+        b = self.acquisition
+        st = dict(self.calib.status or {})
+        prof = self.calib.profile
+        unit = (ev.unit if ev is not None else self.current_unit) or "counts"
+        t_us = ev.integration_us if ev is not None else self.latest_integration_us
+        dsrc = ev.dark_source if ev is not None else self.current_dark_source
+        lin = self.linearity_info or {}
+        rows = [
+            ("Spectrometer", self.connected_backend_name or (type(b).__name__ if b else "")),
+            ("Serial", getattr(b, "serial", None) or ""),
+            ("Date/time", _iso_from_epoch(ev.timestamp if ev is not None else None)),
+            ("Exported", now_iso()),
+            ("Integration time (ms)", f"{t_us / 1000.0:.3f}"),
+            ("Frames averaged", int(self.frames_avg)),
+            ("Smoothing", self._smoothing_text()),
+            ("Dark correction", _onoff(dsrc is not None)),
+            ("Dark mode (applied)", self._dark_applied_text(dsrc)),
+            ("Optical Black mean (ADC)", f"{(ev.ob_mean if ev is not None else self.latest_ob_mean):.3f}"),
+            ("NL correction (device)", {True: "on", False: "off"}.get(
+                calprof.device_nl_active(b), "n/a")),
+            ("Linearity correction", callin.onoff_na(lin)
+             + (f" ({lin.get('id')}, {str(lin.get('created') or '')[:10]})"
+                if lin.get("state") == callin.STATE_ACTIVE else "")),
+        ]
+        if prof is not None and self.calib.active_v2:
+            rows += [("Calibration profile", st.get("label", "")),
+                     ("Profile id", prof.get("id")),
+                     ("Profile name", (prof.get("optics") or {}).get("name", "")),
+                     ("Profile version", prof.get("version")),
+                     ("Profile type", prof.get("type")),
+                     ("Profile state", st.get("state"))]
+            if st.get("linearity_note"):
+                rows.append(("Profile note", st["linearity_note"]))
+        else:
+            rows.append(("Calibration profile", st.get("label") if self.calib.legacy_gain
+                         is not None else "None"))
+        if self.calib.legacy_gain is not None:
+            # legacy gain path only: the old switch is reported when it is in effect
+            rows.append(("Response compensation", "on (legacy gain table)"))
+        mode = getattr(ev, "display_mode", None) if ev is not None else None
+        dunit = getattr(ev, "display_unit", None) if ev is not None else None
+        if mode:
+            rows.append(("Display mode", processing.DISPLAY_LABELS.get(mode, mode)
+                         if hasattr(processing, "DISPLAY_LABELS") else mode))
+        if dunit:
+            rows.append(("Display unit", processing.unit_label(dunit)))
+        rows.append(("Unit", unit))
+        if self.calib.active_v2:
+            vr = st.get("valid_range_nm")
+            if vr:
+                rows.append(("Valid range (nm)", f"{float(vr[0]):.1f}–{float(vr[1]):.1f}"))
+            segs = st.get("valid_segments_nm")
+            rows.append(("Valid segments (nm)", _segments_text(segs) or
+                         (f"{float(vr[0]):.1f}–{float(vr[1]):.1f}" if vr else "")))
+            rows.append(("Masked pixels", MASKED_NOTE))
+            if st.get("implausible"):
+                rows.append(("Plausibility", "FAILED (saved on request)"))
+        return rows
+
+    def export_snapshot(self, ev: "FrameEvent | None" = None) -> dict:
+        """Data + header of one frame for export (desktop + web identical)."""
+        ev = ev if ev is not None else self.last_frame
+        with self._frame_lock:
+            if ev is not None:
+                d = {"wavelengths": np.array(ev.wavelengths, float),
+                     "values": np.array(ev.pixels, float), "unit": ev.unit,
+                     "raw": np.array(ev.raw_averaged, float),
+                     "display": (None if getattr(ev, "display", None) is None
+                                 else np.array(ev.display, float)),
+                     "display_unit": getattr(ev, "display_unit", None),
+                     "display_mode": getattr(ev, "display_mode", None)}
+            else:
+                d = {"wavelengths": np.array(self.wavelength_array, float),
+                     "values": np.array(self.current_pixels, float),
+                     "unit": self.current_unit, "raw": np.array(self.current_raw, float),
+                     "display": None, "display_unit": None, "display_mode": None}
+        d["meta"] = self.export_meta_rows(ev)
+        return d
+
+    def export_spectrum_csv(self, ev: "FrameEvent | None" = None) -> str:
+        return spectrum_csv(self.export_snapshot(ev))
+
+    def export_heatmap_csv(self, indices=None) -> str:
+        meta = [r for r in self.export_meta_rows() if r[0] in (
+            "Spectrometer", "Serial", "Exported", "Integration time (ms)",
+            "Calibration profile", "Linearity correction", "Display mode", "Display unit")]
+        return heatmap_csv_text(self.heatmap_snapshot(), indices, meta)
+
     # ══════════════════════════════════════════════════════════════════════
     #  Measurements (jobs, via frame taps — not the display pipeline)
     # ══════════════════════════════════════════════════════════════════════
@@ -2121,19 +2232,30 @@ def measurement_to_json(rec: dict, *, include_arrays: bool = True) -> dict:
 def measurement_to_csv(rec: dict) -> str:
     buf = io.StringIO()
     acq, dev, cal = rec["acquisition"], rec["device"], rec["calibration"]
+    lin = dev.get("linearity") or {}
+    nl = dev.get("nl_correction")
     meta = [("Measurement id", rec["id"]), ("Timestamp", rec["timestamp"]),
             ("Label", rec.get("label", "")),
             ("Spectrometer", dev.get("backend")), ("Serial", dev.get("serial")),
             ("Integration time (ms)", f"{acq['integration_ms']:.3f}"),
             ("Frames averaged", acq["frames"]), ("Dark", f"{acq['dark']} ({acq['dark_source']})"),
+            ("NL correction (device)", {True: "on", False: "off"}.get(nl, "n/a")),
+            ("Linearity correction", callin.onoff_na(lin) + (
+                f" ({lin.get('id')})" if lin.get("active") else "")),
             ("Peak (fraction of full scale)", f"{acq['peak_frac']:.4f}"),
             ("Saturated pixels", acq["n_saturated"]),
-            ("Calibration profile", cal.get("label")), ("Unit", rec["unit"])]
+            ("Calibration profile", cal.get("label")),
+            ("Profile id", cal.get("profile_id") or ""), ("Profile type", cal.get("type") or ""),
+            ("Unit", rec["unit"])]
     vr = rec.get("valid_range_nm")
     if vr:
         meta.append(("Valid range (nm)", f"{float(vr[0]):.1f}-{float(vr[1]):.1f}"))
+        segs = cal.get("valid_segments_nm")
+        if segs:
+            meta.append(("Valid segments (nm)", _segments_text(segs)))
+        meta.append(("Masked pixels", MASKED_NOTE))
     for k, v in meta:
-        buf.write(f"# {k};{'' if v is None else v}\n")
+        buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
     unit = rec["unit"]
     col = "ADC_Counts" if unit == "counts" else f"Value_{unit}"
     buf.write(f"Pixel_ID;Wavelength_nm;{col}\n")
@@ -2144,4 +2266,106 @@ def measurement_to_csv(rec: dict) -> str:
             buf.write(f"{i};{w:.3f};{v:.2f}\n")
         else:
             buf.write(f"{i};{w:.3f};{v:.6g}\n")
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Spectrum / heatmap / measurement export (ONE implementation, desktop + web)
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  CSV: ';' separated, UTF-8 with BOM (Excel recognises the encoding; µ, ², –
+#  survive), header lines '# key;value' documenting the settings ACTUALLY
+#  applied to the exported data. Masked pixels (outside the valid segments of
+#  a profile) are written as empty cells.
+
+CSV_ENCODING = "utf-8-sig"
+CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
+MASKED_NOTE = ("empty cell = masked pixel (outside the valid segments of the "
+               "calibration profile)")
+
+
+def csv_bytes(text: str) -> bytes:
+    """CSV text → bytes with UTF-8 BOM (HTTP responses)."""
+    return text.encode(CSV_ENCODING)
+
+
+def write_csv_text(path: str, text: str) -> str:
+    """Write CSV text with UTF-8 BOM (desktop saves)."""
+    with open(path, "w", encoding=CSV_ENCODING, newline="") as f:
+        f.write(text)
+    return path
+
+
+def _segments_text(segs) -> str:
+    if not segs:
+        return ""
+    return ", ".join(f"{float(a):.1f}–{float(b):.1f}" for a, b in segs)
+
+
+def _onoff(v) -> str:
+    return "on" if v else "off"
+
+
+def _iso_from_epoch(ts: float | None) -> str:
+    if ts is None:
+        return now_iso()
+    return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+
+
+def _value_column(unit: str) -> str:
+    return "ADC_Counts" if unit == "counts" else f"Value_{unit}"
+
+
+def _fmt_value(v: float, unit: str) -> str:
+    if not np.isfinite(v):
+        return ""
+    if unit in ("counts", processing_unit_counts_corrected()):
+        return f"{v:.2f}"
+    return f"{v:.6g}"
+
+
+def processing_unit_counts_corrected() -> str:
+    return getattr(processing, "UNIT_COUNTS_CORRECTED", "counts_corrected")
+
+
+def spectrum_csv(snapshot: dict) -> str:
+    """CSV text of an export snapshot (Engine.export_snapshot)."""
+    buf = io.StringIO()
+    for k, v in snapshot["meta"]:
+        v = "" if v is None else str(v)
+        buf.write(f"# {k};{v.replace(';', ',')}\n")
+    wl = np.asarray(snapshot["wavelengths"], float)
+    vals = np.asarray(snapshot["values"], float)
+    unit = snapshot["unit"] or "counts"
+    cols = [("Pixel_ID", None), ("Wavelength_nm", None), (_value_column(unit), (vals, unit))]
+    disp = snapshot.get("display")
+    dunit = snapshot.get("display_unit")
+    if disp is not None and dunit and (dunit != unit or not np.array_equal(
+            np.asarray(disp, float), vals, equal_nan=True)):
+        cols.append((f"Display_{dunit}", (np.asarray(disp, float), dunit)))
+    raw = snapshot.get("raw")
+    if raw is not None and snapshot.get("include_raw", True):
+        cols.append(("Raw_ADC", (np.asarray(raw, float), "counts")))
+    buf.write(";".join(c for c, _ in cols) + "\n")
+    for i, w in enumerate(wl):
+        row = [str(i), f"{w:.3f}"]
+        for _c, spec in cols[2:]:
+            arr, u = spec
+            row.append(_fmt_value(float(arr[i]), u) if i < arr.size else "")
+        buf.write(";".join(row) + "\n")
+    return buf.getvalue()
+
+
+def heatmap_csv_text(h: dict, indices=None, meta: list | None = None) -> str:
+    """CSV of the time-lapse buffer (heatmap_snapshot()); indices = frame
+    columns (0 = newest), default all filled."""
+    buf = io.StringIO()
+    for k, v in meta or []:
+        buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
+    idx = list(range(int(h["filled"]))) if indices is None else list(indices)
+    buf.write(";".join(["Time_Frame"] + [f"{w:.2f}" for w in h["wavelengths"]]) + "\n")
+    for fi in idx:
+        col = h["buffer"][:, fi]
+        buf.write(";".join([str(fi)] + [("" if not np.isfinite(v) else f"{v:.6g}")
+                                        for v in col]) + "\n")
     return buf.getvalue()

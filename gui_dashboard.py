@@ -84,6 +84,7 @@ from spectrometer_core import (
 import device_manager as dm
 import processing
 from engine import Engine, LOCAL, ControlBusy, EngineError, NeedsConfirmation
+import engine as eng
 import export_paths
 
 
@@ -2961,7 +2962,7 @@ class DashboardWindow(QMainWindow):
         meta = self.export_meta()
         filename, path_err = export_paths.export_path(f"frame{index}", "csv", meta)
         try:
-            with open(filename, "w", newline="") as f:
+            with open(filename, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f, delimiter=";")
                 age = self.heatmap_times[index]
                 age_s = (f"{time.monotonic() - age:.1f}" if np.isfinite(age) else "unknown")
@@ -3088,48 +3089,13 @@ class DashboardWindow(QMainWindow):
             else:
                 frame_indices = list(range(filled))
         try:
-            with open(filename, "w", newline="") as f:
-                w = csv.writer(f, delimiter=";")
-                if is_heatmap:
-                    w.writerow(["Time_Frame"] +
-                               [f"{wl:.2f}" for wl in self.heatmap_linear_waves])
-                    for fi in frame_indices:
-                        w.writerow([fi] +
-                                   [round(v, 2) for v in self.heatmap_buffer[:, fi]])
-                else:
-                    w.writerow(["# Optical Black mean (ADC)", round(self.latest_ob_mean, 3)])
-                    w.writerow(["# Integration time (ms)",
-                                round(self.latest_integration_us / 1000.0, 1)])
-                    w.writerow(["# Dark correction",
-                                "ON" if self.is_dark_correction_enabled else "OFF"])
-                    w.writerow(["# Dark mode", self.dark_correction_mode])
-                    w.writerow(["# Response compensation",
-                                "ON" if self.calib_runtime.legacy_gain is not None else "OFF"])
-                    unit = getattr(self, "_current_unit", "counts")
-                    if unit == "counts":
-                        w.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
-                        for i, (wl, v) in enumerate(
-                                zip(self.active_wavelengths, self.current_averaged_pixels)):
-                            w.writerow([i, round(wl, 2), round(v, 2)])
-                    else:
-                        st = self.calib_runtime.status
-                        w.writerow(["# Unit", unit])
-                        if self.calib_runtime.active_v2:
-                            w.writerow(["# Calibration profile", st.get("label", "")])
-                            vr = st.get("valid_range_nm")
-                            if vr:
-                                w.writerow(["# Valid range (nm)", f"{vr[0]:.1f}–{vr[1]:.1f}"])
-                            segs = st.get("valid_segments_nm")
-                            if segs:
-                                w.writerow(["# Valid segments (nm)", ", ".join(
-                                    f"{a:.1f}–{b:.1f}" for a, b in segs)])
-                            if st.get("implausible"):
-                                w.writerow(["# Plausibility", "FAILED (saved on request)"])
-                        w.writerow(["Pixel_ID", "Wavelength_nm", f"Value_{unit}"])
-                        for i, (wl, v) in enumerate(
-                                zip(self.active_wavelengths, self.current_averaged_pixels)):
-                            w.writerow([i, round(wl, 2),
-                                        "" if not np.isfinite(v) else f"{v:.6g}"])
+            # ONE export implementation for desktop and web (engine.py):
+            # UTF-8 with BOM, header with the settings actually applied.
+            if is_heatmap:
+                text = self.engine.export_heatmap_csv(frame_indices)
+            else:
+                text = self.engine.export_spectrum_csv(getattr(self, "_export_ev", None))
+            eng.write_csv_text(filename, text)
             self._note_export_saved(filename, path_err)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Save CSV failed: {e}")
@@ -3209,6 +3175,7 @@ class DashboardWindow(QMainWindow):
                 self._restyle_live_pill(True, fps)
 
         self.current_averaged_pixels = ev.pixels
+        self._export_ev = ev                     # frame shown = frame exported
         self.latest_ob_mean = ev.ob_mean
         self.latest_integration_us = ev.integration_us
         self.update_ob_readout()

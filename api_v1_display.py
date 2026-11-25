@@ -110,12 +110,10 @@ def register(router: APIRouter, ctx) -> None:
             idx = list(range(min(start, hi), hi))
         else:
             idx = list(range(n))
-        buf = io.StringIO()
-        buf.write(";".join(["Time_Frame"] + [f"{w:.2f}" for w in h["wavelengths"]]) + "\n")
-        for fi in idx:
-            buf.write(";".join([str(fi)] + [f"{v:.2f}" for v in h["buffer"][:, fi]]) + "\n")
+        from engine import CSV_MEDIA_TYPE, csv_bytes
+        body = engine.export_heatmap_csv(idx)
         name = filename("heatmap", "csv")
-        return Response(buf.getvalue(), media_type="text/csv", headers={
+        return Response(csv_bytes(body), media_type=CSV_MEDIA_TYPE, headers={
             "Content-Disposition": f'attachment; filename="{name}"'})
 
     def filename(kind: str, ext: str) -> str:

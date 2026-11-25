@@ -708,7 +708,8 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
             body, name = heatmap_csv(engine), f"heatmap_{ts}.csv"
         else:
             body, name = spectrum_csv(engine), f"spectrum_{ts}.csv"
-        return Response(content=body, media_type="text/csv",
+        from engine import CSV_MEDIA_TYPE, csv_bytes
+        return Response(content=csv_bytes(body), media_type=CSV_MEDIA_TYPE,
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     # ── WebSocket ─────────────────────────────────────────────────────────
@@ -878,43 +879,10 @@ def reference_list() -> list[dict]:
 
 
 def heatmap_csv(engine: Engine) -> str:
-    h = engine.heatmap_snapshot()
-    buf = io.StringIO()
-    buf.write(";".join(["Frame"] + [f"{wl:.2f}" for wl in h["wavelengths"]]) + "\n")
-    for fi in range(h["buffer"].shape[1]):
-        buf.write(";".join([str(fi)] + [f"{v:.2f}" for v in h["buffer"][:, fi]]) + "\n")
-    return buf.getvalue()
+    """Legacy /api/export/csv?tab=heatmap (shared engine export)."""
+    return engine.export_heatmap_csv()
 
 
 def spectrum_csv(engine: Engine) -> str:
-    cfg = engine.cfg
-    buf = io.StringIO()
-    buf.write(f"# Optical Black mean (ADC);{engine.latest_ob_mean:.3f}\n")
-    buf.write(f"# Integration time (ms);{engine.latest_integration_us / 1000.0:.1f}\n")
-    buf.write(f"# Dark correction;{('ON' if cfg.get('dark_correction') else 'OFF')}\n")
-    buf.write(f"# Dark mode;{cfg.get('dark_mode')}\n")
-    buf.write(f"# Response compensation;{('ON' if cfg.get('spectral_response_compensation') else 'OFF')}\n")
-    unit = engine.current_unit or "counts"
-    if engine.calib.active_v2:
-        st = engine.calib.status
-        buf.write(f"# Unit;{unit}\n")
-        buf.write(f"# Calibration profile;{st.get('label', '')}\n")
-        vr = st.get("valid_range_nm")
-        if vr:
-            buf.write(f"# Valid range (nm);{float(vr[0]):.1f}–{float(vr[1]):.1f}\n")
-        segs = st.get("valid_segments_nm")
-        if segs:
-            buf.write("# Valid segments (nm);" + ", ".join(
-                f"{float(a):.1f}–{float(b):.1f}" for a, b in segs) + "\n")
-        if st.get("implausible"):
-            buf.write("# Plausibility;FAILED (saved on request)\n")
-    col = "ADC_Counts" if unit == "counts" else f"Value_{unit}"
-    buf.write(f"Pixel_ID;Wavelength_nm;{col}\n")
-    for i, (wl, v) in enumerate(zip(engine.wavelength_array, engine.current_pixels)):
-        if not np.isfinite(v):
-            buf.write(f"{i};{wl:.2f};\n")
-        elif unit == "counts":
-            buf.write(f"{i};{wl:.2f};{v:.2f}\n")
-        else:
-            buf.write(f"{i};{wl:.2f};{v:.6g}\n")
-    return buf.getvalue()
+    """Legacy /api/export/csv (shared engine export, identical to the desktop)."""
+    return engine.export_spectrum_csv()
