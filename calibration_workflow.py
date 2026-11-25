@@ -216,6 +216,7 @@ class CalibrationWorkflow:
         self.pixel_checks: dict = {}
         self.causes: dict = {}
         self.dark_drift: list[dict] = []
+        self._checks_final = False
         self.verification: dict | None = None
         self.wl_check: dict | None = None
         self.result: dict | None = None
@@ -464,6 +465,7 @@ class CalibrationWorkflow:
             self.checks["itime_fail_pixels"] = pc["n_fail"]
             self.checks["itime_cause"] = cz["message"]
         self.pixel_ok = ok
+        self._checks_final = bool(final)
         if final:
             self._check_warnings()
         return {"stability": self.checks.get("stability_detail"),
@@ -510,8 +512,8 @@ class CalibrationWorkflow:
         Pixels that failed the per-pixel checks are masked."""
         if self.rate is None:
             raise RuntimeError("capture the calibration spectrum first")
-        if not self.pixel_checks:
-            self.evaluate_checks()
+        if not self.pixel_checks or not self._checks_final:
+            self.evaluate_checks(final=True)
         r = self.rate
         rate = r.rate if self.rate2 is None else 0.5 * (r.rate + self.rate2.rate)
         sat = r.saturated | (self.rate2.saturated if self.rate2 is not None else False)

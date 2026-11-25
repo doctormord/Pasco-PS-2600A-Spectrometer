@@ -26,6 +26,8 @@ import csv
 import time
 import threading
 
+import numpy as np
+
 
 class HeatmapAutosaveWriter:
     def __init__(self, path: str, wavelengths, chunk_frames: int = 20,
@@ -54,7 +56,8 @@ class HeatmapAutosaveWriter:
                 return
             elapsed = time.monotonic() - self._t0
             self._buf.append([timestamp_iso, f"{elapsed:.3f}"] +
-                             [round(float(v), 2) for v in spectrum])
+                             [("" if not np.isfinite(v) else float(f"{float(v):.6g}"))
+                              for v in spectrum])
             if len(self._buf) >= self._chunk_frames:
                 self._flush_locked()
             elif (time.monotonic() - self._last_fsync) >= self._fsync_interval_s:

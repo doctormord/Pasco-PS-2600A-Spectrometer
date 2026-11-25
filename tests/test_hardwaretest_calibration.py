@@ -417,3 +417,39 @@ def test_engine_linearity_job_installs_correction(isolated_config):
         assert info["state"] == cl.STATE_OFF and e.acquisition.linearizer is None
     finally:
         e.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Review fixes
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_linearizer_keeps_saturated_pixels_raw():
+    m = cl.fit_linearity(_synthetic_steps(-0.03, np.random.default_rng(8)), full_scale=FS)
+    fn = cl.make_linearizer(m, saturation_level=60000.0)
+    out = fn(np.array([500.0, 30000.0, 60000.0, 65535.0]), 500.0, 1.0)
+    assert out[2] == 60000.0 and out[3] == 65535.0          # still flagged saturated
+    assert out[1] != 30000.0
+
+
+def test_fast_preview_scale_matches_driver_rule(demo):
+    b = demo()
+    b.set_integration_time_us(100_000)
+    assert b.fast_preview_scale(100_000) == 1.0
+    b.fast_preview_enabled, b.fast_preview_short_pct = True, 10
+    assert b.fast_preview_scale(100_000) == pytest.approx(10.0)
+    seen = []
+    b.set_linearizer(lambda px, dark, r: (seen.append(r), px)[1])
+    t0 = time.time()
+    while not seen and time.time() - t0 < 5:
+        time.sleep(0.02)
+    b.set_linearizer(None)
+    b.fast_preview_enabled = False
+    assert seen and seen[-1] == pytest.approx(10.0)
+
+
+def test_linearity_note_in_status_message(isolated_config):
+    rt = cp.CalibrationRuntime()
+    p = {"device": {"backend": "X", "serial": "1"}, "wl_fingerprint": "fp",
+         "acquisition": {"linearity": {"active": True, "id": "lin-a"}}}
+    st = cp.profile_status(p, "X", "1", "fp", linearity={"state": cl.STATE_NONE})
+    assert "linearity_note" in st and rt is not None

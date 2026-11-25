@@ -3100,19 +3100,25 @@ class DashboardWindow(QMainWindow):
         ent = self._limits_for(mode)
         hm = (Config.get("heatmap_limits_by_mode", {}) or {}).get(mode)
         floor = self._y_floor(unit)
+        def _num(v, default):
+            try:
+                return default if v is None else float(v)
+            except (TypeError, ValueError):
+                return default
+        # shared schema with the web client: {auto, min|None, max|None}
         manual = (isinstance(ent, dict) and not ent.get("auto", True)
-                  and float(ent.get("max", 0.0)) > floor)
+                  and _num(ent.get("max"), 0.0) > floor)
         self.button_auto_y_axis.blockSignals(True)
         self.button_auto_y_axis.setChecked(not manual)
         self.button_auto_y_axis.blockSignals(False)
         self.is_auto_y_axis_enabled = not manual
         if manual:
-            mx = float(ent["max"])
+            mx = _num(ent.get("max"), 0.0)
             self.spinbox_y_max.blockSignals(True)
             self.spinbox_y_max.setValue(mx)
             self.spinbox_y_max.blockSignals(False)
-            self.plot_canvas.setYRange(float(ent.get("min", floor)), mx, padding=0)
-            self._hm_user_max = (float(hm["max"]) if isinstance(hm, dict)
+            self.plot_canvas.setYRange(_num(ent.get("min"), floor), mx, padding=0)
+            self._hm_user_max = (_num(hm.get("max"), mx) if isinstance(hm, dict)
                                  and not hm.get("auto", True) else mx)
         else:
             self._hm_user_max = None
@@ -3263,22 +3269,11 @@ class DashboardWindow(QMainWindow):
         if self._heatmap_filled == 0 or index >= self.heatmap_buffer.shape[1]:
             return
         index = min(index, self._heatmap_filled - 1)
-        spec = self.heatmap_buffer[:, index]
         meta = self.export_meta()
         filename, path_err = export_paths.export_path(f"frame{index}", "csv", meta)
         try:
-            with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f, delimiter=";")
-                age = self.heatmap_times[index]
-                age_s = (f"{time.monotonic() - age:.1f}" if np.isfinite(age) else "unknown")
-                w.writerow([f"# Time-lapse frame {index}"])
-                w.writerow([f"# Seconds before export"] if age_s == "unknown"
-                          else [f"# Seconds before export;{age_s}"])
-                w.writerow(["Wavelength_nm",
-                            "ADC_Counts" if self._display_unit == "counts"
-                            else f"Value_{self._display_unit}"])
-                for wl, v in zip(self.heatmap_linear_waves, spec):
-                    w.writerow([f"{wl:.2f}", round(float(v), 2)])
+            # shared engine export: header, unit, masked pixels empty, UTF-8 BOM
+            eng.write_csv_text(filename, self.engine.export_heatmap_frame_csv(index))
             self._note_export_saved(filename, path_err)
         except OSError as e:
             QMessageBox.warning(self, "Export failed", str(e))

@@ -62,6 +62,13 @@ FILE_KEYS = ("calibration_profiles_file", "reference_sources_file",
 # Config keys holding directories that must not point into the program folder.
 DIR_KEYS = ("export_dir", "heatmap_autosave_dir")
 
+# Files that were tracked in the repository before this version: a `git pull`
+# deletes them from the working copy BEFORE the first start. If they are
+# missing in the program folder but the folder is a git working copy, the
+# last committed version is restored from the git history into the data
+# directory (never overwriting existing data).
+GIT_RESTORE_FILES = ("calibration_profiles.json", "spectrometer_config.json")
+
 MARKER = "migration.json"
 LOG = "migration.log"
 PROTOCOLS = "protocols"
@@ -227,6 +234,25 @@ def _sources(src_dir: str) -> list[str]:
     return names
 
 
+def _git_restore(src: str, name: str) -> tuple[bytes | None, str]:
+    """Content of `name` at the commit before it was deleted from the
+    repository at `src` (None if not a git working copy / never tracked)."""
+    if not os.path.isdir(os.path.join(src, ".git")):
+        return None, ""
+    import subprocess
+    try:
+        sha = subprocess.run(["git", "-C", src, "log", "-n", "1", "--format=%H",
+                              "--diff-filter=D", "--", name], capture_output=True,
+                             timeout=20, check=True).stdout.decode().strip()
+        if not sha:
+            return None, ""
+        data = subprocess.run(["git", "-C", src, "show", f"{sha}^:{name}"],
+                              capture_output=True, timeout=20, check=True).stdout
+        return (data or None), f"{sha[:10]}^"
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+
+
 def _fix_config(dst_cfg: str, src_dir: str, report: dict, stamp: str) -> None:
     """Point file/dir keys of the migrated config away from the program folder."""
     try:
@@ -298,6 +324,20 @@ def migrate(src_dir: str | None = None, dst_dir: str | None = None, *,
                 report["files"].append({"name": n, "action": action})
             except OSError as e:
                 report["errors"].append(f"{n}: {e}")
+        for n in GIT_RESTORE_FILES:
+            tp = os.path.join(dst, n)
+            if n in names or os.path.exists(tp):
+                continue
+            data, ref = _git_restore(src, n)
+            if data:
+                try:
+                    with open(tp, "wb") as f:
+                        f.write(data)
+                    report["files"].append({"name": n, "action":
+                                            f"restored_from_git ({ref}; file was removed "
+                                            f"from the program folder by the update)"})
+                except OSError as e:
+                    report["errors"].append(f"{n}: {e}")
         prot = []
         for pat in PROTOCOL_GLOBS:
             prot += glob.glob(os.path.join(src, pat))
@@ -318,10 +358,15 @@ def migrate(src_dir: str | None = None, dst_dir: str | None = None, *,
                 _fix_config(cfg, src, report, stamp)
             except OSError as e:
                 report["errors"].append(f"config: {e}")
-        if not names and not prot:
+        if not report["files"] and not prot:
             report["status"] = "nothing_to_migrate"
-    with open(marker, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=1)
+    if report["errors"]:
+        # no marker: the migration is retried on the next start (e.g. a file
+        # locked by a virus scanner or a sync client); nothing was overwritten
+        report["status"] = "partial"
+    else:
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=1)
     try:
         with open(os.path.join(dst, LOG), "a", encoding="utf-8") as f:
             f.write(f"[{report['time']}] {report['status']}: {src} -> {dst}\n")
@@ -343,7 +388,8 @@ def migrate(src_dir: str | None = None, dst_dir: str | None = None, *,
     return report
 
 
-def seed_from_examples(dst_dir: str | None = None, src_dir: str | None = None) -> list[str]:
+def seed_from_examples(dst_dir: str | None = None, src_dir: str | None = None,
+                       skip=()) -> list[str]:
     """Create missing runtime files from the *.example.json templates of the
     program folder (fresh installation). Returns the created names."""
     src = os.path.abspath(src_dir or program_dir())
@@ -351,6 +397,8 @@ def seed_from_examples(dst_dir: str | None = None, src_dir: str | None = None) -
     os.makedirs(dst, exist_ok=True)
     made = []
     for n in RUNTIME_FILES:
+        if n in skip:                  # a failed migration must not be masked
+            continue
         root, ext = os.path.splitext(n)
         ex = os.path.join(src, f"{root}.example{ext}")
         tp = os.path.join(dst, n)
@@ -379,8 +427,10 @@ def initialize() -> dict:
         except Exception as e:                                # noqa: BLE001
             rep["migration"] = {"status": "error", "error": str(e)}
             print(f"[data] migration failed: {e}")
+    failed = {str(e).split(":", 1)[0] for e in
+              (rep.get("migration") or {}).get("errors", [])}
     try:
-        rep["seeded"] = seed_from_examples(d)
+        rep["seeded"] = seed_from_examples(d, skip=failed)
     except OSError as e:
         rep["seeded"] = []
         print(f"[data] seeding failed: {e}")

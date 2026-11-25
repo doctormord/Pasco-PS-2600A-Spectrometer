@@ -128,12 +128,35 @@ class BaseSpectrometer(ABC):
     def linearizer(self):
         return getattr(self, "_linearizer", None)
 
+    def fast_preview_scale(self, integration_us) -> float:
+        """Scale factor t_long / t_short a driver applied to a fast-preview
+        frame it reports with ratio 1.0 (all drivers scale the short frame to
+        the long exposure themselves). The linearity correction must act at
+        the SHORT frame's true level. Mirrors the drivers' rule:
+        t_short = max(min_us, t_long · pct/100), only when fast preview is on,
+        auto exposure off and t_long > 2·min_us. 1.0 otherwise."""
+        if not getattr(self, "fast_preview_enabled", False) or \
+                getattr(self, "is_auto_exposure_active", False):
+            return 1.0
+        try:
+            t_long = int(integration_us or self.current_integration_time_us)
+            lo = int(getattr(self, "min_integration_us", 1) or 1)
+            if t_long <= 2 * lo:
+                return 1.0
+            t_short = max(lo, int(t_long * float(self.fast_preview_short_pct) / 100.0))
+            return max(1.0, t_long / float(t_short))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 1.0
+
     def _dispatch_frame(self, pixels, dark=0.0, integration_us=0,
                         kind="standard", ratio=1.0) -> None:
         lin = getattr(self, "_linearizer", None)
         if lin is not None and not getattr(self, "linearity_bypass", False):
             try:
-                pixels = lin(pixels, dark, ratio)
+                r = float(ratio or 1.0)
+                if abs(r - 1.0) < 1e-9:
+                    r = self.fast_preview_scale(integration_us)
+                pixels = lin(pixels, dark, r)
             except Exception as exc:          # never kill acquisition
                 print(f"[device] linearity correction error: {exc}")
         with self._tap_lock:

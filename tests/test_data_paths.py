@@ -149,3 +149,49 @@ def test_stores_resolve_into_data_dir(isolated_config, monkeypatch):
     assert cp._registry_path() == os.path.join(d, "calibration_profiles.json")
     assert cc._dark_path() == os.path.join(d, "dark_spectra.json")
     assert cl._path() == os.path.join(d, "linearity_profiles.json")
+
+
+def test_git_pull_removed_files_are_restored_from_history(tmp_path):
+    """Review K1: an update deletes the formerly tracked runtime files from
+    the working copy before the first start → restore them from git."""
+    import subprocess
+    src = tmp_path / "repo"
+    src.mkdir()
+
+    def git(*a):
+        subprocess.run(["git", "-C", str(src), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (src / "calibration_profiles.json").write_text('{"schema": 2, "profiles": ["mine"]}')
+    (src / "spectrometer_config.json").write_text('{"theme": "light"}')
+    git("add", ".")
+    git("commit", "-q", "-m", "data")
+    git("rm", "-q", "calibration_profiles.json", "spectrometer_config.json")
+    git("commit", "-q", "-m", "move data out")
+    dst = tmp_path / "data"
+    rep = dp.migrate(str(src), str(dst), log=None)
+    assert (dst / "calibration_profiles.json").read_text() == '{"schema": 2, "profiles": ["mine"]}'
+    assert json.loads((dst / "spectrometer_config.json").read_text())["theme"] == "light"
+    assert any(f["action"].startswith("restored_from_git") for f in rep["files"])
+
+
+def test_failed_copy_leaves_no_marker_and_no_seed(tmp_path, monkeypatch):
+    """Review W7: a copy error must not end the migration for good."""
+    src = _program(tmp_path)
+    (src / "calibration_profiles.example.json").write_text('{"schema": 2, "profiles": []}')
+    dst = tmp_path / "data"
+    real = dp.shutil.copy2
+
+    def flaky(a, b, *k, **kw):
+        if os.path.basename(str(a)) == "calibration_profiles.json":
+            raise PermissionError("locked")
+        return real(a, b, *k, **kw)
+    monkeypatch.setattr(dp.shutil, "copy2", flaky)
+    rep = dp.migrate(str(src), str(dst), log=None)
+    assert rep["status"] == "partial" and not (dst / dp.MARKER).exists()
+    assert dp.seed_from_examples(str(dst), str(src), skip={"calibration_profiles.json"}) == []
+    assert not (dst / "calibration_profiles.json").exists()
+    monkeypatch.setattr(dp.shutil, "copy2", real)
+    rep = dp.migrate(str(src), str(dst), log=None)               # retried
+    assert rep["status"] == "migrated" and (dst / "calibration_profiles.json").exists()

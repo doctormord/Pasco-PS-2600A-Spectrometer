@@ -84,6 +84,8 @@ CONTROL_KEYS = frozenset({
     "spatial_smoothing_width", "display_unit", "irradiance_unit",
     "radiometric_calibration_factor", "response_correction_active",
     "heatmap_buffer_size", "heatmap_measure_interval_ms",
+    # resets the shared time-lapse buffer → needs control like display_unit
+    "display_mode",
     *fusion.DEFAULTS.keys(),
 })
 DISPLAY_MODE_VALUES = (processing.DISPLAY_AUTO,) + processing.DISPLAY_MODES
@@ -1185,7 +1187,12 @@ class Engine:
         n = int(wl.size)
         self.heatmap_linear_waves = np.linspace(wl[0], wl[-1], n)
         self.heatmap_buffer = np.zeros((n, self.heatmap_size))
+        # False = masked pixel (outside the valid segments of the profile at
+        # push time); exported as an empty cell. The image itself shows 0.
+        self.heatmap_valid = np.ones((n, self.heatmap_size), bool)
         self.heatmap_times = np.full(self.heatmap_size, np.nan)
+        self.heatmap_unit = None
+        self.heatmap_mode = None
         self.heatmap_filled = 0
 
     def set_heatmap_size(self, n: int, *, persist: bool = True) -> int:
@@ -1347,11 +1354,22 @@ class Engine:
             interval = self._heatmap_measure_ms / 1000.0
             if interval <= 0.0 or (mono - self._heatmap_last_push) >= interval:
                 self._heatmap_last_push = mono
-                if self.heatmap_buffer.shape[0] != wl.size:
+                if self.heatmap_buffer.shape[0] != wl.size or (
+                        self.heatmap_filled and (self.heatmap_unit, self.heatmap_mode)
+                        != (dunit, mode)):
+                    # never mix units / display modes in the time-lapse (also
+                    # an automatic raw <-> corrected switch by a profile change)
                     self._reset_heatmap()
+                self.heatmap_unit, self.heatmap_mode = dunit, mode
                 col = np.interp(self.heatmap_linear_waves, wl, disp)
+                vcol = np.interp(self.heatmap_linear_waves, wl,
+                                 np.isfinite(dvals).astype(float)) > 0.5
                 self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
                 self.heatmap_buffer[:, 0] = col
+                if self.heatmap_valid.shape != self.heatmap_buffer.shape:
+                    self.heatmap_valid = np.ones(self.heatmap_buffer.shape, bool)
+                self.heatmap_valid = np.roll(self.heatmap_valid, 1, axis=1)
+                self.heatmap_valid[:, 0] = vcol
                 if self.heatmap_times.size != self.heatmap_buffer.shape[1]:
                     self.heatmap_times = np.full(self.heatmap_buffer.shape[1], np.nan)
                 self.heatmap_times = np.roll(self.heatmap_times, 1)
@@ -1362,7 +1380,8 @@ class Engine:
                 aw = self._autosave_writer
                 if aw is not None:
                     try:
-                        aw.write_frame(datetime.now().isoformat(timespec="milliseconds"), col)
+                        aw.write_frame(datetime.now().isoformat(timespec="milliseconds"),
+                                       np.where(vcol, col, np.nan))
                     except Exception as e:                       # noqa: BLE001
                         print(f"[engine] autosave write failed: {e!r}")
 
@@ -1408,6 +1427,8 @@ class Engine:
         with self._frame_lock:
             return {"wavelengths": self.heatmap_linear_waves.copy(),
                     "buffer": self.heatmap_buffer.copy(),
+                    "valid": self.heatmap_valid.copy(),
+                    "unit": self.heatmap_unit, "mode": self.heatmap_mode,
                     "times": self.heatmap_times.copy(),
                     "filled": int(self.heatmap_filled),
                     "size": int(self.heatmap_buffer.shape[1])}
@@ -1596,11 +1617,42 @@ class Engine:
     def export_spectrum_csv(self, ev: "FrameEvent | None" = None) -> str:
         return spectrum_csv(self.export_snapshot(ev))
 
-    def export_heatmap_csv(self, indices=None) -> str:
+    def _heatmap_meta(self, h: dict) -> list:
         meta = [r for r in self.export_meta_rows() if r[0] in (
             "Spectrometer", "Serial", "Exported", "Integration time (ms)",
-            "Calibration profile", "Linearity correction", "Display mode", "Display unit")]
-        return heatmap_csv_text(self.heatmap_snapshot(), indices, meta)
+            "Calibration profile", "Profile id", "Linearity correction")]
+        mode = h.get("mode")
+        meta += [("Display mode", processing.DISPLAY_LABELS.get(mode, mode) if mode else ""),
+                 ("Unit", h.get("unit") or ""),
+                 ("Content", "display representation of each logged frame "
+                             "(the time-lapse records what is plotted)")]
+        if h.get("valid") is not None and not bool(np.all(h["valid"])):
+            meta.append(("Masked pixels", MASKED_NOTE))
+        return meta
+
+    def export_heatmap_csv(self, indices=None) -> str:
+        h = self.heatmap_snapshot()
+        return heatmap_csv_text(h, indices, self._heatmap_meta(h))
+
+    def export_heatmap_frame_csv(self, index: int) -> str:
+        """One logged time-lapse frame as a (wavelength, value) CSV with the
+        same header conventions (desktop 'export this frame')."""
+        h = self.heatmap_snapshot()
+        i = max(0, min(int(index), max(int(h["filled"]) - 1, 0)))
+        t = h["times"][i]
+        meta = self._heatmap_meta(h) + [
+            ("Time-lapse frame", i),
+            ("Seconds before export", f"{time.monotonic() - t:.1f}" if np.isfinite(t)
+             else "unknown")]
+        unit = h.get("unit") or "counts"
+        buf = io.StringIO()
+        for k, v in meta:
+            buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
+        buf.write(f"Wavelength_nm;{_value_column(unit)}\n")
+        col, ok = h["buffer"][:, i], h["valid"][:, i]
+        for w, v, good in zip(h["wavelengths"], col, ok):
+            buf.write(f"{w:.3f};{'' if not (good and np.isfinite(v)) else f'{v:.6g}'}\n")
+        return buf.getvalue()
 
     # ══════════════════════════════════════════════════════════════════════
     #  Measurements (jobs, via frame taps — not the display pipeline)
@@ -2084,7 +2136,7 @@ class Engine:
                                       str(p.get("reference_id", "")),
                                       frames=p.get("frames"),
                                       integration_ms=p.get("integration_ms"), ctx=ctx,
-                                      owner=None)
+                                      owner=ctx.job.owner)
             ctx.progress(1.0, "verification done", step="done")
             return json_safe(ver)
         return self.jobs.submit("verification", run, p, owner)
@@ -2437,8 +2489,10 @@ def heatmap_csv_text(h: dict, indices=None, meta: list | None = None) -> str:
         buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
     idx = list(range(int(h["filled"]))) if indices is None else list(indices)
     buf.write(";".join(["Time_Frame"] + [f"{w:.2f}" for w in h["wavelengths"]]) + "\n")
+    valid = h.get("valid")
     for fi in idx:
         col = h["buffer"][:, fi]
-        buf.write(";".join([str(fi)] + [("" if not np.isfinite(v) else f"{v:.6g}")
-                                        for v in col]) + "\n")
+        ok = valid[:, fi] if valid is not None else np.ones(col.size, bool)
+        buf.write(";".join([str(fi)] + [("" if not (g and np.isfinite(v)) else f"{v:.6g}")
+                                        for v, g in zip(col, ok)]) + "\n")
     return buf.getvalue()

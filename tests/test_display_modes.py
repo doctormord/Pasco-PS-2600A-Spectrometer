@@ -174,3 +174,35 @@ def test_mcp_set_acquisition_accepts_display_mode():
     from mcp_server import server
     src = inspect.getsource(server)
     assert "display_mode=display_mode" in src
+
+
+def test_display_mode_needs_control_and_heatmap_masks(conn):
+    conn.acquire_control("remote:a")
+    try:
+        with pytest.raises(eng.ControlBusy):
+            conn.configure({"display_mode": "raw"}, owner="remote:b")
+    finally:
+        conn.release_control("remote:a")
+    assert "display_mode" in eng.CONTROL_KEYS
+    # masked heatmap cells are exported empty and documented
+    wl = conn.wavelength_array
+    sel = (wl >= 450) & (wl <= 700)
+    p = cp.add_profile({"type": "relative", "device": {"backend": BACKEND, "serial": "DEMO-0001"},
+                        "optics": {"name": "x", "input": "bare"},
+                        "reference": {"name": "r", "unit": "relative"},
+                        "wl_fingerprint": conn.acquisition.wl_fingerprint(),
+                        "valid_range_nm": [450.0, 700.0],
+                        "table": [[float(w), 1.0] for w in wl[sel]],
+                        "unit": "relative", "acquisition": {}, "checks": {}})
+    conn.capture_dark(4)
+    conn.select_profile(p["id"])
+    _wait(conn, lambda e: e.unit == "relative")
+    t0 = time.time()
+    while conn.heatmap_filled < 2 and time.time() - t0 < 10:
+        time.sleep(0.02)
+    text = conn.export_heatmap_csv([0])
+    assert "# Masked pixels;" in text and "# Unit;counts_corrected" in text
+    row = [l for l in text.splitlines() if l.startswith("0;")][0].split(";")
+    assert row[1] == ""                                         # 340 nm masked
+    one = conn.export_heatmap_frame_csv(0)
+    assert one.splitlines()[-1].endswith(";")                   # 850 nm masked

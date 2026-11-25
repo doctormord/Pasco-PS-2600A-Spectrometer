@@ -713,8 +713,9 @@ def check_causes(c_ref, c_test, sigma_ref, sigma_test, mask, *, t_ref_us: int,
         add(CAUSE_NONLINEAR, c0, "per full scale", nl_eff, 100.0 * se[2] * span,
             f"nonlinearity: ratio changes by {nl_eff:+.2f} % between "
             f"{100 * x_lo / fs:.0f} % and {100 * x_hi / fs:.0f} % FS "
-            f"(detector response ≈ {-100.0 * c0:+.2f} % per 100 % FS)",
-            response_pct_per_fs=float(-100.0 * c0))
+            f"(detector response ≈ {-100.0 * c0 / max(t_ref / t_test - 1.0, 1e-9):+.2f} % "
+            f"per 100 % FS)",
+            response_pct_per_fs=float(-100.0 * c0 / max(t_ref / t_test - 1.0, 1e-9)))
     sig = [c for c in causes if c["significant"]]
     if sig:
         sig.sort(key=lambda c: -abs(c["effect_pct"]))
@@ -1737,6 +1738,7 @@ class CalibrationRuntime:
                   type=p.get("type"))
         if ps.get("linearity_note"):
             st["linearity_note"] = ps["linearity_note"]
+            st["message"] = ((st.get("message") or "") + " " + ps["linearity_note"]).strip()
         if ps["state"] == STATE_OTHER_DEVICE:
             self.status = st
             return

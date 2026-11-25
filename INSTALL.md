@@ -31,6 +31,16 @@ python PS-2600A_Pro.py --data-dir PATH       # optional: use another data direct
 
 ---
 
+
+> **Updating an existing installation (git):** up to this version
+> `calibration_profiles.json` and `spectrometer_config.json` were part of the
+> repository. A `git pull` removes them from the program folder. On the first
+> start the migration restores them automatically from the git history into the
+> data directory (logged as `restored_from_git` in `migration.log`). To be on the
+> safe side, copy both files (and `dark_spectra.json`, `reference_sources.json`)
+> out of the program folder before updating. Manual recovery:
+> `git show 91d533b:calibration_profiles.json > calibration_profiles.json`.
+
 ## Prerequisites — all platforms
 
 - Python 3.9+ (64-bit); 3.11+ recommended and fully tested.
@@ -285,8 +295,7 @@ crashing.
 ## What is new in this version
 
 - **Display modes** (Raw ADC, Corrected counts, Normalised, Count rate,
-  Absolute) for scope and heatmap; evaluations and exports always use the
-  corrected data.
+  Absolute) for scope and heatmap; spectrum and measurement exports and all evaluations use the corrected data; the time-lapse (heatmap, its export and autosave) records the display representation.
 - **Spectral calibration**: darks before and after (time-interpolated),
   per-pixel checks with cause analysis, verification against the reference
   file with scope overlay.

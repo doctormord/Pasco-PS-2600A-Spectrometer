@@ -164,10 +164,17 @@ def correct_counts(model: dict, x) -> np.ndarray:
     return out
 
 
-def make_linearizer(model: dict):
+def make_linearizer(model: dict, saturation_level: float | None = None):
     """Frame-level correction for BaseSpectrometer.set_linearizer:
     fn(pixels, dark, ratio) → b + ratio · f((pixels − b)/ratio), b = the
-    frame's baseline scalar (driver dark estimate)."""
+    frame's baseline scalar (driver dark estimate).
+
+    Pixels at/above the saturation level are passed through UNCHANGED, so the
+    saturation flags of the captures, the exposure bar and the live
+    saturation warning keep seeing the raw level (a correction factor < 1
+    would otherwise hide clipped pixels)."""
+    sat = None if saturation_level is None else float(saturation_level)
+
     def fn(pixels, dark=0.0, ratio=1.0):
         px = np.asarray(pixels, float)
         try:
@@ -176,7 +183,10 @@ def make_linearizer(model: dict):
             b = 0.0
         r = float(ratio) if ratio and float(ratio) > 0 else 1.0
         x = (px - b) / r
-        return b + r * correct_counts(model, x)
+        out = b + r * correct_counts(model, x)
+        if sat is not None:
+            out = np.where(px >= sat, px, out)
+        return out
     fn.model = model
     return fn
 
@@ -445,7 +455,11 @@ def runtime_for(backend, backend_name: str) -> tuple:
     info.update(state=STATE_ACTIVE, id=e["id"], created=e.get("created"),
                 valid_range_counts=(e["model"] or {}).get("valid_range_counts"),
                 label=f"on ({e['id']}, {str(e.get('created', ''))[:10]})")
-    return make_linearizer(e["model"]), info
+    try:
+        sat = float(backend.adc_saturation_level)
+    except Exception:                                       # noqa: BLE001
+        sat = None
+    return make_linearizer(e["model"], sat), info
 
 
 def profile_linearity_tag(info: dict | None) -> dict:

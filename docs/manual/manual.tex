@@ -155,6 +155,7 @@ spatial smoothing; and (web) a CSV waterfall replay player.
 \begin{quote}\ttfamily\small
 python PS-2600A\_Pro.py\hfill\# desktop GUI (entry point)\\
 python PS-2600A\_Pro.py --headless\hfill\# engine + web UI + REST API, no Qt\\
+python PS-2600A\_Pro.py --data-dir PATH\hfill\# other data directory (\S\ref{sec:datadir})\\
 python web\_server.py\hfill\# same, historic entry point (forwards)\\
 set FP\_DEBUG=1 \&\& python PS-2600A\_Pro.py\hfill\# Windows: per-frame fast-preview log
 \end{quote}
@@ -622,7 +623,9 @@ The valid range is the \emph{intersection} of
 \end{itemize}
 and excludes saturated pixels (any frame at or above the backend's ADC full scale)
 and pixels whose gain would exceed \key{calibration\_max\_gain}
-($S<1/\mathrm{max\_gain}$). Outside the valid range the output is \emph{masked}
+($S<1/\mathrm{max\_gain}$). Pixels that fail the per-pixel stability or cross
+check (\S\ref{sec:speccal-checks}) are masked as well and limit the valid
+segments. Outside the valid range the output is \emph{masked}
 (NaN, drawn grey in the plot); it is never continued with gain~1. A calibration
 is refused if the calibration spectrum contains saturated pixels or if no valid
 pixel remains.
@@ -639,7 +642,7 @@ fibre:} centre the fibre reproducibly in the lamp port (adapter sleeve) or deriv
 the profile (\S\ref{sec:speccal-derive}).
 
 \paragraph{Wizard} (\emph{Calibration\ldots\ $\to$ Spectral calibration}, fixed
-sequence of 8 steps):
+sequence, identical for every device):
 \begin{enumerate}
   \item Choose device, optics configuration (new or existing), input optic,
         reference source from the library and type (relative\,/\,absolute;
@@ -649,28 +652,124 @@ sequence of 8 steps):
   \item Set the integration time or use auto-exposure to the target band
         (\key{calibration\_target\_frac\_lo/hi}, default 70--85\,\% of full scale);
         it is then fixed.
-  \item Capture the dark spectra. \emph{Both} dark spectra ($t_{\mathrm{int}}$
-        and $\approx t_{\mathrm{int}}/2$ for the cross check) are taken in
-        \emph{one} covering step at the start. Devices without a shutter ask you
-        to cover the input once and to uncover it afterwards.
-  \item Capture the calibration spectrum; the automatic \emph{stability check}
-        follows (second capture after \key{calibration\_stability\_delay\_s}).
-  \item Automatic \emph{integration-time cross check}: capture at
-        $\approx t_{\mathrm{int}}/2$ with its own dark; $C(\lambda)$ must agree.
-  \item Compute $S$ or $K$, valid range, gain span; display $C_{\mathrm{cal}}$,
+  \item \textbf{Dark spectra before.} Both dark spectra ($t_{\mathrm{int}}$ and
+        $\approx t_{\mathrm{int}}/2$ for the cross check) are taken in
+        \emph{one} covering step. Devices without a shutter ask you to cover the
+        input and to uncover it afterwards.
+  \item Capture the calibration spectrum and, after
+        \key{calibration\_stability\_delay\_s}, the repeat capture
+        (stability).
+  \item Capture at $\approx t_{\mathrm{int}}/2$ (integration-time cross check).
+  \item \textbf{Dark spectra after}, again at $t_{\mathrm{int}}$ and
+        $t_{\mathrm{int}}/2$ in a second covering step. Every light capture is
+        corrected with the dark \emph{interpolated in time} between its dark
+        before and after (\S\ref{sec:speccal-dark}).
+  \item Automatic \emph{per-pixel checks} (stability and cross check) with
+        cause analysis (\S\ref{sec:speccal-checks}).
+  \item Compute $S$ or $K$, valid range, plausibility including the gain-span
+        hint (\S\ref{sec:speccal-gainspan}); display $C_{\mathrm{cal}}$,
         $E_{\mathrm{ref}}$, result and warnings.
   \item Save as a new profile version (absolute: plus the derived relative
         profile) and create the calibration protocol.
+  \item \textbf{Verification} (\S\ref{sec:speccal-verify}): the reference lamp is
+        measured through the live pipeline with the new profile.
 \end{enumerate}
-\paragraph{Check criterion.} For both checks the ratio of the two count rates is
-smoothed over 21 pixels (spectrally smooth drift is real, per-pixel shot noise is
-not). Evaluated over valid pixels with $C>10\,\%$ of the maximum, the
-\emph{95th percentile of the absolute deviation} must stay below the threshold:
-\key{calibration\_stability\_threshold\_pct} (default 1\,\%) and
-\key{calibration\_itime\_threshold\_pct} (default 2\,\%). A failed check produces
-a warning, not a block; it is recorded in the profile and the protocol. If
-$t_{\mathrm{int}}$ cannot be halved (device minimum) the cross check is skipped
-and noted.
+
+\subsection{Dark before and after, interpolation, drift}\label{sec:speccal-dark}
+The dark level of some detectors (LR-2T) jumps between runs by tens to hundreds
+of counts; a single dark taken once therefore leaves a constant count offset in
+the calibration. The wizard takes the darks \emph{before} and \emph{after} the
+light captures. For each light capture the dark is interpolated \emph{per pixel,
+linearly in time} between the dark before and the dark after, evaluated at the
+capture's mid time (without usable time stamps the mean of both; without a dark
+after, the dark before). The change of the dark level between before and after
+is reported as \emph{dark drift}: mean over the pixels (counts), its expected
+noise, the 95th percentile of the per-pixel change and the elapsed time. A mean
+drift well above its noise ($>3\sigma$) and above
+\key{calibration\_dark\_drift\_warn\_pct} (default 0.5\,\%) of the net peak signal
+produces a warning and is recorded in the protocol.
+
+\subsection{Per-pixel checks and cause model}\label{sec:speccal-checks}
+Both checks compare two count-rate spectra \emph{per pixel}: the repeat at
+$t_{\mathrm{int}}$ (stability) and the capture at $\approx t_{\mathrm{int}}/2$
+(cross check, expected ratio 1 in count rate). A tested pixel passes if
+\[
+  \bigl|C_{\mathrm{test}} - r\,C_{\mathrm{ref}}\bigr| \le
+  k\sqrt{\sigma_{\mathrm{ref}}^{2}+\sigma_{\mathrm{test}}^{2}}
+  + \frac{p}{100}\,|C_{\mathrm{ref}}| ,
+\]
+with $\sigma$ the per-pixel standard deviation of the mean rate (dark and shot
+noise of the actual captures), $r$ the expected ratio (1, or a lamp-drift
+correction), $k=$ \key{calibration\_pixel\_check\_k} (default 4) and $p$ the
+check threshold (\key{calibration\_stability\_threshold\_pct}, default 1\,\%;
+\key{calibration\_itime\_threshold\_pct}, default 2\,\%). The noise term keeps
+weak pixels from failing on noise alone; the relative term is the systematic
+deviation the check accepts. Non-positive or non-finite rates fail. The
+\emph{failing pixels are masked} and limit the valid segments; the number of
+failing pixels per check is shown and recorded. (The earlier 95th-percentile
+criterion over the signal-rich pixels could leave pixels with
+$C_{\mathrm{half}}/C_{\mathrm{cal}}$ up to 1.75 or negative inside the valid
+range.)
+
+\paragraph{Cause model.} Over all tested pixels, in counts of the test capture
+($x$ = counts expected from the reference rate, $y$ = measured counts), the
+model
+\[
+  y = a + s\,x + c\,\frac{x^{2}}{\mathrm{FS}}
+\]
+is fitted by weighted least squares ($c=0$ for the repeat at the same
+$t_{\mathrm{int}}$; one robust re-fit without outliers above $5\sigma$). A term
+is reported as a cause when it is significant ($>3$ standard errors) \emph{and}
+its effect on the ratio $y/x$ reaches \key{calibration\_cause\_min\_pct} (default
+0.3\,\%). The message names the cause and its magnitude.
+\begin{itemize}
+  \item \textbf{Dark drift} ($a$, constant count offset): the dark level changed
+        or does not match the dark used. Remedy: warm up the device, repeat the
+        darks, check light leaks while covering.
+  \item \textbf{Time offset} ($s\neq1$ in the cross check): the effective
+        exposure differs from the nominal $t_{\mathrm{int}}$ by a constant
+        (readout or shutter timing); uniform factor.
+  \item \textbf{Lamp drift} ($s\neq1$ in the repeat at the same $t_{\mathrm{int}}$):
+        the source changed between the two captures; let the lamp warm up. The
+        stability result is applied as $r$ to the cross check.
+  \item \textbf{Nonlinearity} ($c$, signal-dependent): the detector response is
+        not proportional to the light. Remedy: linearity calibration
+        (\S\ref{sec:linearity}).
+\end{itemize}
+A failed check produces a warning, not a block; it is recorded in the profile and
+the protocol. If $t_{\mathrm{int}}$ cannot be halved (device minimum) the cross
+check is skipped and noted.
+
+\subsection{Gain span (hint)}\label{sec:speccal-gainspan}
+The ratio of the largest to the smallest gain over the valid range is reported
+as a \emph{hint} only: a halogen lamp on a silicon detector legitimately spans
+50--100$\times$ between 380 and 950\nm. The default limit is 200$\times$
+(\key{calibration\_max\_gain\_span}); a stored old default is replaced once by
+the new one. Line sources and unsuitable references are recognised by the other
+plausibility metrics: coverage of the expected range, roughness (95th percentile
+of $|S/S_{\mathrm{smoothed}}-1|$), isolated peaks and the widest bridged
+segment.
+
+\subsection{Verification}\label{sec:speccal-verify}
+After saving, the reference lamp (uncovered, same geometry) is measured
+\emph{through the live pipeline} with the new profile (stored dark at the
+profile's $t_{\mathrm{int}}$, same processing as the display). The corrected
+spectrum is compared with the reference file, both normalised over
+550--650\nm (\key{calibration\_verify\_norm\_lo\_nm/hi\_nm}). The result lists the
+deviation in percent \emph{per 50\nm band} (\key{calibration\_verify\_band\_nm})
+and overall (rms, maximum); bands beyond \key{calibration\_verify\_warn\_pct}
+(default 2\,\%) are flagged. Absolute profiles are additionally compared
+unnormalised. The verification can also be started later for any saved v2 profile
+(web client, API \code{POST /calibration/verifications},
+MCP tool \code{verify\_profile}). Typical bench result with the HAL-CAL lamp:
+425--949\nm within $\pm1.2$\,\%, 400--425\nm about $+2$\,\%, 375--400\nm about
+$+5$\,\% (low lamp output and stray light in the blue).
+
+\paragraph{Reference overlay.} The reference curve can be shown in the scope
+(\key{scope\_reference\_overlay}, \key{scope\_reference\_id}). With an absolute
+display it is drawn unscaled in the display unit; in every other display mode it
+is scaled by least squares onto the displayed values over the valid pixels.
+(API: \code{GET /calibration/reference-overlay}.)
 
 \subsection{Deriving one optic from another}\label{sec:speccal-derive}
 The mode \emph{Derive from other optics} (tab \emph{Spectral calibration})
@@ -727,6 +826,8 @@ activate, export\,/\,import (one profile as a file), delete and
 Main window and web client run \code{processing.process\_frame()} with identical
 inputs (\code{pipeline\_kwargs}), hence identical values. Order:
 \begin{enumerate}
+  \item \emph{(if a linearity correction is active)} correct each frame directly after
+        the driver (\S\ref{sec:linearity});
   \item subtract a \emph{per-pixel} dark --- \emph{mandatory} with a profile,
         independent of the \emph{Dark correction} switch and of \key{dark\_mode},
         not clipped. Source, in this order: the stored dark of this unit at
@@ -755,6 +856,87 @@ colorimetry uses the corrected distribution. The web client offers the same
 profiles, units and management (\code{/api/calibration/*}); it does
 \emph{not} capture calibrations.
 
+\subsection{Detector linearity calibration}\label{sec:linearity}
+\paragraph{Why.} $S$ and $K$ are per-pixel factors measured at \emph{one} signal
+level. If the detector response is not proportional to the light (LR-2T: about
+$+1.5$\,\% between 39 and 78\,\% of full scale), every measurement at another
+level is biased and the $t_{\mathrm{int}}/2$ cross check of the spectral
+calibration fails (cause \emph{nonlinearity}, \S\ref{sec:speccal-checks}). The
+linearity calibration measures this per unit and corrects it at the start of the
+pipeline.
+
+\paragraph{When.} Needed for LR-2T and PASCO when the cross check reports a
+nonlinearity, or before the first spectral calibration of a unit. It is
+independent of the optics and valid per unit (backend and serial number);
+repeat it after a repair or a change of the electronics. The Ocean HDX
+linearises in the device itself (\key{ocean\_nonlinearity\_correction}); there
+only a \emph{check} measurement is made and a stored correction is never applied
+on top (no double correction).
+
+\paragraph{Procedure} (tab \emph{Linearity} of the calibration dialog; web
+client and API \code{POST /calibration/linearity/runs}, MCP tool
+\code{start\_linearity}):
+\begin{enumerate}
+  \item Illuminate the input with a stable broadband source (halogen lamp, warmed
+        up); the reference calibration of a lamp is \emph{not} needed.
+  \item Darks are captured at \emph{every} integration time before and after the
+        light steps (covering steps as in the spectral wizard).
+  \item 6--10 (\key{linearity\_steps}, default 8) integration times are chosen so
+        that the raw peak lies between about 10 and 90\,\% of full scale
+        (below the saturation level). All frames are taken with the existing
+        linearity correction bypassed (raw driver output).
+  \item A \emph{reference step} ($\approx50$\,\% FS) is repeated at the start,
+        after every third step and at the end; its count rate follows the lamp
+        drift, which is divided out of every step (linear interpolation in
+        time). A larger lamp drift produces a warning.
+  \item Fit, residual check and protocol (PDF/CSV); the record is stored and,
+        unless declined, activated.
+\end{enumerate}
+
+\paragraph{Model.} For pixel $p$ and step $k$ with net counts
+$N = \mathrm{light}-\mathrm{dark}$ (dark interpolated in time):
+\[
+  \frac{N}{t\,L(\tau)} = R_p\,h(N),\qquad
+  h(N)=\exp\!\Bigl(\sum_{j\ge1} d_j\,(N/\mathrm{FS})^{j}\Bigr),\quad h(0)=1 ,
+\]
+with $R_p$ the linear count rate of the pixel (eliminated per pixel as a
+nuisance parameter) and $L$ the lamp factor. The correction is
+$\mathrm{counts}_{\mathrm{true}} = f(N) = N/h(N)$: at \emph{low} signal the
+corrected value equals the measured one, so the weak end keeps its scale. $f$ is
+stored as a polynomial ($d_j$, degree \key{linearity\_degree}, default 3) and as a
+monotonic support-point table over the measured range; beyond the range the end
+ratio is kept constant.
+
+\paragraph{Application order and why.} The nonlinearity belongs to each single
+readout (charge-to-voltage conversion and ADC) and acts on the accumulated
+signal (photo charge plus dark current) \emph{above} the electronic offset.
+Therefore the correction is applied
+\begin{enumerate}
+  \item per \emph{frame}, directly after the driver --- before fusion, frame
+        averaging and fast-preview scaling (all of these assume linear counts)
+        and before the calibration and measurement frame taps;
+  \item on the signal above the frame's baseline $b$ (the driver's dark scalar:
+        optical black or darkest-pixel estimate):
+        $b + f(\mathrm{raw}-b)$ --- the electronic offset itself is not subject to
+        the detector nonlinearity;
+  \item \emph{before} the dark subtraction; dark frames pass through the same
+        correction ($f(x)\approx x$ for small $x$), so light $-$ dark stays
+        consistent.
+\end{enumerate}
+Fast-preview frames scaled by a ratio are corrected at their true level.
+Without an active correction nothing changes.
+
+\paragraph{Storage and profiles.} The records are stored in
+\file{linearity\_profiles.json} (data directory, \S\ref{sec:datadir}), one list
+of records; the active correction is kept per unit. States: \emph{none},
+\emph{active}, \emph{off} (stored but switched off), \emph{factory} (HDX, not
+applied). Each spectral profile records the linearity state it was made with
+(profile tag: active yes/no and record id). If the state now differs, the status
+line shows a hint (``linearity correction was on/off when this profile was
+made\ldots recalibrate for exact values''); the profile is not blocked. Protocols
+and exports state the linearity correction explicitly as \emph{on}, \emph{off} or
+\emph{n/a}.
+
 \subsection{Calibration protocol}
 Each run produces a protocol as \textbf{PDF} and \textbf{CSV}
 (\file{calibration\_report.py}): date/time, device and serial, optics
@@ -776,8 +958,24 @@ $K$, validity, repeat and half-$t_{\mathrm{int}}$ rates. Default file name:
 \key{calibration\_smooth\_px} & 5 & Moving average of $S$/$K$ (0/1 = off).\\
 \key{calibration\_target\_frac\_lo/hi} & 0.70 / 0.85 & Auto-exposure target (fraction of full scale).\\
 \key{calibration\_stability\_delay\_s} & 5.0 & Delay of the second capture.\\
-\key{calibration\_stability\_threshold\_pct} & 1.0 & Stability limit (p95, \%).\\
-\key{calibration\_itime\_threshold\_pct} & 2.0 & Cross-check limit (p95, \%).\\
+\key{calibration\_stability\_threshold\_pct} & 1.0 & Stability limit per pixel (\%).\\
+\key{calibration\_itime\_threshold\_pct} & 2.0 & Cross-check limit per pixel (\%).\\
+\key{calibration\_pixel\_check\_k} & 4.0 & Noise factor $k$ of the per-pixel checks.\\
+\key{calibration\_cause\_min\_pct} & 0.3 & Minimum effect (\%) for a reported cause.\\
+\key{calibration\_dark\_drift\_warn\_pct} & 0.5 & Dark-drift warning (\% of net peak).\\
+\key{calibration\_max\_gain\_span} & 200 & Gain-span hint (not a block).\\
+\key{calibration\_verify\_norm\_lo\_nm/hi\_nm} & 550 / 650 & Normalisation range of the verification.\\
+\key{calibration\_verify\_band\_nm} & 50 & Band width of the verification.\\
+\key{calibration\_verify\_warn\_pct} & 2.0 & Band deviation that is flagged (\%).\\
+\key{scope\_reference\_overlay} / \key{scope\_reference\_id} & false / --- & Reference curve in the scope.\\
+\key{linearity\_profiles\_file} & \file{linearity\_profiles.json} & Linearity records (per unit).\\
+\key{linearity\_steps} & 8 & Integration times (6--10).\\
+\key{linearity\_frac\_lo/hi} & 0.10 / 0.90 & Peak level of the shortest / longest step (FS).\\
+\key{linearity\_ref\_frac} / \key{linearity\_ref\_every} & 0.50 / 3 & Reference step level / repeat interval.\\
+\key{linearity\_degree} & 3 & Polynomial degree.\\
+\key{display\_mode} & auto & \code{auto}, \code{raw}, \code{corrected}, \code{normalised}, \code{count\_rate}, \code{absolute}.\\
+\key{y\_limits\_by\_mode} & \code{\{\}} & Manual Y limits per display mode (scope).\\
+\key{heatmap\_limits\_by\_mode} & \code{\{\}} & Heatmap upper limit per display mode.\\
 \key{calibration\_fingerprint\_overrides} & \code{\{\}} & Confirmed applications despite changed wavelength calibration or linearisation.\\
 \key{display\_unit} & counts & \code{counts} or \code{counts\_per\_s} without v2 profile.\\
 \key{irradiance\_unit} & uW/cm2/nm & or \code{W/m2/nm} for absolute profiles.\\
@@ -936,7 +1134,7 @@ front-ends: a tab bar (Scope, Heatmap, Color$\cdot$CRI, Replay, Filter) over the
 main plot area, with the four control sections on the right.}
 
 \subsection{Scope tab}
-The live trace (intensity in ADC vs.\ wavelength). Overlays (toolbar above the
+The live trace (intensity vs.\ wavelength, in the unit of the selected display mode, \S\ref{sec:displaymodes}). Overlays (toolbar above the
 plot):
 \begin{itemize}
   \item \textbf{Freeze} --- snapshots the current trace as a grey reference
@@ -951,6 +1149,50 @@ plot):
         (wavelength, intensity) CSV, drawn cyan and normalised to the current Y max;
         or pick a library spectrum via ``Reference library''.
 \end{itemize}
+
+\subsection{Display modes}\label{sec:displaymodes}
+The \emph{Display} selector (scope and heatmap; web client identical;
+\key{display\_mode}, API/MCP \code{display\_mode}) chooses \emph{what is plotted}.
+It does not change the data: all evaluations (colorimetry, CRI, TM-30, filter
+analysis, peaks) always run on the \emph{corrected} data of the pipeline, and
+CSV/PDF exports are independent of the display mode (they carry the mode and
+unit as information in the header).
+\begin{longtable}{@{}p{2.9cm}p{11.3cm}@{}}
+\toprule \textbf{Mode} & \textbf{Definition}\\ \midrule\endhead
+Raw ADC & Counts without calibration profile (dark correction and smoothing as
+  configured). Without a profile identical to the previous display.\\
+Corrected counts & Corrected rate $\times\,t_{\mathrm{int}}$, normalised so that
+  \emph{Corrected = Raw at the pixel of maximum sensitivity} (smallest correction
+  factor). The familiar ADC scale is kept: in the most sensitive region corrected
+  and raw counts agree, elsewhere the curve shows what the detector would have
+  counted with a flat response. Default with an active profile.\\
+Normalised & Maximum $=1$ over the valid (finite) pixels.\\
+Count rate & Counts per second (with a profile: corrected rate on the same
+  normalisation as \emph{Corrected counts}).\\
+Absolute & Spectral irradiance in the active unit; only with an absolute profile.\\
+Auto & \emph{Corrected counts} with an active v2 profile, else \emph{Count rate}
+  if \key{display\_unit} is \code{counts\_per\_s}, else \emph{Raw ADC}.\\
+\bottomrule
+\end{longtable}
+\paragraph{Availability.} Without a profile: Raw ADC, Normalised, Count rate.
+With a relative profile additionally Corrected counts; with an absolute profile
+also Absolute. A requested mode that is not available falls back (Absolute
+$\to$ Corrected $\to$ Raw).
+
+\paragraph{Exposure level.} In corrected views the drive level of the detector
+is no longer visible from the curve. The scope therefore keeps an exposure
+indicator in \emph{raw ADC} (peak counts, percent of full scale, saturated pixel
+count; bar or faint raw curve), independent of the display mode, with a
+saturation warning at the saturation level.
+
+\paragraph{Y limits.} Manual Y limits are stored \emph{per display mode}
+(\key{y\_limits\_by\_mode}; heatmap: \key{heatmap\_limits\_by\_mode}); calibrated
+units use auto-scaling by default, and the axis is rescaled when the mode is
+switched. The heatmap upper limit follows the same logic.
+
+\paragraph{Readout.} The hover and top-bar readout shows the \emph{active unit}
+(not a fixed ``ADC'') and ``--'' instead of ``nan'' for masked pixels (desktop
+and web).
 
 \subsection{Heatmap (waterfall) tab}
 A time-lapse image: each new spectrum becomes one coloured row.
@@ -1096,6 +1338,27 @@ Both apps export from the shared renderers, so numbers match exactly.
   \item \textbf{Parameter header} --- every report carries a monospaced block with
         Spectrometer, Serial, Date/time, Exposure, Dark/baseline and Peak ADC, so a
         saved report is self-describing.
+  \item \textbf{CSV spectrum export} --- semicolon-separated, \textbf{UTF-8 with
+        BOM} (Excel recognises the encoding; \textmu, superscripts and dashes stay
+        intact). The header documents the settings \emph{actually applied}:
+        spectrometer, serial, date and time (ISO, with time zone), export time,
+        integration time, frames averaged, smoothing, dark correction and the
+        dark mode actually used, optical-black mean, NL correction of the device
+        and linearity correction (\emph{on}/\emph{off}/\emph{n/a}), calibration
+        profile (name, id, version, type, state, notes on a changed wavelength
+        calibration or linearity), display mode and unit, unit of the data, valid
+        range and segments, and the note on masked pixels. Contradictory legacy
+        entries (``Response compensation: OFF'' with an active profile) are not
+        written. The value column holds the corrected data and is independent of the
+        display mode (the displayed values follow in an extra column). The
+        time-lapse export and autosave contain the display representation of
+        each logged frame; the header names mode and unit, masked pixels are
+        empty cells.
+  \item \textbf{Calibration and linearity protocols} --- PDF without overlapping
+        blocks (warnings, saved profiles, header and plot titles), table cells
+        wrap instead of being cut off; the NL correction is stated explicitly as
+        \emph{on}, \emph{off} or \emph{n/a}. Files go to \file{protocols/} in the
+        data directory.
 \end{itemize}
 
 % =====================================================================
@@ -1161,11 +1424,9 @@ selects another backend, for example \emph{Demo (virtual)}). The start banner pr
 the URL, the \code{/docs} URL and the token. \code{python web\_server.py} still
 works and forwards to the same server.
 
-A packaged build (\code{pyinstaller PS-2600A\_Pro.spec}) also accepts
-\code{--headless}; because the spec builds a windowed executable
-(\code{console=False}) the banner is not visible there --- start the server from the
-desktop panel or use a source checkout when the token must be read from the
-console.
+The program is started from Python only (virtual environment,
+\code{pip install -r requirements.txt}); there is no packaged executable.
+\code{--data-dir PATH} selects the data directory (\S\ref{sec:datadir}).
 
 \subsection{Token and security}
 For a local bind the token is optional; for LAN it is always required. It is sent as
@@ -1451,8 +1712,48 @@ the tools. Because the API is unencrypted HTTP, use a TLS reverse proxy for anyt
 beyond a trusted network, and keep the token secret.
 
 % =====================================================================
+\section{Data directory \& migration}\label{sec:datadir}
+Runtime data never lives in the program folder (\file{data\_paths.py}, Qt-free).
+Default locations:
+\begin{itemize}
+  \item Windows: \file{\%APPDATA\%\textbackslash PS-2600A\textbackslash}
+  \item macOS: \file{\textasciitilde/Library/Application Support/PS-2600A/}
+  \item Linux: \file{\$XDG\_CONFIG\_HOME/ps-2600a/} (default
+        \file{\textasciitilde/.config/ps-2600a/})
+\end{itemize}
+\textbf{Override} (highest priority first): the command-line option
+\code{--data-dir PATH}, then the environment variable \code{PS2600A\_DATA\_DIR}.
+
+\paragraph{Contents.} \file{spectrometer\_config.json} (settings),
+\file{calibration\_profiles.json} (and \file{calibration\_profiles.v1.bak.json}),
+\file{dark\_spectra.json}, \file{reference\_sources.json} (lamp library),
+\file{linearity\_profiles.json}, the folders \file{protocols/} (calibration and
+linearity protocols) and \file{backup/}, and the migration records
+\file{migration.json} and \file{migration.log}. Relative file names in the
+configuration (e.g.\ \key{calibration\_profiles\_file}) resolve into the data
+directory.
+
+\paragraph{One-time migration.} If the data directory has no
+\file{migration.json}, the files found in the program folder (the runtime files
+above, \file{*.bak.json}, \file{old\_calib\_data\_*.json}, earlier calibration and
+linearity protocols) are \emph{copied}, never moved. An existing file in the data
+directory is never overwritten; the version from the program folder is kept
+beside it as \file{<name>.from-program-dir-<timestamp>.json}. Every source file
+is also copied to \file{backup/migration-<timestamp>/}. The result is written to
+\file{migration.json} (marker) and appended to \file{migration.log}. Afterwards
+the program reads and writes only the data directory; the originals in the
+program folder stay untouched. \code{PS2600A\_SKIP\_MIGRATION=1} skips the
+migration.
+
+\paragraph{Templates and repository.} The repository contains only
+\file{*.example.json} templates; the real data files are listed in
+\file{.gitignore}.
+
+\paragraph{Export folder.} Exports default to
+\file{<Documents>/PS-2600A} (\key{export\_dir}), not to the program folder.
+
 \section{Configuration reference}
-All settings live in \file{spectrometer\_config.json}, created from
+All settings live in \file{spectrometer\_config.json} in the data directory (\S\ref{sec:datadir}), created from
 \code{app\_config.DEFAULT\_CONFIG} on first run; unknown gaps are filled from
 defaults at load. Edit it while the app is closed, or change values from the UI
 (which writes back). New code keys must be added to \code{DEFAULT\_CONFIG}.

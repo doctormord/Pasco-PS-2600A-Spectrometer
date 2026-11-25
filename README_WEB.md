@@ -41,6 +41,7 @@ app.
 python PS-2600A_Pro.py --headless [--host 127.0.0.1] [--lan] [--port 8000]
                        [--token T] [--require-token] [--no-connect]
                        [--backend "Demo (virtual)"] [--log-level warning]
+                       [--data-dir PATH]
 ```
 
 | Option | Meaning |
@@ -51,6 +52,7 @@ python PS-2600A_Pro.py --headless [--host 127.0.0.1] [--lan] [--port 8000]
 | `--require-token` | Also require the token for a local (127.0.0.1) bind. |
 | `--no-connect` | Do not auto-connect the first device found. |
 | `--backend NAME` | Backend to auto-connect (default: first backend). |
+| `--data-dir PATH` | Data directory for settings, profiles, darks, protocols (default: per-user folder, see [`INSTALL.md`](INSTALL.md#data-directory); also `PS2600A_DATA_DIR`). |
 
 The start banner prints the URL, the `/docs` URL and, when a token is required,
 the token. `python web_server.py [--lan] [--host H] [--port P]` still works and
@@ -144,6 +146,20 @@ lamps, stored darks), *Wavelength calibration…* (capture a line lamp, match, f
 save with backup confirmation). Deleting profiles or dark spectra is not
 offered over the API.
 
+**Display modes, verification, linearity** — the display mode (Raw ADC,
+Corrected counts, Normalised, Count rate, Absolute; `display_mode` in
+`PUT /acquisition`) works as on the desktop; spectrum and measurement exports and all evaluations use the corrected data; the time-lapse (heatmap, its export and autosave) records the display representation. After saving a profile, *verification* measures the
+reference lamp through the live pipeline and shows the deviation per 50-nm band
+(reference curve as scope overlay). *Linearity* calibrations (LR-2T, PASCO) run
+as jobs; the Ocean HDX gets a check only. See the manual (chapter *Spectral
+calibration*).
+
+**Data directory** — settings, profiles, dark spectra and protocols live in the
+per-user data directory (`%APPDATA%\PS-2600A\`, `~/Library/Application
+Support/PS-2600A/` or `~/.config/ps-2600a/`), not in the program folder;
+override with `--data-dir PATH` or `PS2600A_DATA_DIR`. Existing files are copied
+there once on the first start. See [`INSTALL.md`](INSTALL.md#data-directory).
+
 **Export** — CSV download, PNG screenshot, and PDF/PNG/CSV colour & filter
 reports (the report endpoints need `matplotlib`). Files that the *server*
 writes (autosave, saved reports, calibration protocols) go to its export folder
@@ -182,6 +198,8 @@ Interactive documentation (OpenAPI / Swagger UI): **`/docs`** (schema:
 | analysis | `POST /analyze/color`, `/analyze/peaks`, `/analyze/filter`, `/analyze/tm30` | no |
 | reports | `POST /reports` (color / filter / measurement; pdf / png / csv) | no |
 | calibration | profiles (list, select, copy, import, export), `GET /calibration/status`, references, darks, `POST /calibration/runs`, `POST /calibration/derivations`, `GET /calibration/runs/{job}/protocol` | select / copy / import / runs |
+| verification | `POST /calibration/verifications`, `GET /calibration/verification`, `GET /calibration/reference-overlay` | POST |
+| linearity | `GET /calibration/linearity`, `POST /calibration/linearity/runs`, `POST /calibration/linearity/select`, `GET /calibration/linearity/runs/{job}/protocol` | POST |
 | wavelength | `/wavelength/lamps`, `/session`, `/capture`, `/match`, `/pairs`, `/fit`, `/save` | steering calls |
 | heatmap | `GET`/`PUT /heatmap`, `/heatmap/clear`, `/heatmap/autosave`, `/heatmap/frame`, `/heatmap/export` | PUT / POST |
 

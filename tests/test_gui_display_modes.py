@@ -286,7 +286,11 @@ def test_heatmap_frame_csv_header_uses_display_unit():
     import inspect
     import gui_dashboard
     src = inspect.getsource(gui_dashboard.DashboardWindow._hm_export_frame_csv)
-    assert 'f"Value_{self._display_unit}"' in src and '"ADC_Counts"' in src
+    # shared engine export (review W8): header column follows the unit there
+    assert "export_heatmap_frame_csv" in src and "csv.writer" not in src
+    import engine
+    assert engine._value_column("counts") == "ADC_Counts"
+    assert engine._value_column("counts_corrected") == "Value_counts_corrected"
 
 
 # ── 13. calibration dialog: result pane never clipped ────────────────────────
