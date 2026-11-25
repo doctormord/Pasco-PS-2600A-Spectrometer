@@ -115,8 +115,27 @@ class BaseSpectrometer(ABC):
             if fn in self._frame_taps:
                 self._frame_taps.remove(fn)
 
+    # ── Detector linearity correction (calibration_linearity) ─────────────
+    # The engine installs the per-unit correction here, so it is applied to
+    # EVERY frame directly after the driver — before the frame taps
+    # (calibration / measurement captures), fusion, averaging and the dark
+    # subtraction. A linearity measurement sets linearity_bypass to capture
+    # uncorrected frames. Signature: fn(pixels, dark, ratio) -> pixels.
+    def set_linearizer(self, fn: Callable[..., np.ndarray] | None) -> None:
+        self._linearizer = fn
+
+    @property
+    def linearizer(self):
+        return getattr(self, "_linearizer", None)
+
     def _dispatch_frame(self, pixels, dark=0.0, integration_us=0,
                         kind="standard", ratio=1.0) -> None:
+        lin = getattr(self, "_linearizer", None)
+        if lin is not None and not getattr(self, "linearity_bypass", False):
+            try:
+                pixels = lin(pixels, dark, ratio)
+            except Exception as exc:          # never kill acquisition
+                print(f"[device] linearity correction error: {exc}")
         with self._tap_lock:
             taps = list(self._frame_taps)
         for fn in taps:
@@ -178,6 +197,8 @@ class BaseSpectrometer(ABC):
         self._user_on_frame     = on_frame
         self._frame_taps: list[Callable[..., None]] = []
         self._tap_lock          = threading.Lock()
+        self._linearizer        = None
+        self.linearity_bypass   = False
         self.on_frame           = self._dispatch_frame
         self.on_auto_exp        = on_auto_exp
         self.on_connection_lost = on_connection_lost

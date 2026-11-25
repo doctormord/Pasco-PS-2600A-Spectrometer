@@ -19,8 +19,9 @@ const SI = {
   DIFF:   5,                    // live − freeze      (magenta, absolute ADC)
   ENV:    6,                    // peak-hold envelope (yellow, absolute ADC)
   TRAIL0: 7,                    // persistence trail 0..PERSIST_N-1 (faded teal)
+  SRC:    7 + PERSIST_N,        // reference-source overlay (server-scaled, violet dashed)
 };
-const SERIES_COUNT = SI.TRAIL0 + PERSIST_N;   // 13 total (1 x + 12 y)
+const SERIES_COUNT = SI.SRC + 1;   // 14 total (1 x + 13 y)
 const emptyScopeData = () => Array.from({ length: SERIES_COUNT }, () => []);
 
 // ── Global state ─────────────────────────────────────────────
@@ -246,6 +247,7 @@ function handleFrame(msg) {
   // CSV background, freeze, difference, peak-hold envelope and the persistence
   // trail — all computed here so a single setData() draws everything in step.
   updateOverlays(msg.intensities);
+  try { RefOverlay.request(false); } catch (e) { /* overlay is optional */ }
 
   // Scope plot
   if (State.scopePlot && State.activeTab === 'scope') {
@@ -310,6 +312,9 @@ function buildScopeSeries() {
   s[SI.CSVBG] = {               // CSV background reference: cyan dashed, 0.9·Ymax
     stroke: '#38bdf8', width: 1.5, dash: [2, 4], spanGaps: true,
     points: { show: false },
+  };
+  s[SI.SRC] = {                 // reference-source overlay (lamp file), already in display unit
+    stroke: '#c084fc', width: 1.5, dash: [8, 4], spanGaps: true, points: { show: false },
   };
   s[SI.FREEZE] = {              // frozen snapshot: grey solid, absolute ADC
     stroke: '#9aa0a6', width: 1.5, spanGaps: true, points: { show: false },
@@ -677,6 +682,8 @@ function rebuildOverlays(live) {
   // CSV background reference (cyan) — interpolated onto the live axis,
   // normalised, scaled to 90% of the current Y max (like the library overlay).
   State.scopeData[SI.CSVBG] = State.csvbg ? buildCsvBgSeries(live) : nullArr();
+  // Reference-source overlay (values scaled by the server to the display unit).
+  State.scopeData[SI.SRC] = RefOverlay.series(live);
 
   // Frozen snapshot (grey) — kept in absolute ADC so drift against the live
   // trace is visible. Re-aligned to the current axis if the device changed.
@@ -1713,6 +1720,9 @@ function applyConfigToUI(cfg) {
   State.measureMode = !!cfg.measure_mode;
   $('#btn-peaks').classList.toggle('on', State.peaksOn);
   $('#btn-measure').classList.toggle('on', State.measureMode);
+  if ('scope_reference_overlay' in cfg || 'scope_reference_id' in cfg) {
+    try { RefOverlay.sync(); RefOverlay.request(true); } catch (e) { /* overlay is optional */ }
+  }
 }
 
 // Reset integration time to 20 ms (mirrors the desktop GUI's "20 ms" button).
@@ -2068,6 +2078,8 @@ async function init() {
     DataSec.init();
     WlCal.init();
     Cal.init();
+    Lin.init();
+    RefOverlay.init();
   } catch (e) {
     console.error('init: wiring controls failed', e);
   }
@@ -3236,6 +3248,85 @@ const CalRun = (() => {
     failed: ['bad', 'Failed'],
   };
 
+  // ── result detail renderers (checks, dark drift, verification) ──
+  const fnum = (v, d) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
+  function checksHtml(res) {
+    const ck = res.checks;
+    if (!ck || typeof ck !== 'object') return [];
+    const causes = res.causes || {};
+    const row = (name, pct, pass, nfail, cause, fallbackCause) => {
+      const cls = pass === false ? 'bad' : '';
+      const c = cause || fallbackCause;
+      const msg = c ? (typeof c === 'string' ? c : (c.message || c.dominant || '')) : '';
+      return `<tr class="${cls}"><td>${esc(name)}</td><td class="num">${fnum(pct, 2)} %</td>` +
+        `<td>${pass === true ? 'pass' : (pass === false ? 'FAIL' : 'n/a')}</td>` +
+        `<td class="num">${nfail == null ? '—' : esc(nfail)}</td><td class="msg">${esc(msg) || '—'}</td></tr>`;
+    };
+    return ['<div class="cr-sub">Checks</div><div class="tbl-wrap"><table class="mini-table">' +
+      '<thead><tr><th>Check</th><th>Deviation</th><th>Result</th><th>Masked pixels</th><th>Cause</th></tr></thead><tbody>' +
+      row('Stability', ck.stability_pct, ck.stability_pass, ck.stability_fail_pixels,
+          ck.stability_cause, causes.stability) +
+      row('Integration-time cross check', ck.itime_crosscheck_pct, ck.itime_pass,
+          ck.itime_fail_pixels, ck.itime_cause, causes.itime) +
+      '</tbody></table></div>'];
+  }
+  function darkDriftHtml(dd) {
+    if (!Array.isArray(dd) || !dd.length) return [];
+    return ['<div class="cr-sub">Dark drift (before / after)</div><div class="tbl-wrap"><table class="mini-table">' +
+      '<thead><tr><th>t_int</th><th>Mean</th><th>% of peak</th><th>Sigma</th><th></th></tr></thead><tbody>' +
+      dd.map((d) => `<tr class="${d.warn ? 'warn' : ''}">` +
+        `<td class="num">${d.integration_us != null ? fnum(d.integration_us / 1000, 2) + ' ms' : '—'}</td>` +
+        `<td class="num">${fnum(d.mean_counts, 1)} counts</td><td class="num">${fnum(d.pct_of_peak, 2)} %</td>` +
+        `<td class="num">${fnum(d.sigma_counts, 2)}</td><td>${d.warn ? '⚠ drift' : 'ok'}</td></tr>`).join('') +
+      '</tbody></table></div>'];
+  }
+  function verificationHtml(v) {
+    if (!v) return '';
+    const bands = Array.isArray(v.bands) ? v.bands : [];
+    const ov = v.overall || {};
+    let h = `<div class="cr-sub">Verification against ${esc(v.reference_name || 'reference')}` +
+      `${v.profile_label ? ' with ' + esc(v.profile_label) : ''} · ` +
+      `${v.pass === true ? 'pass' : (v.pass === false ? 'FAIL' : 'n/a')}</div>`;
+    h += '<div class="tbl-wrap"><table class="mini-table"><thead><tr><th>Band (nm)</th><th>Pixels</th>' +
+      '<th>Mean dev.</th><th>Max |dev.|</th><th></th></tr></thead><tbody>' +
+      (bands.length ? bands.map((b) => `<tr class="${b.warn ? 'warn' : ''}">` +
+        `<td class="num">${fnum(b.lo, 0)}–${fnum(b.hi, 0)}</td><td class="num">${esc(b.n)}</td>` +
+        `<td class="num">${fnum(b.mean_pct, 2)} %</td><td class="num">${fnum(b.max_abs_pct, 2)} %</td>` +
+        `<td>${b.warn ? '⚠' : ''}</td></tr>`).join('')
+        : '<tr><td class="empty" colspan="5">No bands.</td></tr>') +
+      '</tbody></table></div>';
+    h += `<div class="kv">Overall: rms ${fnum(ov.rms_pct, 2)} %, mean |dev.| ${fnum(ov.mean_abs_pct, 2)} %, ` +
+      `max |dev.| ${fnum(ov.max_abs_pct, 2)} %` +
+      (v.norm_range_nm ? ` · normalised at ${fnum(v.norm_range_nm[0], 0)}–${fnum(v.norm_range_nm[1], 0)} nm` : '') +
+      '</div>';
+    return h;
+  }
+
+  async function verifyAgain() {
+    const profileId = State.calSelection;
+    const referenceId = ($('#cr-ref') && $('#cr-ref').value) || State.cfg.scope_reference_id || '';
+    const st = $('#cr-result .cr-verify-status');
+    if (!profileId || profileId === 'None') { toast('Activate a calibration profile first'); return; }
+    if (!referenceId) { toast('Choose a reference source'); return; }
+    const { r, j } = await apiPost('/api/v1/calibration/verifications',
+      { profile_id: profileId, reference_id: referenceId });
+    if (!r.ok) { toast(errText(j, r), 4000); return; }
+    if (st) st.textContent = 'Verifying…';
+    Jobs.track(j.job.id, async (job, fin) => {
+      const s2 = $('#cr-result .cr-verify-status');
+      if (!fin) { if (s2) s2.textContent = job.status === 'waiting_for_user' ? 'Waiting for you (see dialog)…' : 'Verifying…'; return; }
+      if (job.status !== 'done') {
+        if (s2) s2.textContent = `Verification ${job.status}: ${(job.error && job.error.message) || ''}`;
+        return;
+      }
+      const { r: r2, j: v } = await apiJson('/api/v1/calibration/verification');
+      const host = $('#cr-result .cr-verif');
+      if (r2.ok && v && host) host.innerHTML = verificationHtml(v);
+      else if (r2.ok && v) $('#cr-result .cr-actions').insertAdjacentHTML('beforebegin', `<div class="cr-verif">${verificationHtml(v)}</div>`);
+      if (s2) s2.textContent = 'Verification finished.';
+    });
+  }
+
   function renderResult(job) {
     const host = $('#cr-result');
     const res = job.result || {};
@@ -3264,13 +3355,22 @@ const CalRun = (() => {
     } else if (pl && pl.pass) {
       extra.push('<div class="kv">Plausibility: passed.</div>');
     }
-    const ck = res.checks;
-    if (ck && typeof ck === 'object') {
-      const pf = (v) => v === true ? 'pass' : (v === false ? 'FAIL' : 'n/a');
-      const pct = (v) => (v == null || !isFinite(v)) ? '—' : `${Number(v).toFixed(2)} %`;
-      extra.push('<div><b>Checks</b></div><div class="kv">' +
-        `Stability: ${pct(ck.stability_pct)} (${pf(ck.stability_pass)})<br>` +
-        `Integration-time cross check: ${pct(ck.itime_crosscheck_pct)} (${pf(ck.itime_pass)})</div>`);
+    extra.push(...checksHtml(res));
+    extra.push(...darkDriftHtml(res.dark_drift));
+    const hints = pl && Array.isArray(pl.hints) ? pl.hints : [];
+    if (hints.length) {
+      extra.push('<div class="cr-sub">Plausibility hints</div><ul>' +
+        hints.map((h) => `<li>${esc(h)}</li>`).join('') + '</ul>');
+    }
+    if (res.verification) extra.push(`<div class="cr-verif">${verificationHtml(res.verification)}</div>`);
+    else if (res.verification_error) {
+      extra.push(`<div class="cr-verif"><div class="cr-sub">Verification</div>` +
+        `<div class="cr-hint">${esc(res.verification_error)}</div></div>`);
+    }
+    if (job.kind === 'calibration' && job.status === 'done') {
+      extra.push('<div class="cr-actions"><button data-verify-again="1" data-lock="control" ' +
+        'title="Measure the reference again with the active profile and compare">Verify again</button>' +
+        '<span class="kv cr-verify-status"></span></div>');
     }
     if (Array.isArray(res.valid_segments_nm) && res.valid_segments_nm.length) {
       extra.push('<div class="kv">Valid segments: ' + res.valid_segments_nm.map(
@@ -3340,6 +3440,7 @@ const CalRun = (() => {
     $('#cr-close').addEventListener('click', close);
     $('#cr-x').addEventListener('click', close);
     $('#cr-result').addEventListener('click', (e) => {
+      if (e.target.closest('[data-verify-again]')) { verifyAgain(); return; }
       const a = e.target.closest('[data-protocol]');
       if (a && jobId) {
         apiDownload(`/api/v1/calibration/runs/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.protocol}`,
@@ -3348,7 +3449,282 @@ const CalRun = (() => {
     });
   }
 
-  return { init, setRefs, setProfiles, isRunning: () => running, close };
+  return { init, setRefs, setProfiles, verificationHtml, isRunning: () => running, close };
+})();
+
+// ── Linearity panel (hardware test point 5) ──────────────────
+const Lin = (() => {
+  const L = '/api/v1/calibration/linearity';
+  let data = null, jobId = null, running = false;
+  const fnum = (v, d) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
+  const fmtDate = (s) => { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? String(s) : d.toLocaleString(); };
+  const rangeTxt = (r) => (Array.isArray(r) && r.length >= 2)
+    ? `${fnum(r[0], 0)}–${fnum(r[1], 0)} counts` : '—';
+
+  function renderState() {
+    const host = $('#lin-state');
+    const st = (data && data.state) || { state: 'none' };
+    const factory = st.state === 'factory';
+    $('#lin-factory-note').hidden = !factory;
+    $('#lin-start').textContent = factory ? 'Run linearity check' : 'Run linearity calibration';
+    let cls = 'ok', txt;
+    switch (st.state) {
+      case 'active': txt = `Linearity correction active${st.label ? ': ' + st.label : ''}` +
+        ` (valid ${rangeTxt(st.valid_range_counts)}).`; break;
+      case 'off': cls = 'warn'; txt = 'Linearity correction is switched off.'; break;
+      case 'factory': txt = 'Factory linearisation of the device is in use (no software correction).'; break;
+      default: cls = 'warn'; txt = 'No linearity correction available for this device.';
+    }
+    host.className = `cr-result ${cls}`;
+    host.textContent = txt;
+    host.hidden = false;
+    $('#lin-table-note').textContent = data && data.device
+      ? `${data.device}${data.serial ? ' · ' + data.serial : ''}` : 'no device';
+    $('#lin-off').disabled = st.state !== 'active';
+  }
+
+  function renderTable() {
+    const entries = (data && data.entries) || [];
+    const act = data && data.active_id;
+    const head = ['', 'Created', 'Mode', 'Valid range', 'Max dev.', 'RMS before → after', 'Degree', 'Steps', ''];
+    const t = $('#lin-table');
+    t.tHead.innerHTML = `<tr>${head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr>`;
+    t.tBodies[0].innerHTML = entries.length ? entries.map((e) =>
+      `<tr class="${e.id === act ? 'active' : ''}"><td>${e.id === act ? '●' : ''}</td>` +
+      `<td>${esc(fmtDate(e.created))}</td><td>${esc(e.mode || '—')}</td>` +
+      `<td>${esc(rangeTxt(e.valid_range_counts))}</td><td class="num">${fnum(e.max_deviation_pct, 2)} %</td>` +
+      `<td class="num">${fnum(e.rms_before_pct, 2)} → ${e.mode === 'check' ? '—' : fnum(e.rms_after_pct, 2)} %</td>` +
+      `<td class="num">${e.degree == null ? '—' : esc(e.degree)}</td><td class="num">${e.n_steps == null ? '—' : esc(e.n_steps)}</td>` +
+      `<td>${e.mode === 'check' || e.id === act ? '' :
+        `<button class="row-btn lin-act" data-lin-act="${esc(e.id)}" data-lock="control">Activate</button>`}</td></tr>`
+    ).join('') : `<tr><td class="empty" colspan="${head.length}">No linearity records for this device.</td></tr>`;
+    Access.applyLocks();
+  }
+
+  async function refresh() {
+    const { r, j } = await apiJson(L);
+    data = r.ok ? j : null;
+    renderState(); renderTable();
+  }
+
+  async function select(id) {
+    const { r, j } = await apiPost(`${L}/select`, { entry_id: id });
+    if (!r.ok) { toast(errText(j, r), 3500); return; }
+    toast(id ? 'Linearity record activated' : 'Linearity correction switched off');
+    refresh();
+    Cal.refresh();
+  }
+
+  function showIdle() {
+    $('#lin-form').hidden = false; $('#lin-run').hidden = true;
+    $('#lin-start').hidden = false; $('#lin-cancel').hidden = true;
+    $('#lin-close').hidden = false; $('#lin-x').hidden = false;
+  }
+  function showRunning() {
+    $('#lin-form').hidden = true; $('#lin-run').hidden = false; $('#lin-result').hidden = true;
+    $('#lin-start').hidden = true; $('#lin-cancel').hidden = false;
+    $('#lin-close').hidden = true; $('#lin-x').hidden = true;
+    $('#lin-bar').style.width = '0%';
+  }
+
+  async function start() {
+    const fixed = $('#lin-int-mode').value === 'fixed';
+    const ms = parseFloat($('#lin-int-ms').value);
+    if (fixed && !(ms > 0)) { toast('Enter a valid integration time'); return; }
+    const body = { integration_ms: fixed ? ms : 'auto', save: true, activate: true };
+    const steps = parseInt($('#lin-steps').value, 10);
+    const frames = parseInt($('#lin-frames').value, 10);
+    if (isFinite(steps)) body.steps = Math.max(6, Math.min(10, steps));
+    if (isFinite(frames)) body.frames = frames;
+    $('#lin-start').disabled = true;
+    const { r, j } = await apiPost(`${L}/runs`, body);
+    $('#lin-start').disabled = false;
+    if (!r.ok) { toast(errText(j, r), 4000); return; }
+    jobId = j.job.id; running = true;
+    showRunning();
+    Jobs.track(jobId, onJob);
+  }
+
+  function onJob(job, fin) {
+    $('#lin-bar').style.width = `${Math.round(100 * (Number(job.progress) || 0))}%`;
+    const st = $('#lin-status');
+    if (!fin) {
+      st.textContent = job.status === 'waiting_for_user'
+        ? 'Waiting for you (see dialog)…'
+        : `${String(job.step || 'running').replace(/_/g, ' ')} ${Math.round(100 * (Number(job.progress) || 0))}%`;
+      return;
+    }
+    running = false;
+    st.textContent = '';
+    showIdle();
+    renderResult(job);
+    refresh();
+    Cal.refresh();
+  }
+
+  function renderResult(job) {
+    const host = $('#lin-result');
+    const res = job.result || {};
+    let cls = 'ok', title, extra = [];
+    if (job.status === 'cancelled') { cls = 'warn'; title = 'Cancelled'; }
+    else if (job.status === 'failed') {
+      cls = 'bad'; title = 'Failed';
+      extra.push(`<div>${esc((job.error && job.error.message) || 'The job failed.')}</div>`);
+    } else {
+      const T = { saved: 'Saved and activated', check_saved: 'Check measurement saved (no correction applied)',
+                  computed: 'Computed (not saved)', failed: 'Linearity fit failed' };
+      title = T[res.status] || res.status || 'Finished';
+      if (res.status === 'failed') cls = 'bad';
+      else if (res.status === 'computed') cls = 'warn';
+      const m = (res.result && res.result.model) || {};
+      const lamp = (res.result && res.result.lamp) || {};
+      const rows = [
+        ['Mode', res.mode], ['Max deviation', m.max_deviation_pct != null ? fnum(m.max_deviation_pct, 2) + ' %' : null],
+        ['RMS before', m.rms_before_pct != null ? fnum(m.rms_before_pct, 2) + ' %' : null],
+        ['RMS after', res.mode === 'check' || m.rms_after_pct == null ? null : fnum(m.rms_after_pct, 2) + ' %'],
+        ['Valid fraction', m.valid_range_frac != null ? fnum(100 * m.valid_range_frac, 0) + ' %' : null],
+        ['Degree', m.degree], ['Lamp drift', lamp.drift_pct != null ? fnum(lamp.drift_pct, 2) + ' %' : null],
+      ].filter((x) => x[1] != null && x[1] !== '');
+      if (rows.length) extra.push('<div class="kv">' + rows.map(
+        ([k, v]) => `${esc(k)}: ${esc(v)}`).join('<br>') + '</div>');
+      const warns = [].concat(res.warnings || [], (res.result && res.result.warnings) || []);
+      if (warns.length) extra.push('<div class="cr-sub">Warnings</div><ul>' +
+        [...new Set(warns)].map((w) => `<li>${esc(w)}</li>`).join('') + '</ul>');
+      const prot = Array.isArray(res.protocol) ? res.protocol.map((x) => String(x).toLowerCase()) : [];
+      const links = [];
+      if (prot.some((x) => x.endsWith('.pdf'))) links.push(['pdf', 'Protocol (PDF)']);
+      if (prot.some((x) => x.endsWith('.csv'))) links.push(['csv', 'Protocol (CSV)']);
+      if (links.length) extra.push('<div style="margin-top:6px">' + links.map(
+        ([f, t]) => `<a data-lin-protocol="${f}">⤓ ${t}</a>`).join('') + '</div>');
+      if (res.protocol_message) extra.push(`<div class="kv">${esc(res.protocol_message)}</div>`);
+    }
+    host.className = `cr-result ${cls}`;
+    host.innerHTML = `<h4>${esc(title)}</h4>${extra.join('')}`;
+    host.hidden = false;
+  }
+
+  function open() {
+    showModal('lin-dialog', true);
+    if (!running) showIdle();
+    refresh();
+  }
+  function close() { if (!running) showModal('lin-dialog', false); }
+
+  function init() {
+    $('#lin-open').addEventListener('click', open);
+    $('#lin-close').addEventListener('click', close);
+    $('#lin-x').addEventListener('click', close);
+    $('#lin-start').addEventListener('click', start);
+    $('#lin-off').addEventListener('click', () => select(null));
+    $('#lin-int-mode').addEventListener('change', () => {
+      $('#lin-int-ms').disabled = $('#lin-int-mode').value !== 'fixed';
+    });
+    $('#lin-cancel').addEventListener('click', async () => {
+      if (jobId && window.confirm('Cancel the running job?')) await Jobs.cancel(jobId);
+    });
+    $('#lin-table').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-lin-act]');
+      if (b) select(b.dataset.linAct);
+    });
+    $('#lin-result').addEventListener('click', (e) => {
+      const a = e.target.closest('[data-lin-protocol]');
+      if (a && jobId) {
+        apiDownload(`${L}/runs/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.linProtocol}`,
+                    `linearity_protocol.${a.dataset.linProtocol}`);
+      }
+    });
+  }
+  return { init, refresh };
+})();
+
+// ── Scope: reference overlay (hardware test points 3/4) ──────
+const RefOverlay = (() => {
+  const MIN_GAP_MS = 1500;
+  let data = null, key = '', busy = false, lastAt = 0, timer = null;
+
+  const enabled = () => !!State.cfg.scope_reference_overlay;
+  const selEl = () => $('#scope-ref-select');
+  const refId = () => State.cfg.scope_reference_id || (selEl() ? selEl().value : '') || '';
+
+  function sync() {
+    const b = $('#btn-refoverlay'), sel = selEl();
+    if (b) b.classList.toggle('on', enabled());
+    if (sel) {
+      if (State.cfg.scope_reference_id && sel.value !== State.cfg.scope_reference_id &&
+          [...sel.options].some((o) => o.value === State.cfg.scope_reference_id)) {
+        sel.value = State.cfg.scope_reference_id;
+      }
+      sel.disabled = !sel.options.length;
+    }
+  }
+
+  async function loadRefs() {
+    const sel = selEl();
+    if (!sel) return;
+    const { r, j } = await apiJson('/api/v1/calibration/references');
+    const list = (r.ok && Array.isArray(j)) ? j : [];
+    sel.innerHTML = '';
+    for (const s of list) sel.appendChild(new Option(s.name, s.id));
+    sync();
+    if (enabled()) request(true);
+  }
+
+  // Called per frame and on unit changes; throttled to one request per MIN_GAP_MS.
+  function request(force) {
+    if (!enabled() || !refId()) return;
+    const now = Date.now();
+    const k = `${refId()}|${State.unit}|${State.unitLabel}`;
+    if (!force && k === key && now - lastAt < MIN_GAP_MS * 2) return;
+    if (busy || now - lastAt < MIN_GAP_MS) {
+      if (!timer) timer = setTimeout(() => { timer = null; request(force); }, MIN_GAP_MS);
+      return;
+    }
+    fetchOverlay(k);
+  }
+
+  async function fetchOverlay(k) {
+    busy = true; lastAt = Date.now();
+    try {
+      const { r, j } = await apiJson(
+        `/api/v1/calibration/reference-overlay?reference_id=${encodeURIComponent(refId())}`);
+      data = (r.ok && j && Array.isArray(j.wavelengths)) ? j : null;
+      key = k;
+    } catch (e) { data = null; }
+    busy = false;
+    refreshScopeOverlay();
+  }
+
+  // Series on the current live axis; the server already scaled the values.
+  function series(live) {
+    const n = live ? live.length : 0;
+    const xs = State.scopeData[SI.X];
+    if (!enabled() || !data || !xs || xs.length !== n || !n) return new Array(n).fill(null);
+    if (data.wavelengths.length === n) {
+      return data.values.map((v) => (v == null || !isFinite(v)) ? null : v);
+    }
+    return interpToAxis(data.wavelengths, data.values, xs);
+  }
+
+  function setEnabled(on) {
+    const partial = { scope_reference_overlay: !!on };
+    if (on && selEl() && selEl().value) partial.scope_reference_id = selEl().value;
+    pushCfg(partial);
+    if (!on) data = null;
+    sync();
+    if (on) request(true); else refreshScopeOverlay();
+  }
+
+  function init() {
+    $('#btn-refoverlay')?.addEventListener('click', () => setEnabled(!enabled()));
+    selEl()?.addEventListener('change', (e) => {
+      pushCfg({ scope_reference_id: e.target.value });
+      data = null;
+      if (enabled()) request(true);
+    });
+    loadRefs();
+  }
+
+  return { init, sync, request, series };
 })();
 
 // ── Data section: export folder / file-name template (P-07) ──

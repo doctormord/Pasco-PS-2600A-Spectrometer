@@ -223,6 +223,12 @@ class DemoSpectrometer(BaseSpectrometer):
         self._dark_bias     = DEMO_DARK_BIAS
         self._dark_current  = DEMO_DARK_CURRENT
         self._knee_counts   = DEMO_SOFT_KNEE_FRAC * DEMO_ADC_MAX
+        # Optional test effects (config demo_nonlinearity / demo_dark_drift):
+        # response = n·(1 + beta·n/FS) on the photo signal, and a dark offset
+        # that drifts linearly in time (counts per second since connect).
+        self._nl_beta       = 0.0
+        self._dark_drift    = 0.0
+        self._t_connect     = time.monotonic()
 
         # Peak signal counts gained per ms of exposure (set in connect).
         self._gain_per_ms = DEMO_FULLSCALE_FRAC * DEMO_ADC_MAX / DEMO_FULLSCALE_MS
@@ -253,6 +259,9 @@ class DemoSpectrometer(BaseSpectrometer):
         self._knee_counts = max(0.0, min(1.0, knee_frac)) * DEMO_ADC_MAX
         fullscale_ms = max(1.0, float(Config.get("demo_fullscale_ms", DEMO_FULLSCALE_MS)))
         self._gain_per_ms = DEMO_FULLSCALE_FRAC * DEMO_ADC_MAX / fullscale_ms
+        self._nl_beta = float(Config.get("demo_nonlinearity", 0.0) or 0.0)
+        self._dark_drift = float(Config.get("demo_dark_drift", 0.0) or 0.0)
+        self._t_connect = time.monotonic()
 
         spec_name = str(Config.get("demo_spectrum", "led_white"))
         sens = str(Config.get("demo_sensitivity", "none"))
@@ -327,9 +336,14 @@ class DemoSpectrometer(BaseSpectrometer):
         t_ms = t_us / 1000.0
         dark_current = self._dark_current * t_ms          # accumulates with t
         dark   = self._dark_bias + dark_current
+        if self._dark_drift:
+            dark = dark + self._dark_drift * (time.monotonic() - self._t_connect)
         signal = self._shape * self._gain_per_ms * t_ms   # photo-signal
         if self._shutter_closed:
             signal = np.zeros_like(signal)                 # true dark frame
+        if self._nl_beta:
+            n = signal + dark_current
+            signal = n * (1.0 + self._nl_beta * n / DEMO_ADC_MAX) - dark_current
         ideal  = dark + signal
         # Shot noise ∝ sqrt(photo-signal + dark-current counts); read noise fixed.
         sigma  = (np.sqrt(np.maximum(signal + dark_current, 0.0)) * self._shot_noise

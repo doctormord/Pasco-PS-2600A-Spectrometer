@@ -325,6 +325,30 @@ class CalibrationRunRequest(_M):
     save_on_failed_checks: bool = Field(False, description="Save although the stability / "
                                         "t_int cross check failed")
     activate: bool = True
+    verify: bool = Field(True, description="After saving: measure the reference source "
+                                           "with the new profile through the live pipeline "
+                                           "and report the deviation per 50-nm band")
+
+
+class VerificationRequest(_M):
+    profile_id: str
+    reference_id: str
+    integration_ms: Optional[float] = Field(None, gt=0, description="Default: t_int of the profile")
+    frames: Optional[int] = Field(None, ge=1, le=1000)
+
+
+class LinearityRunRequest(_M):
+    integration_ms: Optional[Union[float, Literal["auto"]]] = Field(
+        "auto", description="Probe exposure; 'auto' = auto exposure to ~50 % FS")
+    steps: Optional[int] = Field(None, ge=6, le=10, description="Number of integration times")
+    frames: Optional[int] = Field(None, ge=2, le=1000)
+    save: bool = True
+    activate: bool = Field(True, description="Activate the new correction (not for check "
+                                             "measurements on devices with factory linearisation)")
+
+
+class LinearitySelectRequest(_M):
+    entry_id: Optional[str] = Field(None, description="Linearity record to activate; null = off")
 
 
 # ── reports ──────────────────────────────────────────────────────────────

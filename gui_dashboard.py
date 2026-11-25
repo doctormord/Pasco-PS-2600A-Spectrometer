@@ -576,6 +576,11 @@ class DashboardWindow(QMainWindow):
             pen=pg.mkPen(QColor(T().WARN), width=1.5, style=Qt.PenStyle.DashLine))
         self.reference_curve.setVisible(False)
 
+        # Verified reference (engine.reference_overlay) — dashed, on every frame
+        self.scope_ref_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor(T().ACCENT), width=1.5, style=Qt.PenStyle.DashLine))
+        self.scope_ref_curve.setVisible(False)
+
         # ── Out-of-spec shading ────────────────────────────────────────────
         # Two translucent-red bands mark where the device still returns data but
         # the manufacturer no longer guarantees it (left of spec-min, right of
@@ -1083,6 +1088,14 @@ class DashboardWindow(QMainWindow):
         if idx >= 0:
             self.combo_reference.setCurrentIndex(idx)
 
+        # Scope reference overlay (reference source, scaled onto the display)
+        self.button_scope_ref = ToggleSwitch(bool(Config.get("scope_reference_overlay", False)))
+        self.button_scope_ref.toggled.connect(self.toggle_scope_reference)
+        self.combo_scope_ref = QComboBox()
+        self.combo_scope_ref.setFixedWidth(170)
+        self._fill_scope_reference_combo()
+        self.combo_scope_ref.currentIndexChanged.connect(self._scope_reference_picked)
+
         # Fixed (non-scrolling) acquisition controls, in the header.
         for _lbl, _sub, _ctl in [
             ("Exposure",      "ms", [self.button_exposure_reset, self.spinbox_exposure]),
@@ -1137,6 +1150,8 @@ class DashboardWindow(QMainWindow):
             ("Wavelength range", "nm", [self.spinbox_x_min, self.spinbox_x_max]),
             ("Auto-scale Y",     None, self.button_auto_y_axis),
             ("Y max",            "ADC", [self.button_y_snap, self.spinbox_y_max]),
+            ("Reference overlay", None, self.button_scope_ref),
+            ("Overlay source",    None, self.combo_scope_ref),
         ])
 
         # ─── Processing ───
@@ -2125,6 +2140,62 @@ class DashboardWindow(QMainWindow):
         self.image_item.setTransform(transform)
         self.heatmap_canvas.setXRange(
             self.heatmap_linear_waves[0], self.heatmap_linear_waves[-1], padding=0)
+
+    # ── scope reference overlay (core: engine.reference_overlay) ───────────
+    def _fill_scope_reference_combo(self) -> None:
+        """Reference sources of the library; the selection follows the config
+        key scope_reference_id (the verification sets it)."""
+        import reference_sources as rs
+        want = str(Config.get("scope_reference_id", "") or "")
+        cb = self.combo_scope_ref
+        cb.blockSignals(True)
+        cb.clear()
+        try:
+            srcs = rs.ReferenceLibrary().list()
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[dashboard] reference library not readable: {e}")
+            srcs = []
+        for src in srcs:
+            label = f"{src.name} ({src.serial})" if src.serial else src.name
+            cb.addItem(label, src.id)
+            cb.setItemData(cb.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
+        i = cb.findData(want) if want else -1
+        if i >= 0:
+            cb.setCurrentIndex(i)
+        cb.blockSignals(False)
+
+    def sync_scope_reference(self) -> None:
+        """Re-read scope_reference_id and the library (after a verification)."""
+        self._fill_scope_reference_combo()
+        self._update_scope_reference(self.engine.last_frame)
+
+    def toggle_scope_reference(self, checked: bool) -> None:
+        Config.set("scope_reference_overlay", bool(checked))
+        self._update_scope_reference(self.engine.last_frame)
+
+    def _scope_reference_picked(self, *_):
+        rid = self.combo_scope_ref.currentData()
+        Config.set("scope_reference_id", rid or "")
+        self._update_scope_reference(self.engine.last_frame)
+
+    def _update_scope_reference(self, ev) -> None:
+        """Dashed reference curve for the values the scope plots right now
+        (ev.pixels in ev.unit)."""
+        curve = self.scope_ref_curve
+        rid = self.combo_scope_ref.currentData()
+        if ev is None or not rid or not Config.get("scope_reference_overlay", False):
+            curve.setVisible(False)
+            return
+        try:
+            y = self.engine.reference_overlay(rid, ev.wavelengths, ev.pixels, ev.unit)
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[dashboard] reference overlay failed: {e}")
+            y = None
+        if y is None:
+            curve.setVisible(False)
+            return
+        curve.setData(ev.wavelengths, y, connect="finite")
+        curve.setVisible(True)
 
     def _update_reference_curve_scale(self, name: str | None = None) -> None:
         """Scale reference curve to 90% of the current visible Y maximum."""
@@ -3178,6 +3249,7 @@ class DashboardWindow(QMainWindow):
             self.spectrum_curve.setData(self.active_wavelengths,
                                         self.current_averaged_pixels, connect="finite")
         self.spectrum_fill.setData(self.active_wavelengths, disp)
+        self._update_scope_reference(ev)
         if self.reference_curve.isVisible():
             self._update_reference_curve_scale()
         self._advance_overlays(disp)
@@ -3275,6 +3347,8 @@ class DashboardWindow(QMainWindow):
                 ax.setPen(pg.mkPen(QColor(p.BORDER2), width=1))
                 ax.setTextPen(pg.mkPen(QColor(p.FG3)))
         self.spectrum_curve.setPen(pg.mkPen(QColor(p.FG1), width=1.4))
+        self.scope_ref_curve.setPen(pg.mkPen(QColor(p.ACCENT), width=1.5,
+                                             style=Qt.PenStyle.DashLine))
         self.reference_curve.setPen(pg.mkPen(QColor(p.WARN), width=1.5,
                                              style=Qt.PenStyle.DashLine))
         self.scatter_peaks.setBrush(pg.mkBrush(p.ACCENT))

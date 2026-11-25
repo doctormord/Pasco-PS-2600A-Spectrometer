@@ -14,6 +14,13 @@ api_v1_calibration.py — /api/v1 calibration endpoints.
   POST /calibration/derivations         derive new optics from a known profile (auth, 202)
   POST /calibration/references          import a lamp file (auth)
   DELETE /calibration/references/{id}   remove an imported lamp (auth; not an MCP tool)
+  POST /calibration/verifications       verify a profile against a reference (auth, 202)
+  GET  /calibration/verification        last verification result
+  GET  /calibration/reference-overlay   reference curve scaled to the current display
+  GET  /calibration/linearity           linearity state + records of the connected unit
+  POST /calibration/linearity/runs      linearity calibration / check (auth, 202)
+  POST /calibration/linearity/select    activate a linearity record or switch off (auth)
+  GET  /calibration/linearity/runs/{job_id}/protocol?format=pdf|csv
 
 Deleting profiles / darks is intentionally not offered. User steps (cover /
 uncover) of a run use the generic job endpoints (continue / cancel).
@@ -143,6 +150,89 @@ def register(router: APIRouter, ctx: V1Context) -> None:
         path = paths[0]
         return FileResponse(path, media_type="application/pdf" if format == "pdf" else "text/csv",
                             filename=os.path.basename(path))
+
+    # ── verification (hardware test point 6) ──────────────────────────────
+    @router.post("/calibration/verifications", tags=["calibration"], dependencies=auth,
+                 status_code=202,
+                 summary="Measure the reference source with a profile through the live "
+                         "pipeline and compare with the reference file (job)")
+    async def start_verification(body: M.VerificationRequest, request: Request):
+        job = await ctx.call(engine.submit_verification, body.model_dump(),
+                             owner=ctx.owner(request))
+        return ctx.job_response(job)
+
+    @router.get("/calibration/verification", tags=["calibration"],
+                summary="Last verification result (deviation per 50-nm band)")
+    async def last_verification(curve: bool = False):
+        v = engine.last_verification
+        if v is None:
+            raise ApiError(404, "not_found", "No verification has been run yet.")
+        return json_safe(v if curve else {k: x for k, x in v.items() if k != "curve"})
+
+    @router.get("/calibration/reference-overlay", tags=["calibration"],
+                summary="Reference curve on the axis, scaled to the current display")
+    async def reference_overlay(reference_id: Optional[str] = None):
+        rid = reference_id or engine.cfg.get("scope_reference_id", "")
+        ev = engine.last_frame
+        if ev is None:
+            raise ApiError(404, "not_found", "No frame yet.")
+        disp = getattr(ev, "display", None)
+        dunit = getattr(ev, "display_unit", None) or ev.unit
+        y = engine.reference_overlay(rid, ev.wavelengths,
+                                     ev.pixels if disp is None else disp, dunit)
+        if y is None:
+            raise ApiError(404, "not_found", f"Reference {rid!r} not available.")
+        return json_safe({"reference_id": rid, "unit": dunit,
+                          "wavelengths": [round(float(w), 3) for w in ev.wavelengths],
+                          "values": y})
+
+    # ── linearity (hardware test point 5) ─────────────────────────────────
+    @router.get("/calibration/linearity", tags=["calibration"],
+                summary="Linearity state and stored records of the connected unit")
+    async def linearity_state():
+        import calibration_linearity as cl
+        dev, serial, _fp = engine.calibration_context()
+        entries = [cl.entry_summary(e) for e in cl.entries_for(dev, serial)] if dev else []
+        return json_safe({"device": dev, "serial": serial,
+                          "state": engine.linearity_info,
+                          "active_id": cl.active_id(dev, serial) if dev else None,
+                          "entries": entries})
+
+    @router.post("/calibration/linearity/runs", tags=["calibration"], dependencies=auth,
+                 status_code=202,
+                 summary="Linearity calibration (or check on devices with a factory "
+                         "linearisation) as a job with cover/uncover user steps")
+    async def start_linearity(body: M.LinearityRunRequest, request: Request):
+        params = body.model_dump()
+        if params.get("integration_ms") == "auto":
+            params["integration_ms"] = None
+        job = await ctx.call(engine.submit_linearity, params, owner=ctx.owner(request))
+        return ctx.job_response(job)
+
+    @router.post("/calibration/linearity/select", tags=["calibration"], dependencies=auth,
+                 summary="Activate a linearity record of this unit (null = off)")
+    async def select_linearity(body: M.LinearitySelectRequest, request: Request):
+        info = await ctx.call(engine.select_linearity, body.entry_id,
+                              owner=ctx.owner(request))
+        return json_safe({"ok": True, "state": info})
+
+    @router.get("/calibration/linearity/runs/{job_id}/protocol", tags=["calibration"],
+                summary="Protocol file (PDF or CSV) written by a linearity job")
+    async def linearity_protocol(job_id: str,
+                                 format: str = Query("pdf", pattern="^(pdf|csv)$")):
+        try:
+            job = engine.jobs.get(job_id)
+        except NotFound:
+            raise ApiError(404, "not_found", f"Job {job_id!r} not found.")
+        if job.kind != "linearity":
+            raise ApiError(404, "not_found", f"Job {job_id!r} is not a linearity job.")
+        res = job.result if isinstance(job.result, dict) else {}
+        paths = [p for p in (res.get("protocol") or [])
+                 if str(p).lower().endswith("." + format)]
+        if not paths or not os.path.isfile(paths[0]):
+            raise ApiError(404, "not_found", f"No {format} protocol for job {job_id!r}.")
+        return FileResponse(paths[0], media_type="application/pdf" if format == "pdf"
+                            else "text/csv", filename=os.path.basename(paths[0]))
 
     # ── derivation (new optics from a known profile) ──────────────────────
     @router.post("/calibration/derivations", tags=["calibration"], dependencies=auth,

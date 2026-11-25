@@ -124,6 +124,7 @@ REMOTE_FORBIDDEN_KEYS = frozenset({
     "remote_token", "remote_lan", "remote_port", "remote_enabled",
     "remote_require_token_local", "calibration_profiles_file",
     "reference_sources_file", "dark_spectra_file", "heatmap_autosave_dir",
+    "linearity_profiles_file",
 })
 # Writable remotely only when token protection is active (server paths).
 REMOTE_TOKEN_ONLY_KEYS = frozenset({"export_dir"})

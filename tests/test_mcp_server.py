@@ -27,6 +27,7 @@ EXPECTED_TOOLS = {
     "get_spectrum", "analyze_color", "find_peaks", "analyze_filter", "list_profiles",
     "select_profile", "calibration_status", "list_references", "start_calibration",
     "export_measurement", "create_report",
+    "verify_profile", "linearity_status", "start_linearity",
 }
 LIMIT = 8 * 1024
 

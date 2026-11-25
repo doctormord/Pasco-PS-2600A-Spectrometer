@@ -30,6 +30,7 @@ def isolated_config(tmp_path, monkeypatch):
     cfg._data["calibration_profiles_file"] = str(tmp_path / "calibration_profiles.json")
     cfg._data["reference_sources_file"] = str(tmp_path / "reference_sources.json")
     cfg._data["dark_spectra_file"] = str(tmp_path / "dark_spectra.json")
+    cfg._data["linearity_profiles_file"] = str(tmp_path / "linearity_profiles.json")
     # Exports / reports saved by the server (save=true, autosave) → tmp,
     # never the program folder.
     cfg._data["export_dir"] = str(tmp_path / "exports")

@@ -71,7 +71,7 @@ def test_dialog_has_all_tabs(qapp, msgbox):
     dlg = _dialog(FakeDashboard())
     titles = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
     assert titles == ["Wavelength", "Spectral calibration", "Profiles", "Lamps",
-                      "Response (legacy)"]
+                      "Linearity", "Response (legacy)"]
     w = dlg.tab_wizard
     # absolute is disabled for a bare fibre
     w.cmb_input.setCurrentText("bare")

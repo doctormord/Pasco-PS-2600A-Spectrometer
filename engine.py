@@ -46,6 +46,7 @@ from typing import Any, Callable
 import numpy as np
 
 import calibration_capture as cc
+import calibration_linearity as callin
 import calibration_profiles as calprof
 import color_science as cs
 import device_manager as dm
@@ -514,6 +515,9 @@ class Engine:
 
         # processed state
         self.calib = calprof.CalibrationRuntime()
+        self.linearity_info: dict = {"state": callin.STATE_NONE, "label": "n/a"}
+        self.last_verification: dict | None = None
+        self._overlay_cache: dict = {}
         self.current_pixels = np.zeros(self.pixel_count)
         self.current_raw = np.zeros(self.pixel_count)
         self.current_pre_response = np.zeros(self.pixel_count)
@@ -814,6 +818,7 @@ class Engine:
             self.last_frame = None
             self.spectrum_history.clear()
             self._reset_heatmap()
+            self._install_linearity(backend, backend_name)
             self._rebuild_calibration(backend)
 
     def _reset_device_params(self) -> None:
@@ -827,6 +832,7 @@ class Engine:
             self.supports_ob = True
             self.spec_range_nm = (None, None)
             self.calib = calprof.CalibrationRuntime()
+            self.linearity_info = {"state": callin.STATE_NONE, "label": "n/a"}
             self.current_unit = "counts"
             self.current_pixels = np.zeros(self.pixel_count)
             self.current_raw = np.zeros(self.pixel_count)
@@ -982,6 +988,50 @@ class Engine:
                 self.calib.wl = np.asarray(self.wavelength_array, float)
                 self.calib.refresh()
 
+    def _install_linearity(self, backend, backend_name: str) -> None:
+        """Install the unit's linearity correction on the backend (applied to
+        every frame directly after the driver, see calibration_linearity)."""
+        if backend is None:
+            self.linearity_info = {"state": callin.STATE_NONE, "label": "n/a"}
+            return
+        try:
+            fn, info = callin.runtime_for(backend, backend_name)
+        except Exception as e:                                   # noqa: BLE001
+            print(f"[engine] linearity correction not loaded: {e!r}")
+            fn, info = None, {"state": callin.STATE_NONE, "label": "off",
+                              "error": str(e)}
+        try:
+            backend.set_linearizer(fn)
+        except AttributeError:
+            pass
+        backend.linearity_info = info
+        self.linearity_info = info
+
+    def reload_linearity(self) -> dict:
+        """Re-read the active linearity correction (after a linearity run or a
+        selection change) and re-resolve the calibration (linearity hint)."""
+        with self._lock:
+            b = self.acquisition
+            self._install_linearity(b, self.device_name)
+            self.spectrum_history.clear()
+            self.fusion.reset()
+            self._rebuild_calibration()
+        st = self.calibration_status()
+        self._emit("calibration", st)
+        return dict(self.linearity_info)
+
+    def select_linearity(self, entry_id: str | None, *, owner: str | None = LOCAL) -> dict:
+        """Activate a stored linearity correction of this unit (None = off)."""
+        self.check_control(owner)
+        b = self._require_backend()
+        try:
+            callin.set_active(self.device_name, getattr(b, "serial", None), entry_id)
+        except KeyError:
+            raise NotFound(f"Linearity record '{entry_id}' not found.")
+        except ValueError as e:
+            raise Unprocessable(str(e))
+        return self.reload_linearity()
+
     def rebuild_calibration(self) -> dict:
         """Re-resolve the active selection (after a profile was saved, deleted,
         imported or selected) and apply it live."""
@@ -994,6 +1044,7 @@ class Engine:
     def calibration_status(self) -> dict:
         st = json_safe(dict(self.calib.status))
         st["display_unit"] = self.current_unit
+        st["linearity"] = json_safe(dict(self.linearity_info or {}))
         return st
 
     def calibration_context(self) -> tuple[str, str | None, str | None]:
@@ -1364,6 +1415,7 @@ class Engine:
             "Dark / baseline": (f"{ob:.0f} ADC" if ob is not None else None),
             "Peak ADC":        (f"{peak_adc:.0f}" if peak_adc is not None else None),
             "Calibration":     prof,
+            "Linearity correction": callin.onoff_na(self.linearity_info),
         }
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1475,7 +1527,8 @@ class Engine:
                        "serial": getattr(b, "serial", None),
                        "device_path": self.connected_device_path,
                        "wl_fingerprint": cap.wl_fingerprint,
-                       "nl_correction": calprof.device_nl_active(b)},
+                       "nl_correction": calprof.device_nl_active(b),
+                       "linearity": callin.profile_linearity_tag(self.linearity_info)},
             "acquisition": {"integration_us": int(cap.integration_us),
                             "integration_ms": cap.integration_us / 1000.0,
                             "auto_exposure": auto, "frames": int(cap.n_frames),
@@ -1648,9 +1701,11 @@ class Engine:
 
     def submit_calibration(self, params: dict, *, owner: str) -> Job:
         """Calibration run (relative / absolute) with the fixed wizard order:
-        wavelength check → t_int → darks (cover) → calibration spectrum +
-        stability (uncover) → t_int cross check → compute + plausibility →
-        save (+ activate) → protocol (PDF + CSV)."""
+        wavelength check → t_int → darks before (cover) → calibration spectrum
+        + repeat (uncover) → t/2 capture → darks after (cover / uncover) →
+        per-pixel checks + cause model → compute + plausibility → save
+        (+ activate) → verification through the live pipeline → protocol
+        (PDF + CSV)."""
         import calibration_workflow as cw
         import reference_sources as rs
         b = self._require_backend()
@@ -1670,7 +1725,7 @@ class Engine:
 
         def run(ctx: JobContext):
             res: dict = {"status": "failed", "profile_ids": [], "protocol": []}
-            steps = 8
+            steps = 10
 
             def prog(i, msg, step):
                 ctx.progress(i / steps, msg, step=step)
@@ -1704,9 +1759,26 @@ class Engine:
                 res["stability"] = json_safe(cal.get("stability"))
                 prog(4, "integration-time cross check", "crosscheck")
                 cx = wf.crosscheck_integration()
-                res["crosscheck"] = json_safe({k: v for k, v in cx.items()
-                                               if k in ("skipped", "pass", "crosscheck")})
-                prog(5, "computing", "compute")
+                prog(5, "dark spectra after the light captures", "dark_after")
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the lamp again. The "
+                                      "dark spectra AFTER the light captures are taken "
+                                      "next.", action="cover")
+                ctx.check()
+                ev = wf.capture_darks_after()
+                self.calib.invalidate_darks()
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the lamp (for "
+                                      "the verification measurement).", action="uncover")
+                res["dark_drift"] = json_safe(ev.get("drift"))
+                res["stability"] = json_safe(wf.checks.get("stability_detail"))
+                res["crosscheck"] = json_safe({
+                    "skipped": cx.get("skipped", False), "pass": wf.checks.get("itime_pass"),
+                    "crosscheck": wf.checks.get("itime_detail")})
+                res["causes"] = json_safe({k: {"dominant": v.get("dominant"),
+                                               "message": v.get("message")}
+                                           for k, v in wf.causes.items()})
+                prog(6, "computing", "compute")
                 try:
                     r = wf.compute()
                 except ValueError as e:
@@ -1716,7 +1788,7 @@ class Engine:
                 res["gain_span"] = json_safe(r.get("gain_span"))
                 res["plausibility"] = json_safe(wf.plausibility)
                 res["checks"] = json_safe(wf.checks)
-                prog(6, "saving", "save")
+                prog(7, "saving", "save")
                 activate = bool(p.get("activate", True))
                 if not wf.plausible:
                     if not p.get("allow_implausible"):
@@ -1737,17 +1809,218 @@ class Engine:
                     calprof.set_active_selection(wf.backend_name, saved[0]["id"])
                     res["activated"] = saved[0]["id"]
                 self.rebuild_calibration()
+                if p.get("verify", True):
+                    prog(8, "verification: reference through the live pipeline",
+                         "verification")
+                    try:
+                        ver = self.verify_profile(saved[0]["id"], ref.id, ctx=ctx,
+                                                  owner=None)
+                        wf.verification = ver
+                        res["verification"] = json_safe(
+                            {k: v for k, v in ver.items() if k != "curve"})
+                    except JobCancelled:
+                        raise
+                    except Exception as e:                       # noqa: BLE001
+                        wf.warnings.append(f"Verification failed: {e}")
+                        res["verification_error"] = str(e)
                 return res
             finally:
                 res["warnings"] = list(wf.warnings)
                 if wf.result is not None or res.get("status") == "failed":
                     try:
-                        ctx.progress(7 / steps, "writing the protocol", step="protocol")
+                        ctx.progress(9 / steps, "writing the protocol", step="protocol")
                     except JobCancelled:
                         pass
                     res["protocol"], res["protocol_message"] = self._write_protocol(wf)
                 ctx.job.result = res
         return self.jobs.submit("calibration", run, p, owner)
+
+    # ── verification of a saved profile (point 6 of the hardware test) ────
+    def verify_profile(self, profile_id: str, reference_id: str, *,
+                       frames: int | None = None, integration_ms: float | None = None,
+                       ctx: JobContext | None = None, owner: str | None = LOCAL) -> dict:
+        """Measure the reference source WITH profile `profile_id` through the
+        live pipeline (frame-tap capture → processing.process_frame with the
+        same kwargs as the live display, stored dark at t_int) and compare it
+        with the reference file (calibration_workflow.verify_against_reference:
+        normalised, per 50-nm band and overall; absolute profiles also
+        unnormalised). The result is kept as last_verification (scope overlay)."""
+        import calibration_workflow as cw
+        import reference_sources as rs
+        self.check_control(owner)
+        self._require_backend()
+        ref = rs.ReferenceLibrary().get(str(reference_id))
+        if ref is None:
+            raise NotFound(f"Reference source '{reference_id}' not found.")
+        prof = calprof.get_profile_by_id(str(profile_id))
+        if prof is None:
+            raise NotFound(f"Profile '{profile_id}' not found.")
+        if prof.get("apply") != calprof.APPLY_V2:
+            raise Unprocessable("Only v2 profiles (wizard) can be verified.")
+        t_us = (int(float(integration_ms) * 1000) if integration_ms
+                else int((prof.get("acquisition") or {}).get("integration_us") or 0))
+        mp = {"frames": int(frames or self.cfg.get("calibration_capture_frames", 16)),
+              "dark": "stored", "include_color": False, "include_peaks": False,
+              "label": f"verification {profile_id}"}
+        if t_us:
+            mp["integration_ms"] = t_us / 1000.0
+        if ctx is not None:
+            ctx.progress(message="verification: measuring the reference source",
+                         step="verification")
+        with self._with_profile(str(profile_id), True, owner):
+            rec = self._measure_once(ctx, mp)
+        wl = np.asarray(rec["wavelengths"], float)
+        vals = np.asarray(rec["values"], float)
+        kind = prof.get("type", calprof.TYPE_RELATIVE)
+        unit = rec["unit"] if kind == calprof.TYPE_ABSOLUTE else None
+        e = ref.on_axis(wl, unit=unit) if unit else ref.on_axis(wl)
+        lo, hi = (self.cfg.get("calibration_verify_norm_lo_nm", 550.0),
+                  self.cfg.get("calibration_verify_norm_hi_nm", 650.0))
+        ver = cw.verify_against_reference(
+            wl, vals, e, kind=kind, band_nm=float(self.cfg.get("calibration_verify_band_nm", 50.0)),
+            norm_range_nm=(float(lo), float(hi)),
+            warn_pct=float(self.cfg.get("calibration_verify_warn_pct", 2.0)))
+        ver.update({"profile_id": prof["id"], "profile_label": calprof.profile_label(prof),
+                    "reference_id": ref.id, "reference_name": ref.name,
+                    "measurement_id": rec["id"], "timestamp": rec["timestamp"],
+                    "integration_us": rec["acquisition"]["integration_us"],
+                    "unit": rec["unit"], "type": kind,
+                    "warnings": list(rec.get("warnings") or [])})
+        self.last_verification = ver
+        self.cfg.set("scope_reference_id", ref.id, save=False)
+        self._emit("verification", json_safe({k: v for k, v in ver.items() if k != "curve"}))
+        return ver
+
+    def submit_verification(self, params: dict, *, owner: str) -> Job:
+        self._require_backend()
+        p = dict(params or {})
+
+        def run(ctx: JobContext):
+            ver = self.verify_profile(str(p.get("profile_id", "")),
+                                      str(p.get("reference_id", "")),
+                                      frames=p.get("frames"),
+                                      integration_ms=p.get("integration_ms"), ctx=ctx,
+                                      owner=None)
+            ctx.progress(1.0, "verification done", step="done")
+            return json_safe(ver)
+        return self.jobs.submit("verification", run, p, owner)
+
+    # ── reference overlay for the scope (desktop + web identical) ─────────
+    def reference_overlay(self, reference_id: str | None, wl, display_values,
+                          display_unit: str) -> np.ndarray | None:
+        """Reference curve on the wavelength axis, scaled to the CURRENT
+        display: absolute display → the reference in the display unit
+        (unscaled); any other mode → least-squares scale onto the displayed
+        values over the finite (valid) pixels. None if not available."""
+        import reference_sources as rs
+        if not reference_id:
+            return None
+        wl = np.asarray(wl, float)
+        key = (str(reference_id), wl.size, float(wl[0]) if wl.size else 0.0,
+               float(wl[-1]) if wl.size else 0.0, display_unit if
+               processing.is_absolute_unit(display_unit) else "")
+        e = self._overlay_cache.get(key)
+        if e is None:
+            ref = rs.ReferenceLibrary().get(str(reference_id))
+            if ref is None:
+                return None
+            try:
+                e = (ref.on_axis(wl, unit=display_unit)
+                     if processing.is_absolute_unit(display_unit)
+                     and processing.is_absolute_unit(ref.unit) else ref.on_axis(wl))
+            except Exception:                                    # noqa: BLE001
+                e = ref.on_axis(wl)
+            self._overlay_cache = {key: e}
+        e = np.asarray(e, float)
+        if processing.is_absolute_unit(display_unit):
+            return e
+        v = np.asarray(display_values, float)
+        m = np.isfinite(v) & np.isfinite(e) & (e > 0)
+        if np.count_nonzero(m) < 3:
+            return None
+        den = float(np.sum(e[m] ** 2))
+        scale = float(np.sum(v[m] * e[m]) / den) if den > 0 else 0.0
+        return e * scale
+
+    # ── linearity calibration job ────────────────────────────────────────
+    def submit_linearity(self, params: dict, *, owner: str) -> Job:
+        """Linearity calibration of the connected unit (or a check on devices
+        with a factory linearisation): plan → darks before (cover) → light
+        steps incl. repeated reference (uncover) → darks after (cover /
+        uncover) → fit → save (+ activate) → protocol (PDF + CSV)."""
+        b = self._require_backend()
+        p = dict(params or {})
+        cfg = callin.LinearityConfig.from_config()
+        if p.get("steps"):
+            cfg.n_steps = int(min(10, max(6, int(p["steps"]))))
+        if p.get("frames"):
+            cfg.n_frames = max(2, int(p["frames"]))
+        wf = callin.LinearityWorkflow(b, self.device_name, cfg)
+
+        def run(ctx: JobContext):
+            res: dict = {"status": "failed", "mode": wf.mode, "protocol": []}
+            try:
+                ctx.progress(0.02, "probing the source", step="plan")
+                us = (None if p.get("integration_ms") in (None, "auto")
+                      else int(float(p["integration_ms"]) * 1000))
+                res["plan"] = json_safe(wf.plan(us))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the input. Dark "
+                                      "spectra at all integration times are captured "
+                                      "next.", action="cover")
+                wf.capture_darks("before", progress=lambda f, m: ctx.progress(
+                    0.05 + 0.15 * f, m, step="dark_before"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the input. The "
+                                      "light steps are captured next (keep the source "
+                                      "and the fibre untouched).", action="uncover")
+                wf.capture_steps(sleep=ctx.sleep, check=ctx.check,
+                                 progress=lambda f, m: ctx.progress(0.2 + 0.5 * f, m,
+                                                                    step="steps"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the input again. "
+                                      "The dark spectra AFTER the steps are captured "
+                                      "next.", action="cover")
+                wf.capture_darks("after", progress=lambda f, m: ctx.progress(
+                    0.7 + 0.15 * f, m, step="dark_after"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the input.",
+                                      action="uncover")
+                ctx.progress(0.87, "fitting the correction", step="compute")
+                try:
+                    res["result"] = json_safe(wf.compute())
+                except ValueError as e:
+                    res["error"] = str(e)
+                    return res
+                if p.get("save", True):
+                    saved = wf.save(activate=bool(p.get("activate", True)))
+                    res["entry_id"] = saved["id"]
+                    res["status"] = "saved" if wf.mode == callin.MODE_CORRECTION else "check_saved"
+                    self.reload_linearity()
+                    res["linearity"] = json_safe(self.linearity_info)
+                else:
+                    res["status"] = "computed"
+                return res
+            finally:
+                res["warnings"] = list(wf.warnings)
+                if wf.model is not None or res.get("error"):
+                    res["protocol"], res["protocol_message"] = self._write_linearity_protocol(wf)
+                ctx.job.result = res
+        return self.jobs.submit("linearity", run, p, owner)
+
+    def _write_linearity_protocol(self, wf) -> tuple[list[str], str]:
+        try:
+            import calibration_report as crp
+            import export_paths
+            rec = wf.record()
+            d, note = export_paths.calibration_protocol_dir()
+            base = crp.default_linearity_basename(rec)
+            paths = crp.write_linearity_protocol(rec, os.path.join(d, base + ".pdf"),
+                                                 os.path.join(d, base + ".csv"))
+            return list(paths or []), note or ""
+        except Exception as e:                                   # noqa: BLE001
+            return [], f"Protocol not written: {e}"
+
 
     def submit_derivation(self, params: dict, *, owner: str) -> Job:
         """Derive the relative profile of a NEW optics configuration from a

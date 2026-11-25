@@ -741,3 +741,24 @@ body.light .cr-result.bad { background: #fbe6e2; border-color: #e5b4ac; }
 #job-dialog { z-index: 210; }
 #token-dialog { z-index: 220; }
 .mini-table input[type="number"] { height: 24px; width: 100px; min-width: 0; }
+
+/* ── Hardware-test additions: reference overlay, run-result details, linearity ── */
+.scope-ref-select {
+  height: 28px; max-width: 220px; min-width: 0; font-size: 11px;
+  background: var(--bg-2); color: var(--fg-2);
+  border: 1px solid var(--border-1); border-radius: 6px;
+}
+.scope-ref-select:disabled { opacity: 0.5; }
+.cr-result .cr-sub { margin: 10px 0 4px; font: 600 12px var(--font-sans); }
+.cr-result .tbl-wrap { background: var(--bg-1); max-width: 100%; }
+.cr-result .mini-table td.warn, .cr-result .mini-table tr.warn td { color: var(--warn); }
+.cr-result .mini-table td.bad, .cr-result .mini-table tr.bad td { color: var(--danger); }
+.cr-result .mini-table tr.warn td, .cr-result .mini-table tr.bad td { background: var(--warn-bg); }
+.cr-result .mini-table td.msg { white-space: normal; min-width: 200px; }
+.cr-result .cr-actions { margin-top: 8px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.cr-result .cr-actions button { height: 26px; padding: 0 10px; font-size: 11.5px; }
+.cr-result .cr-hint { font-size: 11.5px; color: var(--warn); overflow-wrap: anywhere; }
+.lin-actions { margin: 8px 0 4px; }
+#lin-factory-note { margin-bottom: 8px; }
+#lin-state { margin-top: 0; margin-bottom: 8px; }
+#lin-run[hidden], #lin-form[hidden] { display: none; }

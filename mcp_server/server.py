@@ -677,6 +677,48 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
                                 "continue_job only after they confirm. Poll job_status until "
                                 "done, then report status, plausibility and the protocol path."}
 
+    @tool("verify_profile",
+          "Verify a saved calibration profile: the reference source is measured with the "
+          "profile through the live pipeline (stored dark at the profile's t_int) and compared "
+          "with the reference file, normalised 550-650 nm, per 50-nm band and overall (rms, "
+          "max in %). The reference lamp must be in place (uncovered). Returns the job; follow "
+          "with job_status.")
+    async def verify_profile(profile_id: str, reference_id: str,
+                             integration_ms: float | None = None) -> dict:
+        body = {"profile_id": profile_id, "reference_id": reference_id}
+        if integration_ms is not None:
+            body["integration_ms"] = integration_ms
+        res = await api.post("/calibration/verifications", body)
+        job = await job_wait(res["job"]["id"], 5.0)
+        return {"job": _job_view(job)}
+
+    @tool("linearity_status",
+          "Detector linearity correction of the connected unit: state (active / off / factory "
+          "= device linearises itself / none), the active record and the stored records with "
+          "date, valid range and max deviation.", read_only=True)
+    async def linearity_status() -> dict:
+        return await api.get("/calibration/linearity")
+
+    @tool("start_linearity",
+          "Start a detector linearity calibration as a job (stable broadband lamp, 6-10 "
+          "integration times between ~10 and 90 % full scale, darks before/after, repeated "
+          "reference step against lamp drift). Devices with a factory linearisation (Ocean "
+          "HDX) only get a check measurement. The job pauses for cover / uncover user steps: "
+          "relay the prompt and call continue_job only after the user confirms.")
+    async def start_linearity(steps: int | None = None,
+                              integration_ms: float | Literal["auto"] = "auto",
+                              activate: bool = True) -> dict:
+        body = {"integration_ms": integration_ms, "activate": activate}
+        if steps is not None:
+            body["steps"] = steps
+        res = await api.post("/calibration/linearity/runs", body)
+        job = await job_wait(res["job"]["id"], 3.0)
+        return {"job": _job_view(job),
+                "instructions": "Multi-step job: relay waiting_for_user prompts (cover / "
+                                "uncover), continue_job after confirmation, poll job_status "
+                                "until done, then report status, max deviation and the "
+                                "protocol path."}
+
     # ---- export / reports ---------------------------------------------------
     @tool("export_measurement",
           "Save a stored measurement (full spectrum + metadata) as csv or json in the data "
