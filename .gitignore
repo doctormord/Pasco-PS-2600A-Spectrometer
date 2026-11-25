@@ -12,3 +12,17 @@ docs/KICKOFF_PROMPT.md
 
 # Calibration protocols (written to <export_dir>/calibration, never here)
 calib_*
+
+# Runtime data lives in the user data directory (data_paths.py), never in the
+# program folder; the repository only ships *.example.json templates.
+spectrometer_config.json
+calibration_profiles.json
+calibration_profiles.v1.bak.json
+dark_spectra.json
+reference_sources.json
+linearity_profiles.json
+*.bak.json
+old_calib_data_*.json
+*.tmp
+linearity_*.pdf
+linearity_*.csv

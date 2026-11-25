@@ -572,11 +572,12 @@ def auto_expose(backend, *, target_frac: tuple[float, float] = (0.70, 0.85),
 # ══════════════════════════════════════════════════════════════════════════
 
 def _dark_path() -> str:
+    import data_paths
     try:
         from app_config import Config
-        return Config.get("dark_spectra_file", DEFAULT_DARK_FILE)
+        return data_paths.resolve(Config.get("dark_spectra_file", DEFAULT_DARK_FILE))
     except Exception:
-        return DEFAULT_DARK_FILE
+        return data_paths.resolve(DEFAULT_DARK_FILE)
 
 
 def _load_darks() -> list[dict]:
@@ -595,6 +596,7 @@ def _load_darks() -> list[dict]:
 def _save_darks(darks: list[dict]) -> None:
     path = _dark_path()
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"schema": 1, "darks": darks}, f)
     except Exception as e:

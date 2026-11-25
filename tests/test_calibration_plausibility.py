@@ -179,7 +179,8 @@ def test_protocol_dir_never_program_folder(isolated_config, tmp_path, monkeypatc
         os.path.join(export_paths.program_dir(), "sub") if export_dir == "INSIDE" else "")
     d, note = export_paths.calibration_protocol_dir()
     assert not export_paths._is_inside(d, export_paths.program_dir())
-    assert d == str(tmp_path / "lad" / "PS-2600A" / "calibration")
+    # hardware test point 15: protocols are runtime data → <data dir>/protocols
+    assert d == str(tmp_path / "lad" / "PS-2600A" / "protocols")
     assert (note is not None) == (export_dir == "INSIDE")
 
 

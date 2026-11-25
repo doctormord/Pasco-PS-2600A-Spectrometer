@@ -139,6 +139,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Calibration dialog geometry [x, y, w, h] (clamped to the current screen).
     "calibration_dialog_geometry": None,
     "main_window_geometry": None,
+    # Display mode (Darstellungsart) of scope + heatmap: auto | raw | corrected
+    # | normalised | count_rate | absolute (processing.display_transform).
+    # auto = corrected with an active profile, else raw (or count_rate with
+    # display_unit counts_per_s). Evaluations always use the corrected data.
+    "display_mode": "auto",
+    # Manual y-axis limits per display mode {mode: {"auto": bool, "min": x,
+    # "max": y}} (scope) and {mode: {"auto": bool, "max": y}} (heatmap).
+    "y_limits_by_mode": {},
+    "heatmap_limits_by_mode": {},
     # Display unit of the main plot when NO v2 profile is active:
     # "counts" (unchanged legacy behaviour) or "counts_per_s".
     "display_unit": "counts",
@@ -169,11 +178,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "heatmap_buffer_size": 100,          # rolling history length (frames), step 10
     "heatmap_measure_interval_ms": 0,    # 0 = every frame; else log one frame per N ms
     "heatmap_autosave_enabled": False,
-    "heatmap_autosave_dir": "",          # "" = current working directory
+    "heatmap_autosave_dir": "",          # "" = the export folder
     "heatmap_autosave_fsync_s": 20,      # periodic fsync interval (crash safety)
 
     # ── Central export location + filename composition (all tabs/saves) ──
-    "export_dir": "",                    # "" = program folder
+    "export_dir": "",                    # "" = <Documents>/PS-2600A (never the program folder)
     "export_filename_template": "{kind}_{datetime}",
 
     # ── Out-of-spec shading (per device) ──────────────────────────────────
@@ -319,6 +328,10 @@ def _migrate_defaults(data: dict, ver: int) -> bool:
 
 class _Config:
     def __init__(self, path: str = CONFIG_FILENAME):
+        # relative names live in the user data directory (data_paths)
+        if not os.path.isabs(path):
+            import data_paths
+            path = data_paths.resolve(path)
         self.path = path
         self._data: dict[str, Any] = {}
         self.load()
@@ -342,6 +355,8 @@ class _Config:
 
     def save(self) -> None:
         try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(d, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, sort_keys=True)
         except Exception as e:
@@ -364,5 +379,9 @@ class _Config:
         return dict(self._data)
 
 
-# Module-level singleton — import this from anywhere.
-Config = _Config()
+# Module-level singleton — import this from anywhere. The user data directory
+# is prepared first (one-time migration out of the program folder, templates).
+import data_paths as _data_paths            # noqa: E402
+
+_data_paths.initialize()
+Config = _Config(_data_paths.config_path())

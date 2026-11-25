@@ -975,11 +975,13 @@ STATE_UNBOUND = "unbound"           # legacy / no serial known: not bound to a u
 
 
 def _registry_path() -> str:
+    import data_paths
     try:
         from app_config import Config
-        return Config.get("calibration_profiles_file", DEFAULT_REGISTRY_FILE)
+        return data_paths.resolve(Config.get("calibration_profiles_file",
+                                             DEFAULT_REGISTRY_FILE))
     except Exception:
-        return DEFAULT_REGISTRY_FILE
+        return data_paths.resolve(DEFAULT_REGISTRY_FILE)
 
 
 def _now_iso() -> str:
@@ -1068,7 +1070,7 @@ def save_registry(reg: dict) -> None:
                 except Exception:
                     old = None
             if isinstance(old, dict) and old and old.get("schema") != SCHEMA_VERSION:
-                bak = os.path.splitext(path)[0] + ".v1.bak.json"
+                bak = os.path.splitext(path)[0] + ".v1.bak.json"   # data dir
                 if not os.path.exists(bak):
                     with open(bak, "w", encoding="utf-8") as fb:
                         json.dump(old, fb, indent=2)

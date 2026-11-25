@@ -150,6 +150,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def headless_main(argv: list[str] | None = None) -> int:
     """Engine + API without any Qt import."""
+    import data_paths
+    argv = data_paths.parse_cli(list(sys.argv[1:] if argv is None else argv))
+    if data_paths.config_path() != Config.path:
+        # started directly (python server_runner.py / web_server.py --data-dir):
+        # the config was loaded before the option was seen → switch now
+        data_paths.initialize()
+        Config.path = data_paths.config_path()
+        Config.load()
     args = build_arg_parser().parse_args(argv)
     # Redirected stdout on Windows may be cp1252: never crash on the banner.
     for stream in (sys.stdout, sys.stderr):
