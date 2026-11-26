@@ -37,6 +37,7 @@ known optics (source drift).
 
 from __future__ import annotations
 
+import numbers
 import time
 from dataclasses import dataclass, field, asdict
 
@@ -881,30 +882,27 @@ class DerivationWorkflow:
 
         Legacy form set_integration(us) / set_integration(None) (no side):
         one integration time for BOTH sides; returns the int."""
-        if which is None or isinstance(which, (int, float)) and not isinstance(which, bool):
+        if which is None or (isinstance(which, numbers.Real)
+                             and not isinstance(which, bool)):
             us = which if integration_us is None else integration_us
-            info = self.set_integration(SIDE_KNOWN, us, auto=auto)
+            info = self.set_integration(SIDE_KNOWN, us, auto=auto if us is None else True)
             t = info["integration_us"]
-            self.itime[SIDE_NEW] = t
+            self._assign_itime(SIDE_NEW, t)
             self.exposure[SIDE_NEW] = dict(info, which=SIDE_NEW, shared=True)
             return t
         which = self._side(which)
+        if integration_us is None and not auto:
+            raise ValueError(f"give the integration time of the {which} optics or use "
+                             f"auto exposure")
         b = self.backend
-        cap, converged, is_auto = None, True, integration_us is None and auto
+        cap, converged, is_auto = None, True, integration_us is None
         if is_auto:
             t, cap, converged = cc.auto_expose(b, target_frac=self.cfg.target_frac,
                                                backend_name=self.backend_name)
         else:
-            b.set_integration_time_us(int(integration_us or b.current_integration_time_us))
+            b.set_integration_time_us(int(integration_us))
             t = int(b.current_integration_time_us)
-        t = int(t)
-        if self.itime[which] is not None and not self._same_t(self.itime[which], t):
-            # new t_int for this side → its captures are no longer usable
-            self.darks[which] = {"before": None, "after": None}
-            self.lights[which] = None
-            if which == SIDE_KNOWN:
-                self.lights[SIDE_REPEAT] = None
-        self.itime[which] = t
+        self._assign_itime(which, int(t))
         info = {"which": which, "integration_us": t, "converged": bool(converged),
                 "peak_frac": None if cap is None else float(cap.peak_frac),
                 "auto": bool(is_auto),
@@ -916,6 +914,26 @@ class DerivationWorkflow:
                        f"{self.cfg.target_frac[0]*100:.0f}–"
                        f"{self.cfg.target_frac[1]*100:.0f} % FS.")
         return info
+
+    def _invalidate(self, which: str) -> None:
+        """Captures of a side are no longer usable (new t_int): drop them and
+        everything computed from them."""
+        self.darks[which] = {"before": None, "after": None}
+        self.lights[which] = None
+        setattr(self, f"rate_{which}", None)
+        self.linearity.pop(which, None)
+        if which == SIDE_KNOWN:
+            self.lights[SIDE_REPEAT] = None
+            self.rate_repeat = None
+            self.linearity.pop(SIDE_REPEAT, None)
+        self.rate_known_used = None
+        self.drift = self.drift_check = self.pixel_ok = None
+        self.result = self.plausibility = None
+
+    def _assign_itime(self, which: str, t: int) -> None:
+        if self.itime[which] is not None and not self._same_t(self.itime[which], t):
+            self._invalidate(which)
+        self.itime[which] = int(t)
 
     # ── captures ─────────────────────────────────────────────────────────
     # Split dark / light steps so a GUI can prompt "cover" / "uncover" and
@@ -938,6 +956,10 @@ class DerivationWorkflow:
             raise RuntimeError(f"The device ran the dark at {d.integration_us/1000:.3f} ms "
                                f"instead of {t/1000:.3f} ms — repeat the dark.")
         cc.save_dark(d)
+        if phase == "before":
+            # a new dark before starts the side's block again: the old dark
+            # after (taken before this one) must not be interpolated with it
+            self.darks[which]["after"] = None
         self.darks[which][phase] = d
         self.backend.set_integration_time_us(t)
         return d
@@ -1012,10 +1034,9 @@ class DerivationWorkflow:
                                                         light.t_mid))
 
     def _rates(self) -> None:
+        """Count rates from the captures present now (None where missing)."""
         for w in (SIDE_KNOWN, SIDE_NEW, SIDE_REPEAT):
-            r = self._rate(w)
-            if r is not None:
-                setattr(self, f"rate_{w}", r)
+            setattr(self, f"rate_{w}", self._rate(w))
 
     def _itime_checks(self) -> None:
         """Dark and light of each side at the side's own integration time."""
@@ -1103,9 +1124,13 @@ class DerivationWorkflow:
         mean_pct = (100.0 * (st["mean_ratio"] - 1.0)
                     if np.isfinite(st["mean_ratio"]) else float("nan"))
         p95 = st["p95_pct"]
-        passed = bool(np.isfinite(p95) and p95 < cfg.derivation_drift_pct)
-        self.drift = {"p95_pct": p95, "median_pct": st["median_pct"],
-                      "max_pct": st["max_pct"], "mean_pct": mean_pct,
+        passed = bool(p95 is not None and np.isfinite(p95)
+                      and p95 < cfg.derivation_drift_pct)
+        def fin(v):
+            return float(v) if v is not None and np.isfinite(v) else None
+        p95, mean_pct = fin(p95), fin(mean_pct)
+        self.drift = {"p95_pct": p95, "median_pct": fin(st["median_pct"]),
+                      "max_pct": fin(st["max_pct"]), "mean_pct": mean_pct,
                       "n_compared": st["n"], "n_tested": pc["n_tested"],
                       "n_fail_pixels": pc["n_fail"], "fail_frac": pc["fail_frac"],
                       "threshold_pct": float(cfg.derivation_drift_pct),
@@ -1125,8 +1150,9 @@ class DerivationWorkflow:
                                                  "Source drift:",
                                                  "Pixels masked by the source drift"))]
         if not passed:
-            self._warn(f"Source drift check failed: {p95:.2f} % > "
-                       f"{cfg.derivation_drift_pct:.2f} % between the capture with the "
+            p95_txt = "no comparable pixels" if p95 is None else f"{p95:.2f} %"
+            self._warn(f"Source drift check failed: {p95_txt} (limit "
+                       f"{cfg.derivation_drift_pct:.2f} %) between the capture with the "
                        f"known optics and its repeat — cause: {cz['message']}.")
         elif cz.get("dominant"):
             self._warn(f"Source drift: {cz['message']}.")
@@ -1150,7 +1176,7 @@ class DerivationWorkflow:
         return self.drift
 
     def compute(self) -> dict:
-        if self.rate_known is None or self.rate_new is None:
+        if self.lights[SIDE_KNOWN] is None or self.lights[SIDE_NEW] is None:
             raise RuntimeError("capture both optics first")
         self._rates()
         self._itime_checks()

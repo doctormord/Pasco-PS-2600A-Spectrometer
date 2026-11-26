@@ -216,6 +216,7 @@ class DemoSpectrometer(BaseSpectrometer):
         # Test effect: throughput of the (simulated) input optics, multiplies the
         # photo-signal (e.g. 1e-3 for a dim optics in a derivation test).
         self.source_scale = 1.0
+        self._stop_evt = threading.Event()
         self.serial: str | None = None
 
         # Per-device integration bounds (µs); overridden from Config in connect.
@@ -287,14 +288,16 @@ class DemoSpectrometer(BaseSpectrometer):
 
     def start(self) -> None:
         self._running = True
+        self._stop_evt.clear()
         self._thread  = threading.Thread(
             target=self._run, daemon=True, name="DEMO-acq")
         self._thread.start()
 
     def stop(self) -> None:
         self._running = False
+        self._stop_evt.set()                 # wakes the frame wait immediately
         if self._thread:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=3.0 + self.current_integration_time_us / 1e6)
             self._thread = None
 
     def disconnect(self) -> None:
@@ -422,7 +425,7 @@ class DemoSpectrometer(BaseSpectrometer):
 
                 # New-data cadence ≈ 1/t (like a real device), capped so 1 ms
                 # doesn't emit thousands of frames/s into the UI.
-                time.sleep(max(t_this / 1_000_000.0, 0.012))
+                self._stop_evt.wait(max(t_this / 1_000_000.0, 0.012))
 
             except Exception as exc:
                 if self._running:

@@ -1170,7 +1170,12 @@ class Engine:
         self.check_control(owner)
         b = self._require_backend()
         prev = int(b.current_integration_time_us)
-        t, cap, conv = cc.auto_expose(b, target_frac=tuple(target_frac),
+        import calibration_workflow as cw
+        # the target band stays below the saturation warning threshold
+        lo, hi = cw.WorkflowConfig(
+            target_frac=(float(target_frac[0]), float(target_frac[1])),
+            saturation_warn_frac=cw._sat_warn_frac()).target_frac
+        t, cap, conv = cc.auto_expose(b, target_frac=(lo, hi),
                                       backend_name=self.device_name)
         if apply:
             self.configure({"exposure_ms": t / 1000.0, "auto_exposure": False}, owner=owner)
@@ -2265,8 +2270,10 @@ class Engine:
         mount known optics → t_int known → (cover) dark → (uncover) light →
         swap optics → t_int new → (cover) dark → (uncover) light → (cover)
         dark after → swap back → repeat light → (cover) dark known after →
-        (uncover) → compute → save (activated only if plausible and the
-        checks passed) → protocol (PDF + CSV).
+        (uncover) → compute → save → protocol (PDF + CSV). Not plausible:
+        saved only with allow_implausible and never activated. Failed drift /
+        consistency checks: saved only with save_on_failed_checks and then
+        activated (if 'activate'), like the calibration run.
 
         Parameters: integration_known_us / integration_new_us or
         integration_known_ms / integration_new_ms (None / "auto" = auto
@@ -2313,7 +2320,9 @@ class Engine:
             res: dict = {"status": "failed", "profile_ids": [], "protocol": [],
                          "source_hint": cw.DERIVATION_SOURCE_HINT}
             try:
-                ctx.wait_for_user("Mount the KNOWN optics on the source. "
+                ctx.wait_for_user("Mount the KNOWN optics on the source and release "
+                                  "the light path (the integration time is set "
+                                  "with the light on). "
                                   + cw.DERIVATION_SOURCE_HINT + " Then continue.",
                                   action="mount_known")
                 ctx.progress(0.05, "integration time (known optics)",
@@ -2330,7 +2339,8 @@ class Engine:
                 res["peak_frac_known"] = json_safe(dw.lights["known"].peak_frac)
 
                 ctx.wait_for_user("Mount the NEW optics on the same source (same position, "
-                                  "same lamp, unchanged power), then continue.",
+                                  "same lamp, unchanged power) and keep the light path "
+                                  "open, then continue.",
                                   action="swap_optics")
                 ctx.progress(0.3, "integration time (new optics)", step="integration_new")
                 inw = dw.set_integration("new", side_us("new"))
@@ -2361,7 +2371,10 @@ class Engine:
                              step="dark_known_after")
                 dw.capture_dark_for("known", "after")
                 self.calib.invalidate_darks()
-                uncover(ctx, "next measurement")
+                if dw.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the source. "
+                                      "The result is computed next.", action="uncover")
+                ctx.check()
 
                 ctx.progress(0.85, "computing", step="compute")
                 try:
@@ -2397,10 +2410,14 @@ class Engine:
                 return res
             finally:
                 res["warnings"] = list(dw.warnings)
+                res["dark_drift"] = json_safe(dw.dark_drift)
                 for w, key in (("known", "integration_known_us"),
                                ("new", "integration_new_us")):
                     if key not in res and dw.itime.get(w) is not None:
                         res[key] = int(dw.itime[w])
+                # legacy field (one t_int before per-side times): the new optics'
+                it = dw.integration_us
+                res["integration_us"] = it.get("new") if isinstance(it, dict) else it
                 if dw.result is not None or res.get("error"):
                     res["protocol"], res["protocol_message"] = \
                         self._write_derivation_protocol(dw)

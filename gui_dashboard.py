@@ -1015,8 +1015,10 @@ class DashboardWindow(QMainWindow):
         self.lbl_exposure.setText(txt)
         tip = ("Peak of the raw signal relative to the detector full scale; "
                f"warning from {float(warn_pct):.0f} % FS")
-        self.lbl_exposure.setToolTip(tip)
-        self.bar_exposure.setToolTip(tip)
+        if tip != getattr(self, "_exposure_tip", None):     # not on every frame
+            self._exposure_tip = tip
+            self.lbl_exposure.setToolTip(tip)
+            self.bar_exposure.setToolTip(tip)
         self.bar_exposure.setValue(int(round(min(100.0, max(0.0, pct)))))
         if cls != self._exposure_cls:
             self._exposure_cls = cls

@@ -69,10 +69,12 @@ def test_protocol_files_and_csv_content(record, tmp_path):
     text = raw.decode("utf-8")
     assert "nan" not in text.lower()  # no "nan" cells
     meta, cols, rows = _header(csv_)
-    assert cols == ("Wavelength_nm;C_known_cps;C_known_repeat_cps;C_new_cps;"
-                    "S_known;S_new;Valid;Drift_pct;Drift_fail")
+    assert cols == ("Wavelength_nm;C_known_cps;C_known_repeat_cps;C_known_used_cps;"
+                    "C_new_cps;S_known;S_new;Valid;Drift_pct;Drift_fail")
+    # the rate the ratio uses and its time-interpolation weight are documented
+    assert "# drift_interp_weight;" in text
     assert len(rows) == len(record["spectra"]["wl"])
-    assert all(len(r.split(";")) == 9 for r in rows)
+    assert all(len(r.split(";")) == 10 for r in rows)
     # both integration times, both levels, drift, linearity correction per side
     assert meta["t_int_known_us"] == "800" and meta["t_int_new_us"] == "400"
     assert meta["t_int_known_mode"] == "fixed" and meta["t_int_new_mode"] == "fixed"
@@ -92,10 +94,10 @@ def test_protocol_files_and_csv_content(record, tmp_path):
     # masked values are empty: S_new blank exactly where Valid is 0
     for r in rows:
         c = r.split(";")
-        if c[6] == "0":
-            assert c[5] == ""
+        if c[7] == "0":                  # Valid
+            assert c[6] == ""                # S_new
         else:
-            assert c[5] != ""
+            assert c[6] != ""
 
 
 def test_protocol_with_missing_data(tmp_path):

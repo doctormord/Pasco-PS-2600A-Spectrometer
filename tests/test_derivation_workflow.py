@@ -226,3 +226,51 @@ def test_legacy_single_integration_time(demo):
     t = dw.set_integration(500)
     assert t == 500 and dw.itime == {"known": 500, "new": 500}
     assert dw.integration_us == 500
+
+
+# ── state after changing the integration time of a side (review finding) ──
+
+def test_new_integration_time_drops_the_side_and_its_results(demo):
+    prof = _known(demo)
+    dw = _dw(demo, prof)
+    dw.run_all(swap=_swapper(demo), save=False)
+    t = dw.itime["known"]
+    dw.set_integration("known", int(t * 0.6))
+    assert dw.lights["known"] is None and dw.lights["repeat"] is None
+    assert dw.rate_known is None and dw.rate_repeat is None
+    assert dw.result is None and dw.drift is None
+    dw.capture_known()
+    res = dw.compute()                       # no repeat any more: drift not checked
+    assert res["n_valid"] > 0
+    assert dw.checks["drift_pass"] is None
+    assert dw.rate_repeat is None
+
+
+def test_compute_needs_the_new_side_again_after_its_time_changed(demo):
+    prof = _known(demo)
+    dw = _dw(demo, prof)
+    dw.run_all(swap=_swapper(demo), save=False)
+    dw.set_integration("new", int(dw.itime["new"] * 0.5))
+    assert dw.rate_new is None
+    with pytest.raises(RuntimeError):
+        dw.compute()
+
+
+def test_set_integration_edge_cases(demo):
+    prof = _known(demo)
+    dw = _dw(demo, prof)
+    t = dw.set_integration(np.int64(700))            # legacy form, numpy integer
+    assert t == dw.itime["known"] == dw.itime["new"]
+    with pytest.raises(ValueError):
+        dw.set_integration("new", None, auto=False)  # neither a value nor auto
+
+
+def test_new_dark_before_resets_the_dark_after(demo):
+    prof = _known(demo)
+    dw = _dw(demo, prof)
+    dw.set_integration("new", 700)
+    dw.capture_dark_for("new")
+    dw.capture_light_for("new")
+    dw.capture_dark_for("new", "after")
+    dw.capture_dark_for("new")                       # side started again
+    assert dw.darks["new"]["after"] is None

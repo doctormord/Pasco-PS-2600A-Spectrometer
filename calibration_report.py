@@ -35,12 +35,16 @@ def _g(d, *keys, default=None):
 
 
 def _num(v, fmt="{:.6g}", none=""):
+    """Formatted number; `none` for missing or non-finite values (never 'nan')."""
     if v is None:
         return none
     try:
-        return fmt.format(float(v))
+        f = float(v)
     except (TypeError, ValueError):
         return str(v)
+    if f != f or f in (float("inf"), float("-inf")):
+        return none
+    return fmt.format(f)
 
 
 def _yesno(v, none="n/a"):
@@ -1051,8 +1055,9 @@ def write_linearity_protocol(record: dict, pdf_path: str | None = None,
 # ══════════════════════════════════════════════════════════════════════════
 #  Derivation protocol (DerivationWorkflow.record())
 # ══════════════════════════════════════════════════════════════════════════
-DERIVATION_CSV_COLUMNS = ["Wavelength_nm", "C_known_cps", "C_known_repeat_cps", "C_new_cps",
-                          "S_known", "S_new", "Valid", "Drift_pct", "Drift_fail"]
+DERIVATION_CSV_COLUMNS = ["Wavelength_nm", "C_known_cps", "C_known_repeat_cps",
+                          "C_known_used_cps", "C_new_cps", "S_known", "S_new", "Valid",
+                          "Drift_pct", "Drift_fail"]
 _DERIV_SIDES = (("known", "Known optics"), ("new", "New optics"))
 
 
@@ -1129,6 +1134,8 @@ def _deriv_metadata(record: dict) -> list[tuple[str, str]]:
           ("drift_masked_pixels", _num(dr.get("n_fail_pixels"), "{:.0f}")),
           ("drift_pixels_tested", _num(dr.get("n_tested"), "{:.0f}")),
           ("drift_seconds", _num(dr.get("seconds"), "{:.1f}")),
+          # weight w of the repeat in C_known_used = (1-w)·C_known + w·C_known_repeat
+          ("drift_interp_weight", _num(dr.get("interp_weight"), "{:.3f}")),
           ("drift_cause", dr.get("cause") or ""),
           ("valid_range_nm", "" if not vr else " - ".join(_num(x, "{:.1f}") for x in vr)),
           ("valid_segments_nm", _segments_text(r.get("valid_segments_nm"))),
@@ -1198,7 +1205,7 @@ def write_derivation_csv(record: dict, path: str) -> str:
         s_new = col("S", i) if ok else None
         lines.append(";".join([
             _dcell(wl[i]), _dcell(col("C_known", i)), _dcell(col("C_known_repeat", i)),
-            _dcell(col("C_new", i)), _dcell(col("S_known", i)), _dcell(s_new),
+            _dcell(col("C_known_used", i)), _dcell(col("C_new", i)), _dcell(col("S_known", i)), _dcell(s_new),
             _dcell(ok if valid is not None else None),
             _dcell(col("drift_pct", i)), _dcell(col("drift_fail", i))]))
     return _write_lines(path, lines)

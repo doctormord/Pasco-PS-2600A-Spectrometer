@@ -1938,7 +1938,7 @@ class _SpectralWizardTab(QWidget):
         light = dw.lights.get(which)
         if light is None:
             return "ok", ""
-        high = light.peak_frac > dw.cfg.saturation_warn_frac
+        high = light.peak_frac >= dw.cfg.saturation_warn_frac
         return ("warning" if high else "ok"), f"{100 * light.peak_frac:.0f} % FS"
 
     def _gen_deriv(self, dw, us_known, us_new=None):
