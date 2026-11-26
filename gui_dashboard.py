@@ -1000,12 +1000,25 @@ class DashboardWindow(QMainWindow):
             return
         pct = float(exp.get("peak_pct_fs", 0.0) or 0.0)
         sat = int(exp.get("n_saturated", 0) or 0)
-        cls = "danger" if (sat or exp.get("saturated") or pct >= 98.0) \
-            else "warn" if pct >= 85.0 else "ok"
+        # state and threshold come from processing.exposure_level (config key
+        # saturation_warn_frac) - the same values the web UI uses
+        warn_pct = exp.get("warn_pct_fs")
+        if warn_pct is None:
+            warn_pct = 100.0 * processing.saturation_warn_frac()
+        cls = exp.get("state")
+        if cls not in ("ok", "warn", "danger"):
+            cls = ("danger" if (sat or exp.get("saturated"))
+                   else "warn" if pct >= float(warn_pct) else "ok")
         txt = f"Peak {pct:.0f} % FS"
         if sat:
             txt += f" · {sat} px saturated"
         self.lbl_exposure.setText(txt)
+        tip = ("Peak of the raw signal relative to the detector full scale; "
+               f"warning from {float(warn_pct):.0f} % FS")
+        if tip != getattr(self, "_exposure_tip", None):     # not on every frame
+            self._exposure_tip = tip
+            self.lbl_exposure.setToolTip(tip)
+            self.bar_exposure.setToolTip(tip)
         self.bar_exposure.setValue(int(round(min(100.0, max(0.0, pct)))))
         if cls != self._exposure_cls:
             self._exposure_cls = cls

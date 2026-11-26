@@ -774,12 +774,87 @@ is scaled by least squares onto the displayed values over the valid pixels.
 \subsection{Deriving one optic from another}\label{sec:speccal-derive}
 The mode \emph{Derive from other optics} (tab \emph{Spectral calibration})
 creates a profile for a new optics configuration (e.g.\ bare fibre) from a known
-one (e.g.\ CC) via two measurements of the \emph{same diffuse, extended source}:
+one (e.g.\ CC) via two measurements of the \emph{same source}:
 \[
-  S_{\mathrm{new}} = S_{\mathrm{known}}\cdot\frac{C_{\mathrm{new}}}{C_{\mathrm{known}}} .
+  S_{\mathrm{new}} = S_{\mathrm{known}}\cdot\frac{C_{\mathrm{new}}}{C_{\mathrm{known}}} ,
 \]
+with $C$ the count rates [counts/s] after linearisation and dark subtraction.
 The result is always relative. The valid range is the overlap of the known
-profile's range with the pixels of sufficient signal in both captures.
+profile's range with the pixels of sufficient signal in both captures and
+without a failed drift check.
+
+\paragraph{Source.} A diffuse, uniformly luminous, extended target that fills the
+field of view of \emph{both} optics, for example back-illuminated opal glass in
+the object plane. Source, position and power must stay unchanged during the
+whole run. The wizard shows this note in the derivation form and in the first
+dialog of the run, and the protocol records it.
+
+\paragraph{Own integration time per optics.} The brightness of two optics on the
+same source can differ by orders of magnitude (bare fibre versus cosine
+corrector). Each optics therefore has its \emph{own} integration time, either
+\emph{Auto} (auto-exposure to the target band
+\key{calibration\_target\_frac\_lo/hi} with that optics mounted and the source on)
+or a fixed value in ms. Because $C$ is a count rate, the result does not depend on
+the chosen times; both sides at the same level also keep the residual
+nonlinearity equal. Every optics has its \emph{own dark spectra} at its own
+integration time; dark and light of one optics always use the same integration
+time (checked and recorded). The linearity correction of the unit is applied to
+every capture; the wizard reports it (on\,/\,off\,/\,n/a) per optics and refuses to
+mix captures with a changed correction.
+
+\paragraph{Sequence.} The wizard lists the steps in this order; devices without a
+shutter ask you to cover the input before each dark and to release it afterwards.
+\begin{enumerate}
+  \item Source note, mount the \emph{known} optics (light path open).
+  \item Integration time of the known optics, dark, light.
+  \item Mount the \emph{new} optics on the same source (light path open).
+  \item Integration time of the new optics, dark, light, dark \emph{after}.
+  \item Mount the known optics \emph{again}; measure it a second time
+        (\emph{repeat}), then its dark after.
+  \item Compute $S_{\mathrm{new}}$, plausibility, drift and consistency checks.
+  \item Save (see below) and write the derivation protocol.
+\end{enumerate}
+Light captures are corrected with the dark of their optics interpolated in time
+between dark before and after (\S\ref{sec:speccal-dark}). A capture with saturated
+pixels stops the run with a message naming the affected optics; shorten its
+integration time (or use Auto) and start again.
+
+\paragraph{Source drift.} The repeat with the known optics compares, per pixel
+and overall, the two known-optics captures (same time basis, same integration
+time). Reported: 95th percentile of the smoothed ratio, mean ratio, the limit, the
+status, the number of masked pixels, the elapsed time and a cause analysis. The
+limit is \key{calibration\_derivation\_drift\_pct} (default 2\,\%); the per-pixel
+test adds the noise-dependent tolerance (\key{calibration\_pixel\_check\_k}).
+Failing pixels are masked and limit the valid segments. The known-optics count
+rate used in the ratio is interpolated linearly in time to the capture of the
+new optics, which compensates a linear drift.
+
+\paragraph{Saving.} A result that fails the plausibility check is saved only after
+explicit confirmation, is marked as not plausible and is not activated. A
+plausible result whose drift or consistency check failed is saved only after the
+question \emph{Checks failed\ldots\ Save anyway?}; answering \emph{No} leaves
+the profile unsaved (the protocol is still written).
+
+\paragraph{Protocol.} After every completed computation (also when it fails or is
+not saved) a PDF and a CSV are written to the protocol folder; file name
+\file{derivation\_device\_serial\_optics\_type\_timestamp}. Content: date and time
+with time zone, device and serial number, known profile (id, version, optics), new
+optics, source note; per optics integration time, auto\,/\,fixed, level in
+\% FS (light and repeat), dark sequence, same-integration-time check and
+linearity correction (on\,/\,off\,/\,n/a) plus the device NL correction; source
+drift in total (p95, mean, limit, status, masked pixels, duration, cause) and per
+pixel (chart with the $\pm$ limit); dark drift per optics; plausibility, valid
+range and segments, gain span, warnings and saved profiles; charts of the
+normalised count rates and of $S_{\mathrm{known}}$\,/\,$S_{\mathrm{new}}$. The
+CSV (UTF-8) has a \code{\# key;value} header with the same fields and the columns
+\code{Wavelength\_nm;C\_known\_cps;C\_known\_repeat\_cps;C\_new\_cps;S\_known;S\_new;Valid;Drift\_pct;Drift\_fail};
+masked values are empty.
+
+\paragraph{Saturation threshold.} The configuration key \key{saturation\_warn\_frac}
+(default 0.90, fraction of full scale, raw ADC peak) is the single saturation
+warning threshold for the desktop application, the web client, the exposure
+indicator and all calibration procedures. The upper limit of the auto-exposure
+target band (\key{calibration\_target\_frac\_hi}) is capped at this value.
 
 \subsection{Lamp library}
 Tab \emph{Lamps}: import Avantes \file{.lmp} (tab/space separated, decimal comma
@@ -962,7 +1037,9 @@ $K$, validity, repeat and half-$t_{\mathrm{int}}$ rates. Default file name:
 \key{calibration\_itime\_threshold\_pct} & 2.0 & Cross-check limit per pixel (\%).\\
 \key{calibration\_pixel\_check\_k} & 4.0 & Noise factor $k$ of the per-pixel checks.\\
 \key{calibration\_cause\_min\_pct} & 0.3 & Minimum effect (\%) for a reported cause.\\
-\key{calibration\_dark\_drift\_warn\_pct} & 0.5 & Dark-drift warning (\% of net peak).\\
+\key{calibration\_dark\_drift\_warn\_pct} & 0.5 & Dark-drift warning (\% of net peak).\
+\key{calibration\_derivation\_drift\_pct} & 2.0 & Source-drift limit of the derivation (p95 and per pixel, \%).\
+\key{saturation\_warn\_frac} & 0.90 & Saturation warning (fraction of full scale); desktop, web, exposure indicator, calibration; caps the auto-exposure target.\\
 \key{calibration\_max\_gain\_span} & 200 & Gain-span hint (not a block).\\
 \key{calibration\_verify\_norm\_lo\_nm/hi\_nm} & 550 / 650 & Normalisation range of the verification.\\
 \key{calibration\_verify\_band\_nm} & 50 & Band width of the verification.\\
@@ -1815,7 +1892,7 @@ defaults at load. Edit it while the app is closed, or change values from the UI
 \key{ocean\_fp\_long\_refresh\_s} & 3.0 & FP long-reference refresh.\\
 \key{ocean\_response\_table} & null & \code{[[$\lambda$, sensitivity], \dots]} or null.\\
 \multicolumn{3}{@{}l}{\textit{Demo (virtual)}}\\
-\key{demo\_min/max\_integration\_us} & 1000 / 1e6 & 1\,ms / 1000\,ms.\\
+\key{demo\_min/max\_integration\_us} & 1000 / 1e6 & 1\,ms / 1000\,ms; configurable from 10\,\textmu s to 10\,s.\\
 \key{demo\_fullscale\_ms} & 1000.0 & Exposure where peak $\approx$ full scale.\\
 \key{demo\_spectrum} & led\_white & Built-in or a CSV column name.\\
 \key{demo\_dark\_bias} & 500.0 & Fixed dark offset (counts).\\

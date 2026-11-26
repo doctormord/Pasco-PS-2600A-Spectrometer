@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Literal, Optional, Union
+from typing import Annotated, Literal, Optional, Union
 
 import api
 from fastapi import APIRouter, Query, Request
@@ -140,7 +140,7 @@ def register(router: APIRouter, ctx: V1Context) -> None:
             job = engine.jobs.get(job_id)
         except NotFound:
             raise ApiError(404, "not_found", f"Job '{job_id}' not found.")
-        if job.kind != "calibration":
+        if job.kind not in ("calibration", "derivation"):
             raise ApiError(404, "not_found", f"Job '{job_id}' is not a calibration job.")
         res = job.result if isinstance(job.result, dict) else {}
         paths = [p for p in (res.get("protocol") or [])
@@ -238,11 +238,16 @@ def register(router: APIRouter, ctx: V1Context) -> None:
     @router.post("/calibration/derivations", tags=["calibration"], dependencies=auth,
                  status_code=202,
                  summary="Derive the relative profile of new optics from a known profile "
-                         "(job; user steps mount_known / cover / uncover / swap_optics)")
+                         "(job; user steps mount_known / cover / uncover / swap_optics "
+                         "/ swap_back via /jobs/{id}/continue)")
     async def start_derivation(body: DerivationRequest, request: Request):
         params = body.model_dump()
-        if params.get("integration_ms") == "auto":
-            params["integration_ms"] = None
+        legacy = params.pop("integration_ms", None)      # both sides, if not set per side
+        for k in ("integration_known_ms", "integration_new_ms"):
+            v = params.get(k)
+            if v is None:
+                v = legacy
+            params[k] = None if v in (None, "auto") else float(v)
         job = await ctx.call(engine.submit_derivation, params, owner=ctx.owner(request))
         return ctx.job_response(job)
 
@@ -296,13 +301,25 @@ def register(router: APIRouter, ctx: V1Context) -> None:
         return {"ok": bool(lib.remove(source_id))}
 
 
+_PosMs = Annotated[float, Field(gt=0)]
+
+
 class DerivationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     known_profile_id: str
     optics: M.OpticsSpec
-    integration_ms: Optional[Union[float, Literal["auto"]]] = "auto"
+    integration_known_ms: Optional[Union[_PosMs, Literal["auto"]]] = Field(
+        None, description="Integration time with the known optics (ms, or 'auto' = "
+                            "auto exposure with that optics mounted; default auto)")
+    integration_new_ms: Optional[Union[_PosMs, Literal["auto"]]] = Field(
+        None, description="Integration time with the new optics (ms, or 'auto'; default auto)")
+    integration_ms: Optional[Union[_PosMs, Literal["auto"]]] = Field(
+        None, description="Legacy: one value for both sides; used only where the "
+                          "side-specific value is not set")
     frames: Optional[int] = Field(None, ge=2, le=1000)
     allow_implausible: bool = False
+    save_on_failed_checks: bool = Field(
+        False, description="Save even if the source-drift or consistency checks failed")
     activate: bool = True
 
 

@@ -35,12 +35,16 @@ def _g(d, *keys, default=None):
 
 
 def _num(v, fmt="{:.6g}", none=""):
+    """Formatted number; `none` for missing or non-finite values (never 'nan')."""
     if v is None:
         return none
     try:
-        return fmt.format(float(v))
+        f = float(v)
     except (TypeError, ValueError):
         return str(v)
+    if f != f or f in (float("inf"), float("-inf")):
+        return none
+    return fmt.format(f)
 
 
 def _yesno(v, none="n/a"):
@@ -1045,4 +1049,355 @@ def write_linearity_protocol(record: dict, pdf_path: str | None = None,
         out.append(write_linearity_csv(record, csv_path))
     if pdf_path:
         out.append(write_linearity_pdf(record, pdf_path))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Derivation protocol (DerivationWorkflow.record())
+# ══════════════════════════════════════════════════════════════════════════
+DERIVATION_CSV_COLUMNS = ["Wavelength_nm", "C_known_cps", "C_known_repeat_cps",
+                          "C_known_used_cps", "C_new_cps", "S_known", "S_new", "Valid",
+                          "Drift_pct", "Drift_fail"]
+_DERIV_SIDES = (("known", "Known optics"), ("new", "New optics"))
+
+
+def default_derivation_basename(record: dict) -> str:
+    record = record or {}
+    parts = ["derivation", _slug(_g(record, "device", "backend"), "device"),
+             _slug(_g(record, "device", "serial"), "noserial"),
+             _slug(_g(record, "optics", "name"), "optics"),
+             _slug(record.get("type"), "type"), _stamp(record)]
+    return re.sub(r"[^A-Za-z0-9_-]", "", "_".join(parts))
+
+
+def _pct(v, fmt="{:.2f}"):
+    return _num(None if v is None else 100 * float(v), fmt)
+
+
+def _exposure_text(side: dict) -> str:
+    a = side.get("auto_exposure")
+    if a is None:
+        return ""
+    txt = "auto exposure" if a else "fixed"
+    if a and side.get("converged") is False:
+        txt += " (target band not reached)"
+    return txt
+
+
+def _deriv_metadata(record: dict) -> list[tuple[str, str]]:
+    r = record or {}
+    acq, chk = r.get("acquisition") or {}, r.get("checks") or {}
+    kp = r.get("known_profile") or {}
+    dr = r.get("drift") or {}
+    sides = r.get("sides") or {}
+    vr = r.get("valid_range_nm")
+    gs = r.get("gain_span")
+    gs_s = (" - ".join(_num(x, "{:.4g}") for x in gs) if isinstance(gs, (list, tuple))
+            else _num(gs, "{:.4g}"))
+    m = [("started", r.get("started") or ""), ("finished", r.get("finished") or ""),
+         ("device", _g(r, "device", "backend", default="")),
+         ("serial", _g(r, "device", "serial", default="")),
+         ("new_optics_name", _g(r, "optics", "name", default="")),
+         ("new_optics_input", _g(r, "optics", "input", default="")),
+         ("new_optics_notes", _g(r, "optics", "notes", default="")),
+         ("known_profile_id", kp.get("id") or ""),
+         ("known_profile_version", _num(kp.get("version"), "{:.0f}")),
+         ("known_profile_type", kp.get("type") or ""),
+         ("known_optics_name", _g(kp, "optics", "name", default="")),
+         ("known_optics_input", _g(kp, "optics", "input", default="")),
+         ("known_reference_name", _g(kp, "reference", "name", default="")),
+         ("type", r.get("type") or ""),
+         ("source_hint", r.get("source_hint") or "")]
+    for s, _label in _DERIV_SIDES:
+        sd = sides.get(s) or {}
+        t = sd.get("integration_us")
+        pk, pr = sd.get("peak_frac"), sd.get("peak_frac_repeat")
+        lin = sd.get("linearity") if isinstance(sd.get("linearity"), dict) else {}
+        m += [(f"t_int_{s}_us", _num(t, "{:.0f}")),
+              (f"t_int_{s}_ms", _num(None if t is None else float(t) / 1000, "{:.4g}")),
+              (f"t_int_{s}_mode", _exposure_text(sd)),
+              (f"peak_{s}_pct_fs", _pct(pk, "{:.1f}"))]
+        if s == "known":
+            m.append(("peak_known_repeat_pct_fs", _pct(pr, "{:.1f}")))
+        m += [(f"saturated_pixels_{s}", _num(sd.get("n_saturated"), "{:.0f}")),
+              (f"dark_sequence_{s}", sd.get("dark_sequence") or ""),
+              (f"dark_light_same_t_int_{s}", _yesno(sd.get("itime_match"))),
+              (f"linearity_correction_{s}", _onoff(sd.get("linearity_text"))),
+              (f"linearity_id_{s}", lin.get("id") or "")]
+    m += [("averages_N", _num(acq.get("averages"), "{:.0f}")),
+          ("nl_correction", _nl_text(acq)),
+          ("drift_pct_p95", _num(dr.get("p95_pct"), "{:.3f}")),
+          ("drift_pct_mean", _num(dr.get("mean_pct"), "{:.3f}")),
+          ("drift_pct_median", _num(dr.get("median_pct"), "{:.3f}")),
+          ("drift_threshold_pct", _num(dr.get("threshold_pct"), "{:.3f}")),
+          ("drift_pass", _yesno(dr.get("pass"), "")),
+          ("drift_masked_pixels", _num(dr.get("n_fail_pixels"), "{:.0f}")),
+          ("drift_pixels_tested", _num(dr.get("n_tested"), "{:.0f}")),
+          ("drift_seconds", _num(dr.get("seconds"), "{:.1f}")),
+          # weight w of the repeat in C_known_used = (1-w)·C_known + w·C_known_repeat
+          ("drift_interp_weight", _num(dr.get("interp_weight"), "{:.3f}")),
+          ("drift_cause", dr.get("cause") or ""),
+          ("valid_range_nm", "" if not vr else " - ".join(_num(x, "{:.1f}") for x in vr)),
+          ("valid_segments_nm", _segments_text(r.get("valid_segments_nm"))),
+          ("gain_span", gs_s), ("n_valid", _num(r.get("n_valid"), "{:.0f}")),
+          ("unit", r.get("unit") or ""),
+          ("wl_fingerprint", r.get("wl_fingerprint") or "")]
+    for key in ("itime_match_known", "itime_match_new",
+                "linearity_consistent", "broadband_pass"):
+        if chk.get(key) is not None:
+            m.append((f"check_{key}", _yesno(chk.get(key))))
+    for i, d in enumerate(r.get("dark_drift") or [], 1):
+        m.append((f"dark_drift_{i}",
+                  f"side={d.get('side', '')} "
+                  f"t_int_us={_num(d.get('integration_us'), '{:.0f}')} "
+                  f"mean_counts={_num(d.get('mean_counts'), '{:+.3f}')} "
+                  f"pct_of_peak={_num(d.get('pct_of_peak'), '{:.3f}')} "
+                  f"warn={_yesno(d.get('warn'), 'no')}"))
+    pl = r.get("plausibility") or {}
+    if pl:
+        met, lim = pl.get("metrics") or {}, pl.get("limits") or {}
+        m += [("plausibility_pass", _yesno(pl.get("pass"))),
+              ("plausibility_override", _yesno(pl.get("override"), "no")),
+              ("coverage_pct", _pct(met.get("coverage"), "{:.1f}")),
+              ("min_coverage_pct", _pct(lim.get("min_coverage"), "{:.1f}")),
+              ("max_gain_span", _num(lim.get("max_gain_span"), "{:.4g}")),
+              ("roughness_pct", _pct(met.get("roughness"), "{:.2f}")),
+              ("max_roughness_pct", _pct(lim.get("max_roughness"), "{:.2f}"))]
+        for i, f in enumerate(pl.get("failures") or [], 1):
+            m.append((f"plausibility_failure_{i}", _msg(f)))
+        for i, h in enumerate(pl.get("hints") or [], 1):
+            m.append((f"plausibility_hint_{i}", _msg(h)))
+    for i, w in enumerate(r.get("warnings") or [], 1):
+        m.append((f"warning_{i}", str(w)))
+    for i, p in enumerate(r.get("profiles") or [], 1):
+        m.append((f"profile_{i}", f"{p.get('id', '')} type={p.get('type', '')} "
+                                  f"version={p.get('version', '')}"))
+    return m
+
+
+def _dcell(v) -> str:
+    """CSV cell: empty for missing / non-finite values (never 'nan')."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return repr(f) if f == f and abs(f) != float("inf") else ""
+
+
+def write_derivation_csv(record: dict, path: str) -> str:
+    sp = _spectra(record)
+    wl = sp.get("wl") or []
+    valid = sp.get("valid")
+    lines = ["# derivation protocol"]
+    for k, v in _deriv_metadata(record):
+        lines.append(f"# {k};{_csv_clean(v)}")
+    lines.append(";".join(DERIVATION_CSV_COLUMNS))
+
+    def col(key, i):
+        c = sp.get(key)
+        return c[i] if c is not None and i < len(c) else None
+    for i in range(len(wl)):
+        ok = True if valid is None or i >= len(valid) else bool(valid[i])
+        s_new = col("S", i) if ok else None
+        lines.append(";".join([
+            _dcell(wl[i]), _dcell(col("C_known", i)), _dcell(col("C_known_repeat", i)),
+            _dcell(col("C_known_used", i)), _dcell(col("C_new", i)), _dcell(col("S_known", i)), _dcell(s_new),
+            _dcell(ok if valid is not None else None),
+            _dcell(col("drift_pct", i)), _dcell(col("drift_fail", i))]))
+    return _write_lines(path, lines)
+
+
+def _norm_max(np, a, valid=None):
+    a = np.asarray(a, float)
+    ref = a[valid] if valid is not None and valid.any() else a
+    ref = ref[np.isfinite(ref)]
+    m = float(np.max(np.abs(ref))) if ref.size else 0.0
+    return a / m if m > 0 else a
+
+
+def write_derivation_pdf(record: dict, path: str) -> str:
+    import numpy as np
+
+    record = record or {}
+    sp = _spectra(record)
+    wl = np.array([np.nan if v is None else float(v) for v in (sp.get("wl") or [])], float)
+    n = len(wl)
+    ck, cr, cn = (_arr(np, sp.get(k), n) for k in ("C_known", "C_known_repeat", "C_new"))
+    sk, sn = _arr(np, sp.get("S_known"), n), _arr(np, sp.get("S"), n)
+    dp = _arr(np, sp.get("drift_pct"), n)
+    vl, df = sp.get("valid"), sp.get("drift_fail")
+    valid = np.zeros(n, bool) if vl is None else np.array(
+        [bool(v) for v in vl] + [False] * max(0, n - len(vl)), bool)[:n]
+    failpx = np.zeros(n, bool) if df is None else np.array(
+        [bool(v) for v in df] + [False] * max(0, n - len(df)), bool)[:n]
+    segs = record.get("valid_segments_nm") or []
+    meta = dict(_deriv_metadata(record))
+    sides = record.get("sides") or {}
+    dr = record.get("drift") or {}
+    chk = record.get("checks") or {}
+    acq = record.get("acquisition") or {}
+
+    def shade(ax):
+        if n and segs:
+            ax.axvspan(np.nanmin(wl), np.nanmax(wl), color=GREY, alpha=0.6, lw=0)
+            for lo, hi in segs:
+                ax.axvspan(float(lo), float(hi), color="#eef6ee", alpha=1.0, lw=0)
+
+    doc = _Doc("Derivation protocol")
+    doc.title_block("Derivation protocol (optics derived from a known profile)")
+    doc.kv([("Started", meta["started"]), ("Finished", meta["finished"]),
+            ("Device", meta["device"]), ("Serial", meta["serial"] or "-"),
+            ("New optics", f"{meta['new_optics_name']} ({meta['new_optics_input']})"),
+            ("Known profile", f"{meta['known_profile_id'] or '-'} v{meta['known_profile_version'] or '-'}"),
+            ("Known optics", f"{meta['known_optics_name']} ({meta['known_optics_input']})"),
+            ("Type / unit", f"{meta['type']} / {meta['unit']}"),
+            ("Averages N", meta["averages_N"]), ("NL correction", meta["nl_correction"]),
+            ("Valid range", f"{meta['valid_range_nm']} nm" if meta["valid_range_nm"] else "-"),
+            ("Gain span (hint)", meta["gain_span"] or "-"),
+            ("Valid pixels", meta["n_valid"] or "-")])
+    doc.kv([("New optics notes", meta["new_optics_notes"] or "-"),
+            ("Valid segments", (meta["valid_segments_nm"] + " nm") if meta["valid_segments_nm"] else "-"),
+            ("WL fingerprint", meta["wl_fingerprint"] or "-")], ncols=1)
+    doc.heading("Source")
+    doc.para(meta["source_hint"] or "-")
+
+    # per-side acquisition
+    doc.heading("Acquisition per optics")
+    kn, nw = sides.get("known") or {}, sides.get("new") or {}
+
+    def both(fn):
+        return [fn(kn), fn(nw)]
+    rows = [
+        ["Integration time"] + both(lambda s: _num(
+            None if s.get("integration_us") is None else s["integration_us"] / 1000,
+            "{:.4g} ms", "n/a")),
+        ["Setting"] + both(lambda s: _exposure_text(s) or "n/a"),
+        ["Level, light capture"] + both(lambda s: _pct(s.get("peak_frac"), "{:.1f} % FS") or "n/a"),
+        ["Level, repeat"] + [_pct(kn.get("peak_frac_repeat"), "{:.1f} % FS") or "n/a", "-"],
+        ["Saturated pixels"] + both(lambda s: _num(s.get("n_saturated"), "{:.0f}", "n/a")),
+        ["Dark sequence"] + both(lambda s: s.get("dark_sequence") or "n/a"),
+        ["Dark and light at the same integration time"] + both(
+            lambda s: _status(s.get("itime_match"), "yes", "NO")),
+        ["Linearity correction"] + both(lambda s: _onoff(s.get("linearity_text"))),
+        ["NL correction (device)", _nl_text(acq), _nl_text(acq)],
+    ]
+    doc.table(["Parameter", "Known optics", "New optics"], rows, [3.2, 2.4, 2.4])
+
+    # plot 1: count rates, normalised
+    doc.heading("Count rates (normalised to the maximum)")
+    a1 = doc.plot(115)
+    if n and np.isfinite(ck).any():
+        shade(a1)
+        a1.plot(wl, _norm_max(np, ck, valid), color=BLUE, lw=1.2, label="C_known")
+        if np.isfinite(cr).any():
+            a1.plot(wl, _norm_max(np, cr, valid), color=DARK, lw=0.8, ls="--",
+                    label="C_known (repeat)")
+        a1.plot(wl, _norm_max(np, cn, valid), color=ORANGE, lw=1.2, label="C_new")
+        a1.legend(fontsize=7, loc="upper right")
+        _style_axes(a1, "wavelength (nm)", "C (normalised)")
+    else:
+        doc.nodata(a1)
+
+    # plot 2: S
+    doc.heading("Sensitivity (valid pixels only)")
+    a2 = doc.plot(115)
+    if n and np.isfinite(sn).any():
+        shade(a2)
+        a2.plot(wl, np.where(valid, sk, np.nan), color=BLUE, lw=1.2, label="S_known")
+        a2.plot(wl, np.where(valid, sn, np.nan), color=ORANGE, lw=1.3, label="S_new")
+        a2.legend(fontsize=7, loc="upper right")
+        _style_axes(a2, "wavelength (nm)", "S (relative)")
+    else:
+        doc.nodata(a2)
+
+    # source drift
+    doc.heading("Source drift (repeat with the known optics; dashed: +/- limit; "
+                "red ticks: masked pixels)")
+    a3 = doc.plot(95)
+    if n and np.isfinite(dp).any():
+        shade(a3)
+        a3.plot(wl, dp, color=BLUE, lw=1, label="drift per pixel")
+        th = dr.get("threshold_pct")
+        if th is not None:
+            for s in (1, -1):
+                a3.axhline(s * float(th), color=ORANGE, ls="--", lw=0.8)
+            lo, hi = a3.get_ylim()
+            a3.set_ylim(min(lo, -1.2 * float(th)), max(hi, 1.2 * float(th)))
+        a3.axhline(0, color="#888888", lw=0.6)
+        if failpx.any():
+            a3.plot(wl[failpx], np.full(int(failpx.sum()), 0.02), "|", color=RED, ms=7,
+                    transform=a3.get_xaxis_transform(), label="masked pixel")
+        a3.legend(fontsize=7, loc="upper right")
+        _style_axes(a3, "wavelength (nm)", "drift (%)")
+    else:
+        doc.nodata(a3, "no repeat measurement")
+
+    doc.heading("Checks")
+    if dr:
+        drows = [[_num(dr.get("p95_pct"), "{:.2f} %", "n/a"),
+                  _num(dr.get("mean_pct"), "{:+.2f} %", "n/a"),
+                  _num(dr.get("threshold_pct"), "{:.2f} %", "n/a"),
+                  _status(dr.get("pass")),
+                  f"{_num(dr.get('n_fail_pixels'), '{:.0f}', 'n/a')} of "
+                  f"{_num(dr.get('n_tested'), '{:.0f}', 'n/a')}",
+                  _num(dr.get("seconds"), "{:.0f} s", "n/a")]]
+        doc.table(["Drift (p95)", "Mean", "Limit", "Result", "Masked pixels", "Duration"],
+                  drows, [1.4, 1.2, 1.2, 1.2, 1.6, 1.2],
+                  row_fill=[WARN_FILL if dr.get("pass") is False else None])
+        doc.para(f"Cause: {dr.get('cause') or 'n/a'}")
+    else:
+        doc.para("Source drift was not checked (no repeat with the known optics).",
+                 7.5, RED)
+    pl = record.get("plausibility") or {}
+    crow = [["Dark and light, known optics", _status(chk.get("itime_match_known"), "yes", "NO")],
+            ["Dark and light, new optics", _status(chk.get("itime_match_new"), "yes", "NO")],
+            ["Linearity correction unchanged", _status(chk.get("linearity_consistent"), "yes", "NO")]]
+    if pl:
+        crow.append(["Broadband / coverage",
+                     ("passed", DARK) if pl.get("pass") else (
+                         ("FAILED (saved on request)", RED) if pl.get("override")
+                         else ("FAILED", RED))])
+    doc.table(["Check", "Result"], crow, [4, 2])
+
+    dd = record.get("dark_drift") or []
+    if dd:
+        doc.heading("Dark drift (dark before / after, per optics)")
+        rws, fills = [], []
+        for d in dd:
+            warn = bool(d.get("warn"))
+            rws.append([dict(_DERIV_SIDES).get(d.get("side"), str(d.get("side") or "")),
+                        _num(None if d.get("integration_us") is None
+                             else d["integration_us"] / 1000, "{:.4g} ms", "n/a"),
+                        _num(d.get("mean_counts"), "{:+.2f}", "n/a"),
+                        _num(d.get("pct_of_peak"), "{:.3f} %", "n/a"),
+                        ("WARN", RED) if warn else ("ok", DARK)])
+            fills.append(WARN_FILL if warn else None)
+        doc.table(["Optics", "t_int", "Mean (counts)", "% of peak", "Status"], rws,
+                  [2, 1.4, 1.6, 1.4, 1.2], row_fill=fills)
+    if pl:
+        if pl.get("failures"):
+            doc.heading("Plausibility failures")
+            doc.bullets([_msg(f) for f in pl["failures"]], color=RED)
+        if pl.get("hints"):
+            doc.heading("Hints (informational, not failures)")
+            doc.bullets([_msg(h) for h in pl["hints"]])
+    doc.heading("Warnings")
+    doc.bullets([str(w) for w in (record.get("warnings") or [])])
+    doc.heading("Saved profiles")
+    doc.bullets([f"{p.get('id', '')}  type={p.get('type', '')}  v{p.get('version', '')}"
+                 for p in (record.get("profiles") or [])])
+    return doc.save(path)
+
+
+def write_derivation_protocol(record: dict, pdf_path: str | None = None,
+                              csv_path: str | None = None) -> list[str]:
+    out = []
+    if csv_path:
+        out.append(write_derivation_csv(record, csv_path))
+    if pdf_path:
+        out.append(write_derivation_pdf(record, pdf_path))
     return out

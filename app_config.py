@@ -114,6 +114,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Dark before/after each light capture: warn when the dark level changed
     # by more than this share of the net peak signal (%) (and > 3 σ).
     "calibration_dark_drift_warn_pct": 0.5,
+    # Derivation of an optics configuration from a known one: the known optics
+    # is measured again at the end; a source drift (p95 over the tested
+    # pixels, %) above this fails the drift check, failing pixels are masked.
+    "calibration_derivation_drift_pct": 2.0,
+    # Saturation warning threshold (fraction of full scale, raw ADC peak):
+    # exposure meter (desktop + web) and calibration runs. The auto-exposure
+    # target band (calibration_target_frac_hi) is capped at this value.
+    "saturation_warn_frac": 0.90,
     # Verification after saving a profile: reference source measured through
     # the live pipeline, normalised over this range, deviation per band.
     "calibration_verify_norm_lo_nm": 550.0,

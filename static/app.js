@@ -2627,7 +2627,8 @@ const Jobs = (() => {
 
   const TITLES = {
     cover: 'Cover the light path', uncover: 'Uncover the light path',
-    mount_known: 'Mount the known optics', swap_optics: 'Swap to the new optics',
+    mount_known: 'Mount the known optics', swap_optics: 'Mount the new optics',
+    swap_back: 'Mount the known optics again',
   };
 
   function renderBar() {
@@ -3133,8 +3134,9 @@ const CalRun = (() => {
   const PLAN = {
     lamp: ['wavelength_check', 'integration', 'dark', 'calibration_capture',
            'crosscheck', 'compute', 'save', 'protocol'],
-    derive: ['integration', 'known', 'dark_known', 'light_known', 'new',
-             'dark_new', 'light_new', 'compute'],
+    derive: ['mount_known', 'integration_known', 'dark_known', 'light_known', 'swap_optics',
+             'integration_new', 'dark_new', 'light_new', 'dark_new_after', 'swap_back',
+             'repeat_known', 'dark_known_after', 'compute', 'save'],
   };
   const LABELS = {
     wavelength_check: 'Wavelength check', integration: 'Integration time',
@@ -3143,6 +3145,13 @@ const CalRun = (() => {
     protocol: 'Protocol (PDF + CSV)', known: 'Known optics', new: 'New optics',
     dark_known: 'Dark (known optics)', light_known: 'Light (known optics)',
     dark_new: 'Dark (new optics)', light_new: 'Light (new optics)',
+    mount_known: 'Mount the known optics on the source',
+    integration_known: 'Integration time (known optics)',
+    integration_new: 'Integration time (new optics)',
+    swap_optics: 'Mount the new optics on the same source',
+    dark_new_after: 'Dark after (new optics)', swap_back: 'Mount the known optics again',
+    repeat_known: 'Repeat with the known optics (source drift)',
+    dark_known_after: 'Dark after (known optics)',
   };
   const label = (s) => LABELS[s] || String(s).replace(/_/g, ' ');
 
@@ -3177,12 +3186,13 @@ const CalRun = (() => {
     $('#cr-mode-derive').classList.toggle('on', m === 'derive');
     document.querySelectorAll('#calrun-dialog .lamp-only').forEach((e) => { e.hidden = m !== 'lamp'; });
     document.querySelectorAll('#calrun-dialog .derive-only').forEach((e) => { e.hidden = m !== 'derive'; });
+    $('#cr-save-failed-text').textContent = m === 'lamp' ? 'Save although checks failed'
+      : 'Save although the drift check failed';
     $('#calrun-title').textContent = m === 'lamp' ? 'Calibration run' : 'Derive new optics';
   }
 
   function updateWarn() {
-    const on = $('#cr-allow-implausible').checked ||
-      (mode === 'lamp' && $('#cr-save-failed').checked);
+    const on = $('#cr-allow-implausible').checked || $('#cr-save-failed').checked;
     $('#cr-warn').hidden = !on;
   }
 
@@ -3220,26 +3230,35 @@ const CalRun = (() => {
     const name = $('#cr-name').value.trim();
     if (!name) { toast('Enter an optics name'); $('#cr-name').focus(); return; }
     const optics = { name, input: $('#cr-input').value, notes: $('#cr-notes').value.trim() };
-    const fixed = $('#cr-int-mode').value === 'fixed';
-    const ms = parseFloat($('#cr-int-ms').value);
-    if (fixed && !(ms > 0)) { toast('Enter a valid integration time'); return; }
     const frames = parseInt($('#cr-frames').value, 10);
     const body = {
       optics,
-      integration_ms: fixed ? ms : 'auto',
       allow_implausible: $('#cr-allow-implausible').checked,
+      save_on_failed_checks: $('#cr-save-failed').checked,
+    };
+    // integration time: one value (lamp run) or one per optics (derivation)
+    const intField = (modeId, msId, what) => {
+      if ($(modeId).value !== 'fixed') return 'auto';
+      const v = parseFloat($(msId).value);
+      if (!(v > 0)) { toast(`Enter a valid integration time${what}`); return null; }
+      return v;
     };
     if (isFinite(frames)) body.frames = frames;
     let url;
     if (mode === 'lamp') {
       body.kind = $('#cr-kind').value;
       body.reference_id = $('#cr-ref').value;
-      body.save_on_failed_checks = $('#cr-save-failed').checked;
+      body.integration_ms = intField('#cr-int-mode', '#cr-int-ms', '');
+      if (body.integration_ms === null) return;
       if (!body.reference_id) { toast('Choose a reference source'); return; }
       url = '/api/v1/calibration/runs';
     } else {
       body.known_profile_id = $('#cr-known').value;
       if (!body.known_profile_id) { toast('Choose the known profile'); return; }
+      body.integration_known_ms = intField('#cr-int-known-mode', '#cr-int-known-ms', ' (known optics)');
+      if (body.integration_known_ms === null) return;
+      body.integration_new_ms = intField('#cr-int-new-mode', '#cr-int-new-ms', ' (new optics)');
+      if (body.integration_new_ms === null) return;
       url = '/api/v1/calibration/derivations';
     }
     if (body.allow_implausible || body.save_on_failed_checks) {
@@ -3311,6 +3330,40 @@ const CalRun = (() => {
       row('Integration-time cross check', ck.itime_crosscheck_pct, ck.itime_pass,
           ck.itime_fail_pixels, ck.itime_cause, causes.itime) +
       '</tbody></table></div>'];
+  }
+  // derivation: both sides (integration time, drive level), source drift, consistency
+  function derivationHtml(res) {
+    const out = [];
+    const ms = (us) => (us == null || !isFinite(us)) ? '—' : `${fnum(Number(us) / 1000, 3)} ms`;
+    const pc = (f) => (f == null || !isFinite(f)) ? '—' : `${fnum(100 * Number(f), 1)} % FS`;
+    if (res.integration_known_us != null || res.integration_new_us != null) {
+      out.push('<div class="cr-sub">Integration time and drive level</div><div class="tbl-wrap">' +
+        '<table class="mini-table"><thead><tr><th>Optics</th><th>t_int</th><th>Peak</th></tr></thead><tbody>' +
+        `<tr><td>Known</td><td class="num">${ms(res.integration_known_us)}</td><td class="num">${pc(res.peak_frac_known)}</td></tr>` +
+        `<tr><td>New</td><td class="num">${ms(res.integration_new_us)}</td><td class="num">${pc(res.peak_frac_new)}</td></tr>` +
+        `<tr><td>Known, repeat</td><td class="num">${ms(res.integration_known_us)}</td><td class="num">${pc(res.peak_frac_repeat)}</td></tr>` +
+        '</tbody></table></div>');
+    }
+    const d = res.drift;
+    if (d && typeof d === 'object') {
+      const pass = d.pass === true ? 'pass' : (d.pass === false ? 'FAIL' : 'n/a');
+      out.push('<div class="cr-sub">Source drift (known optics, first capture vs. repeat)</div><div class="tbl-wrap">' +
+        '<table class="mini-table"><thead><tr><th>p95</th><th>Mean</th><th>Limit</th><th>Result</th>' +
+        '<th>Masked pixels</th><th>Cause</th></tr></thead><tbody>' +
+        `<tr class="${d.pass === false ? 'bad' : ''}"><td class="num">${fnum(d.p95_pct, 2)} %</td>` +
+        `<td class="num">${fnum(d.mean_pct, 2)} %</td><td class="num">${fnum(d.threshold_pct, 2)} %</td>` +
+        `<td>${pass}</td><td class="num">${d.n_fail_pixels == null ? '—' : esc(d.n_fail_pixels)}</td>` +
+        `<td class="msg">${esc(d.cause || '') || '—'}</td></tr></tbody></table></div>`);
+    } else if (res.checks) {
+      out.push('<div class="kv">Source drift: not checked.</div>');
+    }
+    const ck = res.checks || {};
+    const bad = [];
+    if (ck.itime_match_known === false) bad.push('integration times of the known optics differ between dark and light');
+    if (ck.itime_match_new === false) bad.push('integration times of the new optics differ between dark and light');
+    if (ck.linearity_consistent === false) bad.push('the linearity correction changed between the captures');
+    if (bad.length) out.push('<div><b>Consistency</b></div><ul>' + bad.map((b) => `<li>${esc(b)}</li>`).join('') + '</ul>');
+    return out;
   }
   function darkDriftHtml(dd) {
     if (!Array.isArray(dd) || !dd.length) return [];
@@ -3387,7 +3440,9 @@ const CalRun = (() => {
         extra.push('<div class="kv">Run again with “Save even if implausible” to store it flagged.</div>');
       }
       if (res.status === 'not_saved_checks_failed') {
-        extra.push('<div class="kv">Run again with “Save although checks failed” to store it anyway.</div>');
+        extra.push('<div class="kv">Run again with “Save although ' +
+          (job.kind === 'derivation' ? 'the drift check failed' : 'checks failed') +
+          '” to store it anyway.</div>');
       }
     }
     const pl = res.plausibility;
@@ -3397,7 +3452,8 @@ const CalRun = (() => {
     } else if (pl && pl.pass) {
       extra.push('<div class="kv">Plausibility: passed.</div>');
     }
-    extra.push(...checksHtml(res));
+    if (job.kind === 'derivation') extra.push(...derivationHtml(res));
+    else extra.push(...checksHtml(res));
     extra.push(...darkDriftHtml(res.dark_drift));
     const hints = pl && Array.isArray(pl.hints) ? pl.hints : [];
     if (hints.length) {
@@ -3427,7 +3483,7 @@ const CalRun = (() => {
     }
     const prot = Array.isArray(res.protocol) ? res.protocol.map((p) => String(p).toLowerCase()) : [];
     const links = [];
-    if (job.kind === 'calibration' && job.status === 'done') {
+    if ((job.kind === 'calibration' || job.kind === 'derivation') && prot.length) {
       if (prot.some((p) => p.endsWith('.pdf'))) links.push(['pdf', 'Protocol (PDF)']);
       if (prot.some((p) => p.endsWith('.csv'))) links.push(['csv', 'Protocol (CSV)']);
     }
@@ -3473,6 +3529,11 @@ const CalRun = (() => {
     $('#cr-int-mode').addEventListener('change', () => {
       $('#cr-int-ms').disabled = $('#cr-int-mode').value !== 'fixed';
     });
+    for (const w of ['known', 'new']) {
+      $(`#cr-int-${w}-mode`).addEventListener('change', () => {
+        $(`#cr-int-${w}-ms`).disabled = $(`#cr-int-${w}-mode`).value !== 'fixed';
+      });
+    }
     $('#cr-allow-implausible').addEventListener('change', updateWarn);
     $('#cr-save-failed').addEventListener('change', updateWarn);
     $('#cr-start').addEventListener('click', () => {
@@ -3486,7 +3547,7 @@ const CalRun = (() => {
       const a = e.target.closest('[data-protocol]');
       if (a && jobId) {
         apiDownload(`/api/v1/calibration/runs/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.protocol}`,
-                    `calibration_protocol.${a.dataset.protocol}`);
+                    `${mode === 'derive' ? 'derivation' : 'calibration'}_protocol.${a.dataset.protocol}`);
       }
     });
   }
@@ -3892,11 +3953,19 @@ const DisplayMode = (() => {
       return;
     }
     const pct = Number(ex.peak_pct_fs);
-    const sat = !!ex.saturated || pct >= 100;
-    bar.className = 'exposure-bar ' + (sat ? 'danger' : (pct >= 90 ? 'warn' : ''));
+    const sat = !!ex.saturated || Number(ex.n_saturated) > 0;
+    // state and threshold come from the server (config key saturation_warn_frac)
+    const warnPct = ex.warn_pct_fs != null && isFinite(ex.warn_pct_fs) ? Number(ex.warn_pct_fs) : null;
+    let state = ex.state;
+    if (state !== 'ok' && state !== 'warn' && state !== 'danger') {
+      state = sat ? 'danger' : (warnPct != null && pct >= warnPct ? 'warn' : 'ok');
+    }
+    bar.className = 'exposure-bar ' + (state === 'danger' ? 'danger' : (state === 'warn' ? 'warn' : ''));
+    bar.title = 'Peak of the raw signal relative to the detector full scale' +
+      (warnPct != null ? `; warning from ${warnPct.toFixed(0)} % FS` : '');
     let t = `Peak ${pct.toFixed(0)} % FS`;
     if (ex.n_saturated > 0) t += ` · ${ex.n_saturated} px saturated`;
-    else if (sat) t += ' · saturated';
+    else if (state === 'danger') t += ' · saturated';
     txt.textContent = t;
     fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
   }

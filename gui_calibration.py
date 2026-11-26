@@ -957,8 +957,10 @@ def _norm(a, valid=None):
 _LAMP_STEPS = ["Selection", "Wavelength check", "Integration time", "Dark before",
                "Calibration + repeat", "t/2 capture", "Dark after + checks", "Compute",
                "Save", "Verification"]
-_DERIV_STEPS = ["Selection", "Integration time", "Known optics (dark + light)",
-                "New optics (dark + light)", "Compute", "Save"]
+_DERIV_KEYS = ["selection"] + [k for k, _ in cw.DERIVATION_STEPS] + ["protocol"]
+_DERIV_STEPS = (["Selection"] + [label for _, label in cw.DERIVATION_STEPS]
+                + ["Protocol"])
+_DERIV_IX = {k: i for i, k in enumerate(_DERIV_KEYS)}
 _STATE_TEXT = {"waiting": "waiting", "running": "running", "ok": "OK",
                "warning": "warning", "error": "ERROR", "failed": "FAILED"}
 # Leading symbol: the state stays recognisable without colour.
@@ -1052,11 +1054,13 @@ class _SpectralWizardTab(QWidget):
 
         g = QGridLayout()
         g.setHorizontalSpacing(6)
-        g.addWidget(QLabel("Integration:"), 0, 0)
+        self.lbl_itime_cap = QLabel("Integration:")
+        g.addWidget(self.lbl_itime_cap, 0, 0)
         self.cmb_itime = QComboBox()
         self.cmb_itime.addItems(["Auto", "Fixed"])
-        self.cmb_itime.setToolTip("Auto: exposure to the target level (70–85 % of "
-                                  "full scale). Fixed: the value on the right.")
+        self.cmb_itime.setToolTip("Auto: exposure to the configured target band "
+                                  "(calibration_target_frac_lo/hi, limited by "
+                                  "saturation_warn_frac). Fixed: the value on the right.")
         self.cmb_itime.currentIndexChanged.connect(self._itime_mode_changed)
         g.addWidget(self.cmb_itime, 0, 1)
         self.spn_ms = QDoubleSpinBox()
@@ -1223,12 +1227,34 @@ class _SpectralWizardTab(QWidget):
         f.addRow(self.lbl_ref_info)
         return w
 
+    def _itime_row(self, which: str):
+        """Auto / fixed integration time of one optics (own value per side)."""
+        cmb = QComboBox()
+        cmb.addItems(["Auto", "Fixed"])
+        cmb.setToolTip("Auto: exposure to the configured target band with this "
+                       "optics mounted and the source on. Fixed: the value on the right.")
+        spn = QDoubleSpinBox()
+        spn.setRange(0.01, 60000.0); spn.setDecimals(2)
+        spn.setValue(100.0); spn.setSuffix(" ms")
+        spn.setEnabled(False)
+        cmb.currentIndexChanged.connect(
+            lambda _i=0, c=cmb, s=spn: s.setEnabled(c.currentIndex() == 1))
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(cmb)
+        row.addWidget(spn, 1)
+        return cmb, spn, row
+
     def _build_deriv_form(self) -> QWidget:
         w, f = self._form()
-        hint = QLabel("Same diffuse, extended source with the known and the new "
-                      "optics: S_new = S_known · C_new / C_known.")
+        hint = QLabel("Same source with the known and the new optics: "
+                      "S_new = S_known · C_new / C_known. Each optics has its own "
+                      "integration time and dark spectra.")
         hint.setWordWrap(True)
         f.addRow(hint)
+        self.lbl_source_hint = QLabel(f"<b>{cw.DERIVATION_SOURCE_HINT}</b>")
+        self.lbl_source_hint.setWordWrap(True)
+        self.lbl_source_hint.setTextFormat(Qt.TextFormat.RichText)
+        f.addRow(self.lbl_source_hint)
         self.cmb_known = self._narrow_combo(QComboBox())
         f.addRow("Known:", self.cmb_known)
         self.edit_new_name = QLineEdit()
@@ -1240,6 +1266,10 @@ class _SpectralWizardTab(QWidget):
         self.edit_new_notes = QLineEdit()
         self.edit_new_notes.setPlaceholderText("Notes")
         f.addRow("Notes:", self.edit_new_notes)
+        self.cmb_itime_known, self.spn_ms_known, row = self._itime_row("known")
+        f.addRow("Integration (known):", row)
+        self.cmb_itime_new, self.spn_ms_new, row = self._itime_row("new")
+        f.addRow("Integration (new):", row)
         return w
 
     # ── refresh / small slots ────────────────────────────────────────────
@@ -1362,6 +1392,8 @@ class _SpectralWizardTab(QWidget):
         if self.running:
             return
         self.stack.setCurrentIndex(i)
+        for wdg in (self.lbl_itime_cap, self.cmb_itime, self.spn_ms):
+            wdg.setVisible(i == 0)               # derivation: one time per optics
         self._set_steps(_LAMP_STEPS if i == 0 else _DERIV_STEPS)
 
     # ── step list ────────────────────────────────────────────────────────
@@ -1494,8 +1526,9 @@ class _SpectralWizardTab(QWidget):
         self._reset_plots()
         cfg = cw.WorkflowConfig.from_config()
         cfg.n_frames = int(self.spn_frames.value())
-        us = (None if self.cmb_itime.currentIndex() == 0
-              else int(round(self.spn_ms.value() * 1000.0)))
+        def fixed_us(cmb, spn):
+            return None if cmb.currentIndex() == 0 else int(round(spn.value() * 1000.0))
+        us = fixed_us(self.cmb_itime, self.spn_ms)
         try:
             if self.cmb_mode.currentIndex() == 0:
                 src = rs.ReferenceLibrary().get(self.cmb_ref.currentData() or "")
@@ -1523,7 +1556,9 @@ class _SpectralWizardTab(QWidget):
                             "input": self.cmb_new_input.currentText(),
                             "notes": self.edit_new_notes.text().strip()},
                     cfg=cfg)
-                gen = self._gen_deriv(self._dw, us)
+                gen = self._gen_deriv(
+                    self._dw, fixed_us(self.cmb_itime_known, self.spn_ms_known),
+                    fixed_us(self.cmb_itime_new, self.spn_ms_new))
         except (ValueError, KeyError) as e:
             QMessageBox.warning(self, "Selection incomplete", str(e))
             return
@@ -1832,7 +1867,7 @@ class _SpectralWizardTab(QWidget):
             extra.append(_span(t.WARN, "<br>".join(other)))
         self.lbl_result.setText(self._result_text(res, wf.plausibility, extra))
 
-    def _write_protocol(self, wf):
+    def _write_protocol(self, wf, derivation: bool = False):
         """Generator fragment: the record is built here (GUI thread), the PDF /
         CSV are written in the worker thread (matplotlib is slow)."""
         try:
@@ -1846,10 +1881,12 @@ class _SpectralWizardTab(QWidget):
             import export_paths
             rec = wf.record()
             d, note = export_paths.calibration_protocol_dir()
-            base = crp.default_protocol_basename(rec)
+            base = (crp.default_derivation_basename(rec) if derivation
+                    else crp.default_protocol_basename(rec))
+            write = crp.write_derivation_protocol if derivation else crp.write_protocol
             pdf, csv_ = os.path.join(d, base + ".pdf"), os.path.join(d, base + ".csv")
             self.lbl_status.setText("Writing the protocol…")
-            paths = yield (lambda: crp.write_protocol(rec, pdf, csv_))
+            paths = yield (lambda: write(rec, pdf, csv_))
             self.protocol_paths = list(paths or [])
             self.protocol_message = note or ""
         except Exception as e:                                # noqa: BLE001
@@ -1859,83 +1896,270 @@ class _SpectralWizardTab(QWidget):
         self._set_protocol_display()
 
     # derivation ----------------------------------------------------------
-    def _capture_pair(self, dw, which, cover):
-        """Dark + light for `which` (generator fragment), with the cover /
-        uncover prompts between them on devices without a shutter. Uses the
-        split DerivationWorkflow steps (no capture/rate logic here)."""
-        if cover and not _ask(self, "Dark spectrum",
-                              "Block the light path / cover the source.\n\n"
-                              "The dark spectrum is captured next.", ok_cancel=True):
-            raise _Abort("cancelled at the dark prompt")
-        yield (lambda: dw.capture_dark_for(which))
-        if cover and not _ask(self, "Release the light path",
-                              "Release the light path / uncover the source.\n\n"
-                              "The light spectrum is captured next.", ok_cancel=True):
-            raise _Abort("cancelled at the light prompt")
-        yield (lambda: dw.capture_light_for(which))
+    def _deriv_prompt(self, title: str, text: str) -> None:
+        if not _ask(self, title, text, ok_cancel=True):
+            raise _Abort(f"cancelled at the prompt '{title}'")
 
-    def _gen_deriv(self, dw, us):
+    def _deriv_cover(self, dw, what: str) -> None:
+        """Dark prompt (devices without a shutter only)."""
+        if dw.needs_user_cover:
+            self._deriv_prompt("Dark spectrum",
+                               "Block the light path / cover the source.\n\n"
+                               f"The dark spectrum ({what}) is captured next.")
+
+    def _deriv_uncover(self, dw, what: str) -> None:
+        if dw.needs_user_cover:
+            self._deriv_prompt("Release the light path",
+                               "Release the light path / uncover the source.\n\n"
+                               f"The {what} is captured next.")
+
+    @staticmethod
+    def _side_label(which: str) -> str:
+        return "known optics" if which == cw.SIDE_KNOWN else "new optics"
+
+    def _deriv_itime_text(self, dw) -> str:
+        """One line: integration time and level per side."""
+        parts = []
+        for s, nm in ((cw.SIDE_KNOWN, "Known"), (cw.SIDE_NEW, "New")):
+            t = dw.itime.get(s)
+            if t is None:
+                continue
+            ex = dw.exposure.get(s) or {}
+            light = dw.lights.get(s)
+            txt = f"{nm}: {t / 1000:.3f} ms"
+            if ex.get("auto") is not None:
+                txt += " (auto)" if ex.get("auto") else " (fixed)"
+            if light is not None:
+                txt += f", {100 * light.peak_frac:.0f} % FS"
+            parts.append(txt)
+        return " · ".join(parts)
+
+    def _deriv_peak_state(self, dw, which: str) -> tuple[str, str]:
+        light = dw.lights.get(which)
+        if light is None:
+            return "ok", ""
+        high = light.peak_frac >= dw.cfg.saturation_warn_frac
+        return ("warning" if high else "ok"), f"{100 * light.peak_frac:.0f} % FS"
+
+    def _gen_deriv(self, dw, us_known, us_new=None):
+        I = _DERIV_IX                                          # noqa: N806
         step = 0
-        cover = not getattr(dw.backend, "SUPPORTS_SHUTTER", False)
+
+        def begin(key):
+            nonlocal step
+            step = I[key]
+            self._checkpoint()
+            self._state(step, "running")
+
+        def itime_step(which, us, key):
+            begin(key)
+            self.lbl_status.setText(f"Setting the integration time ({self._side_label(which)})…")
+            info = yield (lambda: dw.set_integration(which, us))
+            self.lbl_itime.setText(self._deriv_itime_text(dw))
+            t = info["integration_us"]
+            txt = f"{t / 1000:.3f} ms, " + ("auto exposure" if info["auto"] else "fixed")
+            if info.get("peak_frac") is not None:
+                txt += f", {100 * info['peak_frac']:.0f} % FS"
+            if info["auto"] and not info.get("converged", True):
+                txt += ", target band not reached"
+            self._state(step, "ok" if info.get("converged", True) else "warning", txt)
+
+        def dark_step(which, key, phase="before"):
+            begin(key)
+            what = f"{self._side_label(which)}" + (", after" if phase == "after" else "")
+            self._deriv_cover(dw, what)
+            self.lbl_status.setText(f"Capturing the dark spectrum ({what})…")
+            d = yield (lambda: dw.capture_dark_for(which, phase))
+            self._state(step, "ok", f"{d.integration_us / 1000:.3f} ms, "
+                                    f"peak {d.peak_counts:.0f} counts")
+
+        def light_step(which, key, uncover_what):
+            begin(key)
+            self._deriv_uncover(dw, uncover_what)
+            side = cw.SIDE_KNOWN if which == cw.SIDE_REPEAT else which
+            self.lbl_status.setText(f"Capturing the light spectrum ({self._side_label(side)}"
+                                    + (", repeat)…" if which == cw.SIDE_REPEAT else ")…"))
+            yield (lambda: dw.capture_light_for(which))
+            self.lbl_itime.setText(self._deriv_itime_text(dw))
+            st, txt = self._deriv_peak_state(dw, which)
+            self._state(step, st, txt)
+
         try:
             self._state(0, "ok", f"{(dw.known.get('optics') or {}).get('name')} → "
                                  f"{dw.optics['name']} ({dw.optics['input']})")
-            step = 1; self._checkpoint(); self._state(1, "running")
-            self.lbl_status.setText("Setting the integration time…")
-            t = yield (lambda: dw.set_integration(us))
-            self.lbl_itime.setText(f"t_int = {t/1000:.2f} ms")
-            self._state(1, "ok", self.lbl_itime.text())
-            step = 2; self._checkpoint(); self._state(2, "running")
-            QMessageBox.information(
-                self, "Known optics",
-                "Mount the known optics on the diffuse, extended source.\n\n"
-                "The capture starts after confirmation.")
-            self.lbl_status.setText("Capturing with the known optics…")
-            yield from self._capture_pair(dw, "known", cover)
-            self._state(2, "ok")
-            step = 3; self._checkpoint(); self._state(3, "running")
-            if not _ask(self, "Swap optics",
-                        "Mount the NEW optics on the same diffuse, extended source "
-                        "(same position, same lamp).",
-                        ok_cancel=True):
-                raise _Abort("cancelled at the optics swap")
-            self.lbl_status.setText("Capturing with the new optics…")
-            yield from self._capture_pair(dw, "new", cover)
-            self._state(3, "ok")
-            step = 4; self._checkpoint(); self._state(4, "running")
-            res = yield dw.compute
-            self._show_deriv_result(dw, res)
-            if dw.plausible:
-                self._state(4, "ok",
-                            f"valid {calprof.format_segments(res.get('segments_nm'), 3)}")
-            else:
-                self._state(4, "failed", "plausibility check failed: "
-                            + "; ".join(dw.plausibility["failures"]))
-            step = 5; self._checkpoint()
-            activate = dw.plausible
-            if not activate and not self._confirm_implausible(dw.plausibility["failures"]):
-                self._state(5, "failed", "not saved (plausibility check failed)")
+            # known optics
+            begin("mount_known")
+            self._deriv_prompt(
+                "Known optics",
+                f"{cw.DERIVATION_SOURCE_HINT}\n\n"
+                "Mount the KNOWN optics on the source and keep the light path "
+                "open. The integration time of this optics is set next.")
+            self._state(step, "ok")
+            yield from itime_step(cw.SIDE_KNOWN, us_known, "integration_known")
+            yield from dark_step(cw.SIDE_KNOWN, "dark_known")
+            yield from light_step(cw.SIDE_KNOWN, "light_known", "light spectrum")
+            # new optics
+            begin("swap_optics")
+            self._deriv_prompt(
+                "New optics",
+                "Mount the NEW optics on the same source (same position, same "
+                "power) and keep the light path open. The integration time of "
+                "this optics is set next.")
+            self._state(step, "ok")
+            yield from itime_step(cw.SIDE_NEW, us_new, "integration_new")
+            yield from dark_step(cw.SIDE_NEW, "dark_new")
+            yield from light_step(cw.SIDE_NEW, "light_new", "light spectrum")
+            yield from dark_step(cw.SIDE_NEW, "dark_new_after", "after")
+            # known optics again (source drift)
+            begin("swap_back")
+            self._deriv_prompt(
+                "Known optics again",
+                "Mount the KNOWN optics again on the same source (same position, "
+                "same power) and keep the light path open. It is measured once "
+                "more to detect source drift.")
+            self._state(step, "ok")
+            yield from light_step(cw.SIDE_REPEAT, "repeat_known", "repeat spectrum")
+            yield from dark_step(cw.SIDE_KNOWN, "dark_known_after", "after")
+            # compute
+            begin("compute")
+            self.lbl_status.setText("Computing S_new…")
+            try:
+                res = yield dw.compute
+            except ValueError as e:                           # no valid pixel at all
+                self._state(step, "failed", str(e))
+                self._state(I["save"], "failed", "not saved")
                 self.last_status = "failed"
-                self.lbl_status.setText("Derivation failed: result not plausible, "
+                self.lbl_result.setText(_span(_T().DANGER, f"<b>FAILED</b>: {e}"))
+                yield from self._write_protocol(dw, derivation=True)
+                self.lbl_status.setText("Derivation failed: no valid pixels, "
                                         "no profile saved.")
                 return
-            self._state(5, "running")
+            self._show_deriv_result(dw, res)
+            self._deriv_check_states(dw)
+            if dw.plausible:
+                self._state(step, "ok",
+                            f"valid {calprof.format_segments(res.get('segments_nm'), 3)}")
+            else:
+                self._state(step, "failed", "plausibility check failed: "
+                            + "; ".join(dw.plausibility["failures"]))
+            # save
+            step = I["save"]
+            self._checkpoint()
+            activate = True
+            if not dw.plausible:
+                other = self._deriv_failed_checks(dw)
+                if not self._confirm_implausible(dw.plausibility["failures"], other):
+                    self._state(step, "failed", "not saved (plausibility check failed)")
+                    self.last_status = "failed"
+                    yield from self._write_protocol(dw, derivation=True)
+                    self.lbl_status.setText("Derivation failed: result not plausible, "
+                                            "no profile saved.")
+                    return
+                activate = False
+            elif not dw.checks_passed:
+                if not _ask(self, "Checks failed",
+                            "The source drift check and/or a consistency check "
+                            "failed:\n" + "\n".join(f"• {c}" for c in
+                                                    self._deriv_failed_checks(dw))
+                            + "\n\nSave the profile anyway?"):
+                    self._state(step, "warning", "not saved (checks failed)")
+                    self.last_status = "not_saved"
+                    yield from self._write_protocol(dw, derivation=True)
+                    self.lbl_status.setText("Not saved.")
+                    return
+            self._state(step, "running")
             p = yield (lambda: dw.save(allow_implausible=not activate))
             if activate:
                 calprof.set_active_selection(dw.backend_name, p["id"])
             self.dlg.notify_profiles_changed()
             pid = f"profile {p['id']} v{p['version']}"
+            self._show_deriv_result(dw, res)
+            yield from self._write_protocol(dw, derivation=True)
             if activate:
-                self._state(5, "ok", f"{pid} saved and active")
+                self._state(step, "ok" if self.protocol_paths else "warning",
+                            f"{pid} saved and active"
+                            + ("" if self.protocol_paths else "; protocol not written"))
                 self.last_status = "saved"
                 self.lbl_status.setText(f"Saved and activated {pid}.")
             else:
-                self._state(5, "warning", f"{pid} saved as NOT PLAUSIBLE, not activated")
+                self._state(step, "warning", f"{pid} saved as NOT PLAUSIBLE, not activated")
                 self.last_status = "saved_implausible"
                 self.lbl_status.setText(f"Saved {pid} marked as not plausible; "
                                         f"not activated.")
+            self._state(I["protocol"], "ok" if self.protocol_paths else "warning",
+                        "written" if self.protocol_paths else "not written")
         except Exception as e:                                # noqa: BLE001
             self._fail_msg(step, e)
+
+    @staticmethod
+    def _deriv_failed_checks(dw) -> list[str]:
+        c = dw.checks
+        out = []
+        if c.get("drift_pass") is False:
+            out.append("Source drift")
+        if c.get("itime_match_known") is False or c.get("itime_match_new") is False:
+            out.append("Dark and light at the same integration time")
+        if c.get("linearity_consistent") is False:
+            out.append("Linearity correction unchanged")
+        return out
+
+    def _deriv_check_states(self, dw) -> None:
+        """States of the repeat / dark-after steps from the FINAL checks."""
+        c = dw.checks
+        I = _DERIV_IX                                          # noqa: N806
+        if c.get("drift_pct") is not None:
+            self._state(I["repeat_known"], "ok" if c.get("drift_pass") else "warning",
+                        f"drift {c['drift_pct']:.2f} % (limit "
+                        f"{c['drift_threshold_pct']:.2f} %)"
+                        + (f", {c['drift_fail_pixels']} px masked"
+                           if c.get("drift_fail_pixels") else ""))
+        else:
+            self._state(I["repeat_known"], "warning", "drift not evaluated")
+        for d in dw.dark_drift or []:
+            key = "dark_known_after" if d["side"] == cw.SIDE_KNOWN else "dark_new_after"
+            self._state(I[key], "warning" if d.get("warn") else "ok",
+                        f"dark drift {d['mean_counts']:+.1f} counts")
+
+    def _deriv_lines(self, dw) -> list[str]:
+        """Per optics: integration time, level, linearity correction; source
+        drift; dark drift (no empty or 'nan' values)."""
+        t = _T()
+        rec = dw.record()
+        out = []
+        for s, nm in ((cw.SIDE_KNOWN, "Known optics"), (cw.SIDE_NEW, "New optics")):
+            sd = rec["sides"][s]
+            if sd["integration_us"] is None:
+                continue
+            line = f"{nm}: t_int {sd['integration_us'] / 1000:.3f} ms"
+            if sd.get("auto_exposure") is not None:
+                line += " (auto)" if sd["auto_exposure"] else " (fixed)"
+            if sd.get("peak_frac") is not None:
+                line += f" · level {100 * sd['peak_frac']:.1f} % FS"
+            if sd.get("peak_frac_repeat") is not None:
+                line += f" (repeat {100 * sd['peak_frac_repeat']:.1f} %)"
+            line += f" · linearity correction: {sd.get('linearity_text') or 'n/a'}"
+            if sd.get("itime_match") is False:
+                line += " · " + _span(t.DANGER, "dark/light integration time differs")
+            out.append(line)
+        dr = rec.get("drift")
+        if dr:
+            ok = bool(dr.get("pass"))
+            mean = dr.get("mean_pct")
+            out.append(
+                f"Source drift: p95 {dr['p95_pct']:.2f} %"
+                + (f", mean {mean:+.2f} %" if mean is not None else "")
+                + f", limit {dr['threshold_pct']:.2f} % — "
+                + _span(t.OK if ok else t.DANGER, "passed" if ok else "NOT passed")
+                + f" · {int(dr.get('n_fail_pixels') or 0)} px masked"
+                + (f"<br>&nbsp;&nbsp;Cause: {dr['cause']}" if dr.get("cause") else ""))
+        else:
+            out.append("Source drift: not checked")
+        for d in rec.get("dark_drift") or []:
+            s = (f"Dark drift ({'known' if d['side'] == cw.SIDE_KNOWN else 'new'} optics, "
+                 f"{d['integration_us'] / 1000:.2f} ms): {d['mean_counts']:+.1f} counts "
+                 f"({d.get('pct_of_peak', 0.0):+.2f} % of the peak)")
+            out.append(_span(t.WARN, s + " — warning") if d.get("warn") else s)
+        return out
 
     def _show_deriv_result(self, dw, res):
         wl, valid = res["wl"], res["valid"]
@@ -1943,6 +2167,11 @@ class _SpectralWizardTab(QWidget):
         self.plot_in.clear()
         self.plot_in.plot(wl, _norm(res["C_known"], valid), name="C_known (norm)",
                           pen=pg.mkPen((120, 200, 120), width=1))
+        if dw.rate_repeat is not None:
+            self.plot_in.plot(wl, _norm(dw.rate_repeat.rate, valid),
+                              name="C_known repeat (norm)",
+                              pen=pg.mkPen((200, 200, 120), width=1,
+                                           style=Qt.PenStyle.DashLine))
         self.plot_in.plot(wl, _norm(res["C_new"], valid), name="C_new (norm)",
                           pen=pg.mkPen((120, 180, 255), width=1))
         _shade_masked(self.plot_in, wl, segs)
@@ -1953,7 +2182,12 @@ class _SpectralWizardTab(QWidget):
                            pen=pg.mkPen((255, 170, 60), width=2))
         _shade_masked(self.plot_out, wl, segs)
         self.plot_out.autoRange()
-        self.lbl_result.setText(self._result_text(res, dw.plausibility))
+        t = _T()
+        extra = self._deriv_lines(dw)
+        other = [w for w in dw.warnings if not w.startswith("Plausibility check failed")]
+        if other:
+            extra.append(_span(t.WARN, "<br>".join(other)))
+        self.lbl_result.setText(self._result_text(res, dw.plausibility, extra))
 
 
 # ══════════════════════════════════════════════════════════════════════════

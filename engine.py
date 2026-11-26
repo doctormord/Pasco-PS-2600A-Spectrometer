@@ -1170,7 +1170,12 @@ class Engine:
         self.check_control(owner)
         b = self._require_backend()
         prev = int(b.current_integration_time_us)
-        t, cap, conv = cc.auto_expose(b, target_frac=tuple(target_frac),
+        import calibration_workflow as cw
+        # the target band stays below the saturation warning threshold
+        lo, hi = cw.WorkflowConfig(
+            target_frac=(float(target_frac[0]), float(target_frac[1])),
+            saturation_warn_frac=cw._sat_warn_frac()).target_frac
+        t, cap, conv = cc.auto_expose(b, target_frac=(lo, hi),
                                       backend_name=self.device_name)
         if apply:
             self.configure({"exposure_ms": t / 1000.0, "auto_exposure": False}, owner=owner)
@@ -1700,10 +1705,10 @@ class Engine:
                     auto = True
                     if ctx:
                         ctx.progress(message="auto exposure", step="auto_exposure")
-                    cfg = self.cfg
+                    import calibration_workflow as cw
+                    # target band capped at the saturation warning threshold
                     t, _cap, conv = cc.auto_expose(
-                        b, target_frac=(float(cfg.get("calibration_target_frac_lo", 0.70)),
-                                        float(cfg.get("calibration_target_frac_hi", 0.85))),
+                        b, target_frac=cw.WorkflowConfig.from_config().target_frac,
                         backend_name=self.device_name)
                     if not conv:
                         warnings.append("Auto exposure did not reach the target band.")
@@ -2262,8 +2267,18 @@ class Engine:
         """Derive the relative profile of a NEW optics configuration from a
         KNOWN v2 profile (same diffuse source, both optics) — the desktop
         wizard's derivation, with its user steps as waiting_for_user:
-        mount known optics → (cover/uncover) → swap optics → (cover/uncover)
-        → compute → save (activated only if plausible)."""
+        mount known optics → t_int known → (cover) dark → (uncover) light →
+        swap optics → t_int new → (cover) dark → (uncover) light → (cover)
+        dark after → swap back → repeat light → (cover) dark known after →
+        (uncover) → compute → save → protocol (PDF + CSV). Not plausible:
+        saved only with allow_implausible and never activated. Failed drift /
+        consistency checks: saved only with save_on_failed_checks and then
+        activated (if 'activate'), like the calibration run.
+
+        Parameters: integration_known_us / integration_new_us or
+        integration_known_ms / integration_new_ms (None / "auto" = auto
+        exposure with that side's optics mounted); integration_ms is the
+        legacy value for both sides."""
         import calibration_workflow as cw
         b = self._require_backend()
         p = dict(params or {})
@@ -2279,54 +2294,150 @@ class Engine:
         except ValueError as e:
             raise Unprocessable(str(e))
 
-        def pair(ctx: JobContext, which: str):
+        def side_us(which: str):
+            """Fixed integration time [µs] of one side or None (auto)."""
+            v = p.get(f"integration_{which}_us")
+            if v is None:
+                ms = p.get(f"integration_{which}_ms")
+                if ms is None:
+                    ms = p.get("integration_ms")
+                v = None if ms in (None, "auto") else float(ms) * 1000.0
+            return None if v is None else max(1, int(round(float(v))))
+
+        def cover(ctx: JobContext, what: str):
             if dw.needs_user_cover:
-                ctx.wait_for_user("Block the light path / cover the source. The dark "
-                                  "spectrum is captured next.", action="cover")
-            ctx.progress(message=f"dark ({which} optics)", step=f"dark_{which}")
-            dw.capture_dark_for(which)
+                ctx.wait_for_user(f"Block the light path / cover the source. The dark "
+                                  f"spectrum ({what}) is captured next.", action="cover")
+            ctx.check()
+
+        def uncover(ctx: JobContext, what: str):
             if dw.needs_user_cover:
-                ctx.wait_for_user("Release the light path / uncover the source. The "
-                                  "light spectrum is captured next.", action="uncover")
-            ctx.progress(message=f"light ({which} optics)", step=f"light_{which}")
-            dw.capture_light_for(which)
+                ctx.wait_for_user(f"Release the light path / uncover the source. The "
+                                  f"{what} is captured next.", action="uncover")
+            ctx.check()
 
         def run(ctx: JobContext):
-            res: dict = {"status": "failed", "profile_ids": []}
-            ctx.progress(0.05, "setting the integration time", step="integration")
-            us = (None if p.get("integration_ms") in (None, "auto")
-                  else int(float(p["integration_ms"]) * 1000))
-            res["integration_us"] = int(dw.set_integration(us))
-            ctx.wait_for_user("Mount the KNOWN optics on the diffuse, extended source, "
-                              "then continue.", action="mount_known")
-            ctx.progress(0.2, "capturing with the known optics", step="known")
-            pair(ctx, "known")
-            ctx.wait_for_user("Mount the NEW optics on the same diffuse, extended source "
-                              "(same position, same lamp), then continue.",
-                              action="swap_optics")
-            ctx.progress(0.55, "capturing with the new optics", step="new")
-            pair(ctx, "new")
-            ctx.progress(0.85, "computing", step="compute")
+            res: dict = {"status": "failed", "profile_ids": [], "protocol": [],
+                         "source_hint": cw.DERIVATION_SOURCE_HINT}
             try:
-                r = dw.compute()
-            except ValueError as e:
-                res["error"] = str(e)
+                ctx.wait_for_user("Mount the KNOWN optics on the source and release "
+                                  "the light path (the integration time is set "
+                                  "with the light on). "
+                                  + cw.DERIVATION_SOURCE_HINT + " Then continue.",
+                                  action="mount_known")
+                ctx.progress(0.05, "integration time (known optics)",
+                             step="integration_known")
+                ik = dw.set_integration("known", side_us("known"))
+                res["integration_known_us"] = int(ik["integration_us"])
+                cover(ctx, "known optics")
+                ctx.progress(0.12, "dark spectrum (known optics)", step="dark_known")
+                dw.capture_dark_for("known")
+                self.calib.invalidate_darks()
+                uncover(ctx, "light spectrum with the known optics")
+                ctx.progress(0.2, "light spectrum (known optics)", step="light_known")
+                dw.capture_light_for("known")
+                res["peak_frac_known"] = json_safe(dw.lights["known"].peak_frac)
+
+                ctx.wait_for_user("Mount the NEW optics on the same source (same position, "
+                                  "same lamp, unchanged power) and keep the light path "
+                                  "open, then continue.",
+                                  action="swap_optics")
+                ctx.progress(0.3, "integration time (new optics)", step="integration_new")
+                inw = dw.set_integration("new", side_us("new"))
+                res["integration_new_us"] = int(inw["integration_us"])
+                cover(ctx, "new optics")
+                ctx.progress(0.38, "dark spectrum (new optics)", step="dark_new")
+                dw.capture_dark_for("new")
+                self.calib.invalidate_darks()
+                uncover(ctx, "light spectrum with the new optics")
+                ctx.progress(0.46, "light spectrum (new optics)", step="light_new")
+                dw.capture_light_for("new")
+                res["peak_frac_new"] = json_safe(dw.lights["new"].peak_frac)
+                cover(ctx, "new optics, after the light spectrum")
+                ctx.progress(0.54, "dark spectrum after (new optics)",
+                             step="dark_new_after")
+                dw.capture_dark_for("new", "after")
+                self.calib.invalidate_darks()
+
+                ctx.wait_for_user("Mount the KNOWN optics again on the same source "
+                                  "(same position) and release the light path, then "
+                                  "continue.", action="swap_back")
+                ctx.progress(0.65, "repeat with the known optics (source drift)",
+                             step="repeat_known")
+                dw.capture_light_for("repeat")
+                res["peak_frac_repeat"] = json_safe(dw.lights["repeat"].peak_frac)
+                cover(ctx, "known optics, after the repeat")
+                ctx.progress(0.75, "dark spectrum after (known optics)",
+                             step="dark_known_after")
+                dw.capture_dark_for("known", "after")
+                self.calib.invalidate_darks()
+                if dw.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the source. "
+                                      "The result is computed next.", action="uncover")
+                ctx.check()
+
+                ctx.progress(0.85, "computing", step="compute")
+                try:
+                    r = dw.compute()
+                except ValueError as e:
+                    res["error"] = str(e)
+                    return res
+                res["valid_segments_nm"] = json_safe(r.get("segments_nm"))
+                res["plausibility"] = json_safe(dw.plausibility)
+                res["checks"] = json_safe(dw.checks)
+                res["drift"] = (json_safe({k: v for k, v in dw.drift.items()
+                                           if k != "per_pixel_pct"}) if dw.drift else None)
+                ctx.progress(0.92, "saving", step="save")
+                activate = bool(p.get("activate", True))
+                if not dw.plausible:
+                    if not p.get("allow_implausible"):
+                        res["status"] = "not_saved_implausible"
+                        return res
+                    saved = dw.save(allow_implausible=True)
+                    activate = False
+                    res["status"] = "saved_implausible"
+                elif not dw.checks_passed and not p.get("save_on_failed_checks"):
+                    res["status"] = "not_saved_checks_failed"
+                    return res
+                else:
+                    saved = dw.save()
+                    res["status"] = "saved"
+                res["profile_ids"] = [saved["id"]]
+                if activate:
+                    calprof.set_active_selection(dw.backend_name, saved["id"])
+                    res["activated"] = saved["id"]
+                self.rebuild_calibration()
                 return res
-            res["valid_segments_nm"] = json_safe(r.get("segments_nm"))
-            res["plausibility"] = json_safe(dw.plausibility)
-            res["warnings"] = list(dw.warnings)
-            if not dw.plausible and not p.get("allow_implausible"):
-                res["status"] = "not_saved_implausible"
-                return res
-            saved = dw.save(allow_implausible=not dw.plausible)
-            res["profile_ids"] = [saved["id"]]
-            if dw.plausible and p.get("activate", True):
-                calprof.set_active_selection(dw.backend_name, saved["id"])
-                res["activated"] = saved["id"]
-            res["status"] = "saved" if dw.plausible else "saved_implausible"
-            self.rebuild_calibration()
-            return res
+            finally:
+                res["warnings"] = list(dw.warnings)
+                res["dark_drift"] = json_safe(dw.dark_drift)
+                for w, key in (("known", "integration_known_us"),
+                               ("new", "integration_new_us")):
+                    if key not in res and dw.itime.get(w) is not None:
+                        res[key] = int(dw.itime[w])
+                # legacy field (one t_int before per-side times): the new optics'
+                it = dw.integration_us
+                res["integration_us"] = it.get("new") if isinstance(it, dict) else it
+                if dw.result is not None or res.get("error"):
+                    res["protocol"], res["protocol_message"] = \
+                        self._write_derivation_protocol(dw)
+                ctx.job.result = res
         return self.jobs.submit("derivation", run, p, owner)
+
+    def _write_derivation_protocol(self, dw) -> tuple[list[str], str]:
+        try:
+            import calibration_report as crp
+            import export_paths
+            if not hasattr(crp, "write_derivation_protocol"):
+                return [], "Protocol not written: derivation protocol not available."
+            rec = dw.record()
+            d, note = export_paths.calibration_protocol_dir()
+            base = crp.default_derivation_basename(rec)
+            paths = crp.write_derivation_protocol(rec, os.path.join(d, base + ".pdf"),
+                                                  os.path.join(d, base + ".csv"))
+            return list(paths or []), note or ""
+        except Exception as e:                                   # noqa: BLE001
+            return [], f"Protocol not written: {e}"
 
     def _write_protocol(self, wf) -> tuple[list[str], str]:
         try:

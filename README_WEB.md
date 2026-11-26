@@ -146,6 +146,32 @@ lamps, stored darks), *Wavelength calibration…* (capture a line lamp, match, f
 save with backup confirmation). Deleting profiles or dark spectra is not
 offered over the API.
 
+*Derivation of other optics* (`POST /api/v1/calibration/derivations`): the new
+optics' relative profile is derived from a known profile by measuring the same
+diffuse, extended source with both optics (the dialog shows the source
+requirements). Parameters: `known_profile_id`, `optics`, `integration_known_ms`
+and `integration_new_ms` (each a number in ms or `"auto"`, default `"auto"`: auto
+exposure to the same target band with that side's optics mounted; the legacy
+`integration_ms` applies to both sides where no side-specific value is given),
+`frames`, `allow_implausible`, `save_on_failed_checks` (store although the
+source-drift or consistency checks failed), `activate`. The job waits for user
+steps via `POST /jobs/{id}/continue` in this order: `mount_known`, [`cover`,
+`uncover`] (dark / light, known optics), `swap_optics`, [`cover`, `uncover`,
+`cover`] (dark / light / dark after, new optics), `swap_back`, repeat with the
+known optics, [`cover`, `uncover`] (dark after, known optics); `cover` /
+`uncover` only on devices without a shutter. The result contains
+`integration_known_us`, `integration_new_us`, `peak_frac_known` / `_new` /
+`_repeat`, `drift` (p95, mean, limit `calibration_derivation_drift_pct`, pass,
+masked pixels), `checks`, `plausibility`, `warnings`, `profile_ids` and the
+protocol paths (`GET /calibration/runs/{job}/protocol?format=pdf|csv`). Status:
+`saved`, `saved_implausible`, `not_saved_implausible`,
+`not_saved_checks_failed`.
+
+**Saturation warning**: the exposure bar (desktop and web) and the calibration
+runs use one threshold, the config key `saturation_warn_frac` (fraction of full
+scale, default 0.90, range 0.5-1.0). The frame message's `exposure` object
+carries `state` (`ok` / `warn` / `danger`), `warn_pct_fs` and `peak_pct_fs`.
+
 **Display modes, verification, linearity** — the display mode (Raw ADC,
 Corrected counts, Normalised, Count rate, Absolute; `display_mode` in
 `PUT /acquisition`) works as on the desktop; spectrum and measurement exports and all evaluations use the corrected data; the time-lapse (heatmap, its export and autosave) records the display representation. After saving a profile, *verification* measures the

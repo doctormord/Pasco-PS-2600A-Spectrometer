@@ -559,20 +559,35 @@
             <div class="fgrid-sub derive-only" hidden>
               <label for="cr-known">Known profile</label>
               <select id="cr-known"></select>
+              <label for="cr-int-known-mode">Integration, known optics</label>
+              <span class="fpair">
+                <select id="cr-int-known-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
+                <input type="number" id="cr-int-known-ms" min="0.01" step="0.01" value="20" disabled title="Integration time with the known optics in ms">
+                <span class="hm-u">ms</span>
+              </span>
+              <label for="cr-int-new-mode">Integration, new optics</label>
+              <span class="fpair">
+                <select id="cr-int-new-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
+                <input type="number" id="cr-int-new-ms" min="0.01" step="0.01" value="20" disabled title="Integration time with the new optics in ms">
+                <span class="hm-u">ms</span>
+              </span>
             </div>
-            <label for="cr-int-mode">Integration</label>
-            <span class="fpair">
-              <select id="cr-int-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
-              <input type="number" id="cr-int-ms" min="0.01" step="0.01" value="20" disabled title="Integration time in ms">
-              <span class="hm-u">ms</span>
-            </span>
+            <div class="fgrid-sub lamp-only">
+              <label for="cr-int-mode">Integration</label>
+              <span class="fpair">
+                <select id="cr-int-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
+                <input type="number" id="cr-int-ms" min="0.01" step="0.01" value="20" disabled title="Integration time in ms">
+                <span class="hm-u">ms</span>
+              </span>
+            </div>
             <label for="cr-frames">Frames</label>
             <input type="number" id="cr-frames" min="2" max="1000" step="1" placeholder="default">
           </div>
+          <div class="cr-hint-box derive-only" id="cr-source-hint" hidden>Source: a diffuse, uniformly luminous, extended target that fills the field of view of BOTH optics (e.g. back-illuminated opal glass in the object plane). Keep the source, its position and its power unchanged during the whole run.</div>
           <div class="cr-save">
             <label class="cr-chk"><input type="checkbox" id="cr-allow-implausible"> Save even if implausible</label>
-            <label class="cr-chk lamp-only"><input type="checkbox" id="cr-save-failed"> Save although checks failed</label>
-            <div class="cr-warn" id="cr-warn" hidden>Warning: a result that fails the plausibility or stability check is stored flagged as implausible (and is NOT activated automatically). Only use this when you know why the check fails.</div>
+            <label class="cr-chk"><input type="checkbox" id="cr-save-failed"> <span id="cr-save-failed-text">Save although checks failed</span></label>
+            <div class="cr-warn" id="cr-warn" hidden>Warning: a result that fails the plausibility check is stored flagged as implausible and is NOT activated. A result that only fails the stability, cross or source drift check is stored and activated like a passing one. Only use this when you know why the check fails.</div>
           </div>
         </form>
 

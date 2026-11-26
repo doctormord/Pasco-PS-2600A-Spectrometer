@@ -197,9 +197,13 @@ def test_exposure_bar_and_raw_axis_in_corrected_mode(dash):
     assert dash.raw_curve.isVisible()                          # default on
     assert dash.plot_canvas.getPlotItem().getAxis("right").isVisible()
     # colour class follows the drive level (theme tokens)
-    for pct, n_sat, cls in ((40.0, 0, "ok"), (90.0, 0, "warn"), (99.0, 0, "danger"),
+    # (the state comes from processing.exposure_level; without it the bar derives it
+    # from warn_pct_fs, config key saturation_warn_frac = 0.90)
+    for pct, n_sat, cls in ((40.0, 0, "ok"), (90.0, 0, "warn"), (99.0, 0, "warn"),
                             (50.0, 3, "danger")):
-        ex = dict(ev.exposure, peak_pct_fs=pct, n_saturated=n_sat, saturated=bool(n_sat))
+        ex = dict(ev.exposure, peak_pct_fs=pct, n_saturated=n_sat, saturated=bool(n_sat),
+                  warn_pct_fs=90.0)
+        ex.pop("state", None)
         dash._update_exposure(dataclasses.replace(ev, exposure=ex))
         assert dash._exposure_cls == cls
     assert "saturated" in dash.lbl_exposure.text()
