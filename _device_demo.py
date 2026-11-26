@@ -55,6 +55,10 @@ DEMO_SOFT_KNEE_FRAC = 0.85
 # Integration time (µs)
 DEMO_MIN_INTEGRATION_US = 1_000      # 1 ms
 DEMO_MAX_INTEGRATION_US = 1_000_000  # 1000 ms
+# Hard limits for the config keys demo_min/max_integration_us (test setups with
+# very different brightness, e.g. an optics derivation 1:1000).
+DEMO_ABS_MIN_INTEGRATION_US = 10          # 10 µs
+DEMO_ABS_MAX_INTEGRATION_US = 10_000_000  # 10 s
 
 # Brightness calibration: the brightest pixel's LINEAR (pre-saturation) signal
 # reaches DEMO_FULLSCALE_FRAC of full scale at DEMO_FULLSCALE_MS, so the whole
@@ -209,6 +213,9 @@ class DemoSpectrometer(BaseSpectrometer):
         self._shape = _resolve_spectrum("led_white", self._wl)
         self._rng   = np.random.default_rng()
         self._shutter_closed = False
+        # Test effect: throughput of the (simulated) input optics, multiplies the
+        # photo-signal (e.g. 1e-3 for a dim optics in a derivation test).
+        self.source_scale = 1.0
         self.serial: str | None = None
 
         # Per-device integration bounds (µs); overridden from Config in connect.
@@ -243,10 +250,10 @@ class DemoSpectrometer(BaseSpectrometer):
 
     def connect(self, device_id: str) -> None:
         from app_config import Config
-        self._min_us = max(DEMO_MIN_INTEGRATION_US,
+        self._min_us = max(DEMO_ABS_MIN_INTEGRATION_US,
                            int(Config.get("demo_min_integration_us",
                                           DEMO_MIN_INTEGRATION_US)))
-        self._max_us = min(DEMO_MAX_INTEGRATION_US,
+        self._max_us = min(DEMO_ABS_MAX_INTEGRATION_US,
                            int(Config.get("demo_max_integration_us",
                                           DEMO_MAX_INTEGRATION_US)))
         self.min_integration_us = self._min_us
@@ -338,7 +345,7 @@ class DemoSpectrometer(BaseSpectrometer):
         dark   = self._dark_bias + dark_current
         if self._dark_drift:
             dark = dark + self._dark_drift * (time.monotonic() - self._t_connect)
-        signal = self._shape * self._gain_per_ms * t_ms   # photo-signal
+        signal = self._shape * (self._gain_per_ms * t_ms * float(self.source_scale))
         if self._shutter_closed:
             signal = np.zeros_like(signal)                 # true dark frame
         if self._nl_beta:

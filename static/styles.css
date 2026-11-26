@@ -674,6 +674,8 @@ button:disabled { opacity: .45; cursor: default; }
 .fgrid label { color: var(--fg-2); font-size: 12px; }
 .fgrid input, .fgrid select { width: 100%; min-width: 0; height: 30px; }
 .fgrid-sub { display: contents; }
+.cr-hint-box { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--border-1); border-radius: 6px; font-size: 12px; color: var(--fg-2); background: var(--bg-2); overflow-wrap: anywhere; }
+.cr-hint-box[hidden] { display: none; }
 .fgrid-sub[hidden], .lamp-only[hidden], .derive-only[hidden] { display: none; }
 .fpair { display: flex; align-items: center; gap: 8px; }
 .fpair select { width: 90px; flex: none; }

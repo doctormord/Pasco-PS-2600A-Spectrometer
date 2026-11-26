@@ -196,8 +196,11 @@ def test_wizard_derivation_run(qapp, msgbox, demo):
     assert w.cmb_known.count() == 1
     w.edit_new_name.setText("bare from CC")
     w.cmb_new_input.setCurrentText("bare")
-    w.cmb_itime.setCurrentIndex(1)
-    w.spn_ms.setValue(wf.integration_us / 1000.0)
+    # own integration time per optics (fixed here to keep the run short)
+    w.cmb_itime_known.setCurrentIndex(1)
+    w.spn_ms_known.setValue(wf.integration_us / 1000.0)
+    w.cmb_itime_new.setCurrentIndex(1)
+    w.spn_ms_new.setValue(wf.integration_us / 1000.0)
     w.start()
     _wait(qapp, w)
     assert w.last_error is None, w.last_error
