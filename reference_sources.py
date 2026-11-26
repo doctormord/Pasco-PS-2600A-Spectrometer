@@ -254,7 +254,9 @@ class ReferenceLibrary:
     def __init__(self, path: str | None = None):
         if path is None:
             from app_config import Config
-            path = Config.get("reference_sources_file", "reference_sources.json")
+            import data_paths
+            path = data_paths.resolve(Config.get("reference_sources_file",
+                                                 "reference_sources.json"))
         self.path = path
         self._builtin = {s.id: s for s in builtin_sources()}
         self._stored: dict[str, ReferenceSource] = {}

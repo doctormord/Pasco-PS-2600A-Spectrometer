@@ -74,6 +74,11 @@
       <!-- Scope -->
       <div class="tab-pane on" data-pane="scope">
         <div class="scope-tools">
+          <select id="scope-display-mode" class="scope-ref-select" aria-label="Display mode"
+                  title="What the scope shows: raw ADC, corrected, normalised, count rate or absolute. Auto picks the best available mode."></select>
+          <button id="btn-raw-curve" class="tool-toggle"
+                  title="Show the averaged raw ADC curve (faint, right axis) behind corrected data.">RAW CURVE</button>
+          <span class="scope-tools-sep"></span>
           <button id="btn-freeze" class="tool-toggle"
                   title="Freeze the current trace as a grey snapshot (absolute ADC). Click again to clear.">❄&nbsp; FREEZE</button>
           <button id="btn-diff" class="tool-toggle"
@@ -89,6 +94,15 @@
           <button id="btn-csvbg-clear" class="mini-btn" style="display:none"
                   title="Clear the CSV background reference">✕</button>
           <span id="csvbg-name" class="scope-tools-name"></span>
+          <span class="scope-tools-sep"></span>
+          <button id="btn-refoverlay" class="tool-toggle"
+                  title="Overlay the reference source (lamp file) as a dashed line, scaled to the current display unit.">REF OVERLAY</button>
+          <select id="scope-ref-select" class="scope-ref-select" aria-label="Reference source for the overlay"
+                  title="Reference source for the overlay"></select>
+        </div>
+        <div id="exposure-bar" class="exposure-bar" title="Peak of the raw signal relative to the detector full scale">
+          <span id="exposure-text" class="exposure-text">—</span>
+          <span class="exposure-track"><span id="exposure-fill" class="exposure-fill"></span></span>
         </div>
         <div id="scope-plot" class="plot scope-plot"></div>
       </div>
@@ -101,6 +115,10 @@
           <label class="hm-f" title="Log one column per interval (0 = every frame).">Interval
             <input type="number" id="hm-interval" min="0" step="100" value="0" data-lock="auth"><span class="hm-u">ms</span></label>
           <span id="hm-span" class="hm-span" title="Time covered by a full buffer (size × interval, or ÷ frame rate)">Span —</span>
+          <label class="hm-f" title="Heatmap colour scale: automatic (per frame) or a fixed upper limit. Stored per display mode.">
+            <input type="checkbox" id="hm-ymax-auto" checked data-lock="auth"> Auto max
+            <input type="number" id="hm-ymax" min="0" step="any" disabled data-lock="auth">
+            <span class="hm-u" id="hm-ymax-unit">ADC</span></label>
           <button id="hm-clear" class="mini-btn" data-lock="auth" title="Clear the time-lapse buffer">⟲ Clear</button>
           <span class="scope-tools-sep"></span>
           <label class="hm-f" title="Write every logged column to a CSV file on the SERVER (crash-safe)."><input type="checkbox" id="hm-autosave" data-lock="auth"> Autosave to disk</label>
@@ -334,10 +352,10 @@
           <input type="number" id="cfg-x_max_nm" min="100" max="1500" step="10" value="1050" /></div>
         <div class="row"><label>Auto-scale Y</label>
           <span class="toggle on" data-key="auto_y"></span></div>
-        <div class="row"><label>Y max <span>ADC</span></label>
+        <div class="row"><label>Y max <span id="y-unit-lbl">ADC</span></label>
           <span class="ctl-group">
             <button id="btn-y-snap" class="mini-btn" title="Snap Y max to the current frame peak (also disables Auto-scale Y)">▲</button>
-            <input type="number" id="cfg-y_max_adc" min="10" max="65000" step="100" value="4000" />
+            <input type="number" id="cfg-y_max_adc" min="0" step="any" value="4000" />
           </span></div>
       </details>
 
@@ -406,6 +424,8 @@
                 title="Lamp calibration (relative / absolute) as a guided job on the server">Calibration run…</button>
         <button id="cal-derive-open" class="full" data-lock="control"
                 title="Derive the profile of new optics from a known profile">Derive new optics…</button>
+        <button id="lin-open" class="full"
+                title="Linearity calibration / check of the detector (counts vs. integration time)">Linearity…</button>
         <button id="cal-manage" class="full"
                 title="Profiles, reference sources and stored dark spectra">Profiles · references · darks…</button>
         <button id="wlcal-open" class="full"
@@ -567,6 +587,45 @@
         <button id="cr-cancel" class="ghost danger-text" hidden>Cancel run</button>
         <button id="cr-close" class="ghost">Close</button>
         <button id="cr-start" class="primary">Start</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="lin-dialog" hidden>
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="lin-title">
+      <div class="modal-hdr"><span id="lin-title">Linearity</span>
+        <button id="lin-x" class="modal-x" title="Close">✕</button></div>
+      <div class="modal-body">
+        <div id="lin-state" class="cr-result" hidden></div>
+        <div id="lin-factory-note" class="cr-warn" hidden>This device has a factory linearisation. A run is a check measurement only: it is documented in a protocol, but no correction is applied.</div>
+        <h4 class="tbl-h">Records <span id="lin-table-note" class="tbl-note"></span></h4>
+        <div class="tbl-wrap"><table class="mini-table" id="lin-table"><thead></thead><tbody></tbody></table></div>
+        <div class="export-row lin-actions">
+          <button id="lin-off" data-lock="control">Switch off</button>
+        </div>
+        <h4 class="tbl-h">New run</h4>
+        <div id="lin-form" class="fgrid">
+          <label for="lin-int-mode">Integration</label>
+          <span class="fpair">
+            <select id="lin-int-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
+            <input type="number" id="lin-int-ms" min="0.01" step="0.01" value="20" disabled title="Integration time in ms">
+            <span class="hm-u">ms</span>
+          </span>
+          <label for="lin-steps">Steps</label>
+          <input type="number" id="lin-steps" min="6" max="10" step="1" placeholder="default">
+          <label for="lin-frames">Frames</label>
+          <input type="number" id="lin-frames" min="2" max="1000" step="1" placeholder="default">
+        </div>
+        <div id="lin-run" class="cr-run" hidden>
+          <div class="cr-progress"><div id="lin-bar" class="cr-bar"></div></div>
+          <div id="lin-status" class="cal-status"></div>
+        </div>
+        <div id="lin-result" class="cr-result" hidden></div>
+      </div>
+      <div class="modal-ftr">
+        <button id="lin-cancel" class="ghost danger-text" hidden>Cancel run</button>
+        <button id="lin-close" class="ghost">Close</button>
+        <button id="lin-start" class="primary" data-lock="control">Run linearity calibration</button>
       </div>
     </div>
   </div>

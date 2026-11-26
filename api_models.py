@@ -138,6 +138,10 @@ class AcquisitionSettings(_M):
     spatial_smoothing: Optional[bool] = None
     spatial_smoothing_width: Optional[int] = Field(None, ge=3, le=51)
     display_unit: Optional[Literal["counts", "counts_per_s"]] = None
+    display_mode: Optional[Literal["auto", "raw", "corrected", "normalised", "count_rate",
+                                   "absolute"]] = Field(
+        None, description="Display mode of scope/heatmap (only what is plotted; "
+                          "evaluations and exports always use the corrected data)")
     irradiance_unit: Optional[Literal["uW/cm2/nm", "W/m2/nm", "mW/m2/nm"]] = None
     fusion_enabled: Optional[bool] = None
     fusion_smoothing: Optional[float] = Field(None, ge=0, le=0.99)
@@ -325,6 +329,30 @@ class CalibrationRunRequest(_M):
     save_on_failed_checks: bool = Field(False, description="Save although the stability / "
                                         "t_int cross check failed")
     activate: bool = True
+    verify: bool = Field(True, description="After saving: measure the reference source "
+                                           "with the new profile through the live pipeline "
+                                           "and report the deviation per 50-nm band")
+
+
+class VerificationRequest(_M):
+    profile_id: str
+    reference_id: str
+    integration_ms: Optional[float] = Field(None, gt=0, description="Default: t_int of the profile")
+    frames: Optional[int] = Field(None, ge=1, le=1000)
+
+
+class LinearityRunRequest(_M):
+    integration_ms: Optional[Union[float, Literal["auto"]]] = Field(
+        "auto", description="Probe exposure; 'auto' = auto exposure to ~50 % FS")
+    steps: Optional[int] = Field(None, ge=6, le=10, description="Number of integration times")
+    frames: Optional[int] = Field(None, ge=2, le=1000)
+    save: bool = True
+    activate: bool = Field(True, description="Activate the new correction (not for check "
+                                             "measurements on devices with factory linearisation)")
+
+
+class LinearitySelectRequest(_M):
+    entry_id: Optional[str] = Field(None, description="Linearity record to activate; null = off")
 
 
 # ── reports ──────────────────────────────────────────────────────────────

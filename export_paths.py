@@ -4,9 +4,10 @@ in the app (spectrum CSV/PNG, time-lapse CSV/frame/autosave, colour & filter
 reports and metrics) so a single "DATA" setting governs where and how files are
 named everywhere.
 
-- Directory comes from config key ``export_dir`` (empty = the program folder).
-  If it can't be used (missing/uncreatable/not writable) the caller gets the
-  program folder plus an error string to surface in the UI.
+- Directory comes from config key ``export_dir`` (empty = <Documents>/PS-2600A,
+  data_paths.default_export_dir). It is NEVER the program folder: a configured
+  folder inside it, or one that can't be used, falls back to the default
+  (or <data dir>/exports) plus an error string to surface in the UI.
 - Filename comes from config key ``export_filename_template`` — a pattern with
   {tokens} the user composes in the DATA section. Unknown/empty tokens degrade
   gracefully; the result is always filesystem-safe.
@@ -36,42 +37,50 @@ def program_dir() -> str:
 
 
 def configured_dir() -> str:
+    import data_paths
     d = (Config.get("export_dir", "") or "").strip()
-    return d or program_dir()
+    return d or data_paths.default_export_dir()
+
+
+def _fallback_dir() -> str:
+    import data_paths
+    for d in (data_paths.default_export_dir(), os.path.join(data_paths.data_dir(), "exports")):
+        if _usable_dir(d) and not _is_inside(d, program_dir()):
+            return d
+    return os.path.join(data_paths.data_dir(), "exports")
 
 
 def ensure_export_dir() -> tuple[str, str | None]:
     """Return (directory, error_or_None). Try to use/create the configured
-    export directory; on any failure fall back to the program folder and return
-    a human-readable error so the UI can show it."""
+    export directory; a folder inside the program folder or one that cannot
+    be used falls back to <Documents>/PS-2600A (or <data dir>/exports) with a
+    human-readable error for the UI. Never the program folder."""
     d = configured_dir()
+    if _is_inside(d, program_dir()):
+        fb = _fallback_dir()
+        return fb, (f"Export folder '{d}' lies inside the program folder; "
+                    f"using '{fb}'.")
     try:
         os.makedirs(d, exist_ok=True)
         if not os.path.isdir(d) or not os.access(d, os.W_OK):
             raise OSError("not writable")
         return d, None
     except OSError as e:
-        return program_dir(), f"Export folder '{d}' unusable ({e}); using program folder."
+        fb = _fallback_dir()
+        return fb, f"Export folder '{d}' unusable ({e}); using '{fb}'."
 
 
 CALIBRATION_SUBDIR = "calibration"
+PROTOCOLS_SUBDIR = "protocols"          # = data_paths.PROTOCOLS
 APP_DATA_NAME = "PS-2600A"
 
 
 def user_data_dir() -> str:
-    """Per-user application data directory (never the program folder):
-    %LOCALAPPDATA%\\PS-2600A on Windows, ~/Library/Application Support/PS-2600A
-    on macOS, $XDG_DATA_HOME/PS-2600A (or ~/.local/share/PS-2600A) elsewhere."""
-    import sys
-    if sys.platform.startswith("win"):
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") \
-            or os.path.join(os.path.expanduser("~"), "AppData", "Local")
-    elif sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
-            os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, APP_DATA_NAME)
+    """Per-user application data directory (data_paths.data_dir: %APPDATA%\\
+    PS-2600A, ~/Library/Application Support/PS-2600A, $XDG_CONFIG_HOME/ps-2600a
+    or the --data-dir / PS2600A_DATA_DIR override). Never the program folder."""
+    import data_paths
+    return data_paths.data_dir()
 
 
 def _is_inside(path: str, root: str) -> bool:
@@ -92,10 +101,11 @@ def _usable_dir(d: str) -> bool:
 
 
 def calibration_protocol_dir() -> tuple[str, str | None]:
-    """Directory for calibration protocols (PDF/CSV). Returns (dir, note).
+    """Directory for calibration / linearity protocols (PDF/CSV). Returns
+    (dir, note).
 
     <export_dir>/calibration when an export directory is configured, usable and
-    not inside the program folder; otherwise <user data dir>/calibration.
+    not inside the program folder; otherwise <user data dir>/protocols.
     Never the program / repository folder. `note` explains a fallback."""
     configured = (Config.get("export_dir", "") or "").strip()
     note = None
@@ -109,7 +119,7 @@ def calibration_protocol_dir() -> tuple[str, str | None]:
                 return d, None
             note = (f"Export folder '{configured}' unusable; calibration protocols "
                     f"are stored in the user data folder.")
-    d = os.path.join(user_data_dir(), CALIBRATION_SUBDIR)
+    d = os.path.join(user_data_dir(), PROTOCOLS_SUBDIR)
     if not _usable_dir(d):
         raise OSError(f"Neither the export folder nor '{d}' is writable.")
     return d, note

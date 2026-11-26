@@ -76,7 +76,9 @@ def test_limits_from_config(isolated_config):
     wl = np.linspace(380, 780, 400)
     S = np.linspace(1.0, 0.1, wl.size)                       # gain span 10
     r = cp.broadband_check(_result(wl, S, np.ones(wl.size, bool)), lim)
-    assert not r["pass"] and any("gain span" in f for f in r["failures"])
+    # hardware test point 1: the gain span is only a hint, never a failure
+    assert r["pass"] and any("gain span" in h for h in r["hints"])
+    assert not any("gain span" in f for f in r["failures"])
     assert r["limits"]["max_gain_span"] == 7.0
 
 
@@ -177,7 +179,8 @@ def test_protocol_dir_never_program_folder(isolated_config, tmp_path, monkeypatc
         os.path.join(export_paths.program_dir(), "sub") if export_dir == "INSIDE" else "")
     d, note = export_paths.calibration_protocol_dir()
     assert not export_paths._is_inside(d, export_paths.program_dir())
-    assert d == str(tmp_path / "lad" / "PS-2600A" / "calibration")
+    # hardware test point 15: protocols are runtime data → <data dir>/protocols
+    assert d == str(tmp_path / "lad" / "PS-2600A" / "protocols")
     assert (note is not None) == (export_dir == "INSIDE")
 
 
@@ -253,7 +256,8 @@ def test_wizard_line_source_not_saved(qapp, isolated_config, tmp_path, monkeypat
         b.disconnect()
     assert asked, "the override question must be asked"
     assert w.last_status == "failed"
-    assert w.step_states[6][0] == "failed" and w.step_states[7][0] == "failed"
+    # step list (hardware test): ... Dark after + checks (6), Compute (7), Save (8)
+    assert w.step_states[7][0] == "failed" and w.step_states[8][0] == "failed"
     assert cp.all_profiles() == []
     assert cp.active_selection(BACKEND) in (cp.SEL_NONE, "", None)
     # failed run still documented, in <export_dir>/calibration

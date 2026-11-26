@@ -50,3 +50,7 @@ httpx>=0.27
 # app through the REST API. Not needed for the app, the web UI or the REST API.
 # Requires Python 3.10+ and httpx (above). See mcp_server/README.md.
 # mcp>=2.3
+
+# Tests only — PDF layout checks of the calibration / linearity protocols
+# (tests/test_calibration_report_layout.py). Not needed to run the app.
+pdfplumber>=0.10

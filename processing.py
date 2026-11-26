@@ -373,3 +373,148 @@ def photometric_inputs(values: np.ndarray, unit: str):
     if is_absolute_unit(unit):
         return v * _TO_W_M2_NM[unit], 1.0
     return v, None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Display modes (Darstellungsarten) — shared desktop + web + API
+# ──────────────────────────────────────────────────────────────────────
+#
+# The pipeline result (process_frame "pixels", unit) is the CORRECTED data
+# every evaluation uses (CIE, CRI, TM-30, filter, exports' base values). The
+# display mode only changes what is plotted:
+#
+#   raw          Raw ADC — counts without calibration profile (dark correction
+#                and smoothing as configured; identical to the legacy display
+#                when no profile is active).
+#   corrected    Corrected counts (default with an active profile):
+#                corrected rate × current t_int, normalised so that in the
+#                pixel of maximum sensitivity (smallest correction factor)
+#                Corrected = Raw (net counts). Keeps the familiar ADC scale.
+#   normalised   max = 1 over the valid (finite) range.
+#   count_rate   counts/s (with a profile: corrected rate on the same
+#                normalisation as "corrected").
+#   absolute     irradiance (only with an absolute profile).
+#   auto         corrected with an active v2 profile, else count_rate when the
+#                legacy display_unit is counts_per_s, else raw.
+DISPLAY_AUTO = "auto"
+DISPLAY_RAW = "raw"
+DISPLAY_CORRECTED = "corrected"
+DISPLAY_NORMALISED = "normalised"
+DISPLAY_RATE = "count_rate"
+DISPLAY_ABSOLUTE = "absolute"
+DISPLAY_MODES = (DISPLAY_RAW, DISPLAY_CORRECTED, DISPLAY_NORMALISED, DISPLAY_RATE,
+                 DISPLAY_ABSOLUTE)
+DISPLAY_LABELS = {
+    DISPLAY_AUTO: "Auto",
+    DISPLAY_RAW: "Raw ADC",
+    DISPLAY_CORRECTED: "Corrected counts",
+    DISPLAY_NORMALISED: "Normalised",
+    DISPLAY_RATE: "Count rate",
+    DISPLAY_ABSOLUTE: "Absolute",
+}
+UNIT_COUNTS_CORRECTED = "counts_corrected"
+UNIT_NORMALISED = "normalised"
+UNIT_LABELS.update({UNIT_COUNTS_CORRECTED: "counts (corrected)",
+                    UNIT_NORMALISED: "normalised"})
+
+
+def available_display_modes(profile_type: str | None) -> list[str]:
+    """Modes selectable now. profile_type: 'relative' | 'absolute' | None
+    (no v2 profile active)."""
+    if profile_type is None:
+        return [DISPLAY_RAW, DISPLAY_NORMALISED, DISPLAY_RATE]
+    modes = [DISPLAY_RAW, DISPLAY_CORRECTED, DISPLAY_NORMALISED, DISPLAY_RATE]
+    if profile_type == "absolute":
+        modes.append(DISPLAY_ABSOLUTE)
+    return modes
+
+
+def effective_display_mode(requested: str | None, profile_type: str | None,
+                           legacy_display_unit: str = "counts") -> str:
+    """The mode actually shown: 'auto' and modes that are not available with
+    the current profile fall back (absolute → corrected → raw)."""
+    req = (requested or DISPLAY_AUTO).strip().lower()
+    avail = available_display_modes(profile_type)
+    if req == DISPLAY_AUTO or req not in DISPLAY_MODES:
+        if profile_type is not None:
+            return DISPLAY_CORRECTED
+        return DISPLAY_RATE if legacy_display_unit == "counts_per_s" else DISPLAY_RAW
+    if req in avail:
+        return req
+    if req == DISPLAY_ABSOLUTE and profile_type is not None:
+        return DISPLAY_CORRECTED
+    return DISPLAY_RAW
+
+
+def display_transform(mode: str, *, values: np.ndarray, unit: str,
+                      integration_us: int, calibration=None,
+                      raw_counts: np.ndarray | None = None) -> tuple[np.ndarray, str]:
+    """(display values, display unit) for an EFFECTIVE mode.
+
+    values/unit: process_frame result (corrected data). calibration: the active
+    CalibrationApplier (None without v2 profile). raw_counts: the uncalibrated
+    counts (needed for 'raw' when a profile is active; else values are used)."""
+    v = np.asarray(values, float)
+    t = max(int(integration_us), 1) / 1_000_000.0
+    if calibration is not None:
+        norm = float(getattr(calibration, "counts_norm", 1.0) or 1.0)
+        if mode == DISPLAY_RAW:
+            base = v if raw_counts is None else np.asarray(raw_counts, float)
+            return base, "counts"
+        if mode == DISPLAY_ABSOLUTE and getattr(calibration, "type", "") == "absolute":
+            return v, unit
+        rate = v * norm                    # corrected count rate (counts/s)
+        if mode == DISPLAY_RATE:
+            return rate, "counts/s"
+        if mode == DISPLAY_NORMALISED:
+            return normalise(rate), UNIT_NORMALISED
+        return rate * t, UNIT_COUNTS_CORRECTED
+    # no v2 profile: values are counts or counts/s (legacy pipeline)
+    if mode == DISPLAY_RATE:
+        return (v if unit == "counts/s" else v / t), "counts/s"
+    if mode == DISPLAY_NORMALISED:
+        return normalise(v), UNIT_NORMALISED
+    if mode == DISPLAY_RAW and unit == "counts/s":
+        return v * t, "counts"
+    return v, unit
+
+
+def normalise(values: np.ndarray) -> np.ndarray:
+    """max = 1 over the finite (valid) values; all-NaN / non-positive → as is."""
+    v = np.asarray(values, float)
+    fin = np.isfinite(v)
+    if not np.any(fin):
+        return v
+    mx = float(np.max(v[fin]))
+    return v / mx if mx > 0 else v
+
+
+def exposure_level(raw_averaged, *, full_scale: float, saturation_level: float) -> dict:
+    """Detector drive level in ADC (independent of the display mode):
+    peak counts, % of full scale, saturated pixel count."""
+    r = np.asarray(raw_averaged, float)
+    fin = r[np.isfinite(r)]
+    peak = float(np.max(fin)) if fin.size else 0.0
+    fs = float(full_scale) if full_scale else 0.0
+    return {"peak_counts": peak,
+            "peak_pct_fs": (100.0 * peak / fs) if fs > 0 else None,
+            "full_scale": fs, "saturation_level": float(saturation_level),
+            "n_saturated": int(np.count_nonzero(fin >= float(saturation_level)))
+            if saturation_level else 0,
+            "saturated": bool(saturation_level and peak >= float(saturation_level))}
+
+
+def format_value(v, unit: str) -> str:
+    """Readout text with the active unit; '–' for masked / invalid pixels."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "–"
+    if not np.isfinite(x):
+        return "–"
+    label = unit_label(unit)
+    if unit in ("counts", UNIT_COUNTS_CORRECTED):
+        return f"{x:.0f} {label}"
+    if unit == UNIT_NORMALISED:
+        return f"{x:.4f}"
+    return f"{x:.4g} {label}"

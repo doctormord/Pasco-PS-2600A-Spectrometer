@@ -341,7 +341,8 @@ def add_v1_routes(app: FastAPI, engine: Engine, settings: ServerSettings,
             body = json.dumps(measurement_to_json(m), indent=1)
             return Response(body, media_type="application/json", headers={
                 "Content-Disposition": f'attachment; filename="{mid}.json"'})
-        return Response(measurement_to_csv(m), media_type="text/csv", headers={
+        from engine import CSV_MEDIA_TYPE, csv_bytes
+        return Response(csv_bytes(measurement_to_csv(m)), media_type=CSV_MEDIA_TYPE, headers={
             "Content-Disposition": f'attachment; filename="{mid}.csv"'})
 
     # ── further groups ────────────────────────────────────────────────────

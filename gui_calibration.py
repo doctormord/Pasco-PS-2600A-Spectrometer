@@ -46,6 +46,7 @@ import reference_sources as rs
 import wavelength_calibration as wlcal
 import gui_theme as gt
 import gui_tables as gtab
+from engine import LOCAL as _LOCAL
 from gui_layout import (
     ElidedLabel, FixedTextPane, scroll_page, place_window, schedule_fix_onscreen,
     geometry_to_config,
@@ -172,6 +173,8 @@ class CalibrationDialog(QDialog):
         self.tab_wizard = _SpectralWizardTab(self)
         self.tab_profiles = _ProfilesTab(self)
         self.tab_lamps = _LampsTab(self)
+        from gui_linearity import LinearityTab
+        self.tab_linearity = LinearityTab(self)
         # Every tab page sits in a scroll area: its minimum size can never force
         # the dialog larger than the window / screen.
         self._pages = {}
@@ -179,6 +182,7 @@ class CalibrationDialog(QDialog):
                             (self.tab_wizard, "Spectral calibration"),
                             (self.tab_profiles, "Profiles"),
                             (self.tab_lamps, "Lamps"),
+                            (self.tab_linearity, "Linearity"),
                             (self._build_response_tab(), "Response (legacy)")):
             sa = page if getattr(page, "SELF_SCROLLING", False) else scroll_page(page)
             self._pages[id(sa)] = page
@@ -212,11 +216,14 @@ class CalibrationDialog(QDialog):
             print(f"[calib] saving the dialog geometry failed: {e}")
 
     # ── busy handling (a wizard step runs in a worker thread) ────────────
-    def set_busy(self, busy: bool) -> None:
+    def set_busy(self, busy: bool, keep=None) -> None:
+        """Lock the dialog while a run is active; `keep` is the tab that
+        stays enabled (the running one; default: the spectral wizard)."""
         self._busy = bool(busy)
+        keep = keep if keep is not None else self.tab_wizard
         self.btn_close.setEnabled(not busy)
         for i in range(self.tabs.count()):
-            if self.page_at(i) is not self.tab_wizard:
+            if self.page_at(i) is not keep:
                 self.tabs.setTabEnabled(i, not busy)
 
     def done(self, r):
@@ -228,7 +235,8 @@ class CalibrationDialog(QDialog):
 
     def _on_tab_changed(self, i):
         w = self.page_at(i)
-        for t in (self.tab_wizard, self.tab_profiles, self.tab_lamps):
+        for t in (self.tab_wizard, self.tab_profiles, self.tab_lamps,
+                  self.tab_linearity):
             if w is t and hasattr(t, "refresh"):
                 t.refresh()
 
@@ -241,6 +249,19 @@ class CalibrationDialog(QDialog):
                 print(f"[calib] on_calibration_profiles_changed failed: {e}")
         for t in (self.tab_wizard, self.tab_profiles):
             t.refresh()
+
+    def notify_scope_reference_changed(self) -> None:
+        """The scope reference selection changed (verification sets it)."""
+        fn = getattr(self.dash, "sync_scope_reference", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:                            # noqa: BLE001
+                print(f"[calib] sync_scope_reference failed: {e}")
+
+    def engine(self):
+        """The core engine behind the dashboard (None for stub dashboards)."""
+        return getattr(self.dash, "engine", None)
 
     # ── helpers ──────────────────────────────────────────────────────────
     def _device_name(self) -> str:
@@ -933,9 +954,9 @@ def _norm(a, valid=None):
 #  SPECTRAL CALIBRATION TAB (wizard)
 # ══════════════════════════════════════════════════════════════════════════
 
-_LAMP_STEPS = ["Selection", "Wavelength check", "Integration time", "Dark spectra",
-               "Calibration + stability", "Integration cross check", "Compute",
-               "Save + protocol"]
+_LAMP_STEPS = ["Selection", "Wavelength check", "Integration time", "Dark before",
+               "Calibration + repeat", "t/2 capture", "Dark after + checks", "Compute",
+               "Save", "Verification"]
 _DERIV_STEPS = ["Selection", "Integration time", "Known optics (dark + light)",
                 "New optics (dark + light)", "Compute", "Save"]
 _STATE_TEXT = {"waiting": "waiting", "running": "running", "ok": "OK",
@@ -954,6 +975,21 @@ def _state_color(state: str) -> str:
 
 def _span(color_token: str, html: str) -> str:
     return f"<span style='color:{color_token}'>{html}</span>"
+
+
+class _ResultPane(FixedTextPane):
+    """Result text with its own space in the plot splitter: never fixed to a
+    height the plots could squeeze, at least `lines` lines tall, longer content
+    scrolls inside the pane (the top line is always the first one shown)."""
+
+    def __init__(self, lines: int = 6, parent=None):
+        super().__init__(lines, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _update_height(self) -> None:
+        fw = 2 * self.frameWidth()
+        self.setMinimumHeight(self.fontMetrics().lineSpacing() * self._lines + 10 + fw)
+        self.setMaximumHeight(16777215)
 
 
 class _SpectralWizardTab(QWidget):
@@ -1073,10 +1109,16 @@ class _SpectralWizardTab(QWidget):
         self._reset_plots()
         plots.addWidget(self.plot_in)
         plots.addWidget(self.plot_out)
+        # The result pane is the third pane of the splitter: it keeps its own
+        # space (minimum height of 6 lines) and is never covered by the plots.
+        self.lbl_result = _ResultPane(6)
+        plots.addWidget(self.lbl_result)
+        plots.setStretchFactor(0, 2)
+        plots.setStretchFactor(1, 2)
+        plots.setStretchFactor(2, 2)
+        plots.setSizes([200, 200, 200])
+        self.plots_split = plots
         rv.addWidget(plots, 1)
-        # Fixed-height result pane — no layout jumps.
-        self.lbl_result = FixedTextPane(4)
-        rv.addWidget(self.lbl_result)
         self.split.addWidget(right)
         self.split.setStretchFactor(0, 0)
         self.split.setStretchFactor(1, 1)
@@ -1523,11 +1565,15 @@ class _SpectralWizardTab(QWidget):
         """Separate hook so tests can answer the dialog."""
         return QMessageBox.StandardButton(box.exec())
 
+    def _engine(self):
+        """The dashboard's engine (Qt-free core), or None (stub dashboards)."""
+        return getattr(self.dlg.dash, "engine", None)
+
     def _gen_lamp(self, wf, us):
         step = 0
         try:
             self._state(0, "ok", f"{wf.optics['name']} · {wf.optics['input']} · {wf.kind}")
-            # 2 wavelength check
+            # 1 wavelength check
             step = 1; self._checkpoint(); self._state(1, "running")
             self.lbl_status.setText("Checking the wavelength calibration…")
             chk = yield wf.check_wavelength
@@ -1538,7 +1584,7 @@ class _SpectralWizardTab(QWidget):
             self._state(1, "warning" if msgs else "ok", f"fingerprint {fp}")
             self.lbl_result.setText(f"Fingerprint: <code>{fp}</code>"
                                     + (f"<br>{msgs}" if msgs else ""))
-            # 3 integration time
+            # 2 integration time
             step = 2; self._checkpoint(); self._state(2, "running")
             self.lbl_status.setText("Setting the integration time…")
             info = yield (lambda: wf.set_integration(us, auto=us is None))
@@ -1548,14 +1594,14 @@ class _SpectralWizardTab(QWidget):
                 + (f", half = {half/1000:.2f} ms" if half else ", no half value"))
             self._state(2, "ok" if info.get("converged", True) else "warning",
                         self.lbl_itime.text())
-            # 4 dark
+            # 3 darks BEFORE
             step = 3; self._checkpoint(); self._state(3, "running")
             if wf.needs_user_cover:
                 if not _ask(self, "Dark spectrum",
                             "Block the light path / cover the lamp.\n\n"
                             "The dark spectra are captured next.", ok_cancel=True):
                     raise _Abort("cancelled at the dark prompt")
-            self.lbl_status.setText("Capturing dark spectra…")
+            self.lbl_status.setText("Capturing dark spectra (before)…")
             dk = yield wf.capture_darks
             if wf.needs_user_cover:
                 if not _ask(self, "Release the light path",
@@ -1564,29 +1610,46 @@ class _SpectralWizardTab(QWidget):
                             ok_cancel=True):
                     raise _Abort("cancelled at the release prompt")
             self._state(3, "ok", f"peak {dk['dark_peak']:.0f} counts")
-            # 5 calibration + stability
+            # 4 calibration + repeat (provisional stability)
             step = 4; self._checkpoint(); self._state(4, "running")
             self.lbl_status.setText("Capturing the calibration spectrum…")
             cal = yield (lambda: wf.capture_calibration(sleep=self._worker_sleep))
             self._note = ""
             st = cal["stability"]["p95_pct"]
-            self._state(4, "ok" if cal["pass"] else "warning", f"stability {st:.2f} %")
-            # 6 cross check
+            self._state(4, "ok" if cal["pass"] else "warning",
+                        f"stability {st:.2f} % (provisional)")
+            # 5 t/2 capture (provisional cross check)
             step = 5; self._checkpoint(); self._state(5, "running")
-            self.lbl_status.setText("Integration-time cross check…")
+            self.lbl_status.setText("Integration-time cross check (t/2)…")
             cx = yield wf.crosscheck_integration
             if cx.get("skipped"):
                 self._state(5, "warning", "skipped")
             else:
                 self._state(5, "ok" if cx["pass"] else "warning",
-                            f"{cx['crosscheck']['p95_pct']:.2f} %")
-            # 7 compute + plausibility
+                            f"{cx['crosscheck']['p95_pct']:.2f} % (provisional)")
+            # 6 darks AFTER + final checks
             step = 6; self._checkpoint(); self._state(6, "running")
+            if wf.needs_user_cover:
+                if not _ask(self, "Dark spectrum (after)",
+                            "Block the light path / cover the lamp again.\n\n"
+                            "The dark spectra AFTER the light captures are taken next.",
+                            ok_cancel=True):
+                    raise _Abort("cancelled at the second dark prompt")
+            self.lbl_status.setText("Capturing dark spectra (after)…")
+            ev = yield wf.capture_darks_after
+            if wf.needs_user_cover:
+                if not _ask(self, "Release the light path",
+                            "Release the light path / uncover the lamp (for the "
+                            "verification measurement).", ok_cancel=True):
+                    raise _Abort("cancelled at the release prompt")
+            self._final_check_states(wf, ev)
+            # 7 compute + plausibility
+            step = 7; self._checkpoint(); self._state(7, "running")
             try:
                 res = yield wf.compute
             except ValueError as e:                       # no valid pixel at all
-                self._state(6, "failed", str(e))
-                self._state(7, "failed", "not saved")
+                self._state(7, "failed", str(e))
+                self._state(8, "failed", "not saved")
                 self.last_status = "failed"
                 self.lbl_result.setText(_span(_T().DANGER, f"<b>FAILED</b>: {e}"))
                 yield from self._write_protocol(wf)
@@ -1596,19 +1659,19 @@ class _SpectralWizardTab(QWidget):
             self._show_lamp_result(wf, res)
             segs = calprof.format_segments(res.get("segments_nm"), 3)
             if wf.plausible:
-                self._state(6, "ok", f"valid {segs}")
+                self._state(7, "ok", f"valid {segs}")
             else:
-                self._state(6, "failed", "plausibility check failed: "
+                self._state(7, "failed", "plausibility check failed: "
                             + "; ".join(wf.plausibility["failures"]))
             # 8 save
-            step = 7; self._checkpoint()
+            step = 8; self._checkpoint()
             activate = True
             if not wf.plausible:
                 other = [n for k, n in (("stability_pass", "Stability"),
                                         ("itime_pass", "Integration-time cross"))
                          if wf.checks.get(k) is False]
                 if not self._confirm_implausible(wf.plausibility["failures"], other):
-                    self._state(7, "failed", "not saved (plausibility check failed)")
+                    self._state(8, "failed", "not saved (plausibility check failed)")
                     self.last_status = "failed"
                     yield from self._write_protocol(wf)
                     self.lbl_status.setText("Calibration failed: result not plausible, "
@@ -1619,31 +1682,76 @@ class _SpectralWizardTab(QWidget):
                 if not _ask(self, "Checks failed",
                             "The stability and/or integration-time cross check "
                             "failed.\n\nSave the profile anyway?"):
-                    self._state(7, "warning", "not saved (checks failed)")
+                    self._state(8, "warning", "not saved (checks failed)")
                     self.last_status = "not_saved"
                     yield from self._write_protocol(wf)
                     self.lbl_status.setText("Not saved.")
                     return
-            self._state(7, "running")
+            self._state(8, "running")
             saved = yield (lambda: wf.save(allow_implausible=not activate))
             if activate:
                 calprof.set_active_selection(wf.backend_name, saved[0]["id"])
             self.dlg.notify_profiles_changed()
-            yield from self._write_protocol(wf)
             pid = f"profile {saved[0]['id']} v{saved[0]['version']}"
+            self._state(8, "ok" if activate else "warning",
+                        f"{pid} saved and active" if activate
+                        else f"{pid} saved as NOT PLAUSIBLE, not activated")
+            # 9 verification: the reference is measured through the live
+            # pipeline WITH the new profile (never aborts the run).
+            step = 9; self._checkpoint(); self._state(9, "running")
+            engine = self._engine()
+            if engine is None:
+                self._state(9, "warning", "no engine available")
+                wf.warnings.append("Verification skipped: no engine available.")
+            else:
+                self.lbl_status.setText("Verification: measuring the reference source…")
+                ver = None
+                try:
+                    ver = yield (lambda: engine.verify_profile(
+                        saved[0]["id"], wf.reference.id, owner=_LOCAL))
+                except Exception as e:                        # noqa: BLE001
+                    self._state(9, "warning", f"failed: {e}")
+                    wf.warnings.append(f"Verification failed: {e}")
+                if ver is not None:
+                    wf.verification = ver
+                    o = ver["overall"]
+                    self._state(9, "ok" if ver.get("pass") else "warning",
+                                f"rms {o['rms_pct']:.2f} %, max {o['max_abs_pct']:.2f} %")
+                    self.dlg.notify_scope_reference_changed()
+            self._show_lamp_result(wf, res)               # now incl. verification
+            yield from self._write_protocol(wf)           # protocol AFTER verification
             if activate:
-                self._state(7, "ok" if self.protocol_paths else "warning",
-                            f"{pid} saved and active"
-                            + ("" if self.protocol_paths else "; protocol not written"))
+                if not self.protocol_paths:
+                    self._state(8, "warning", f"{pid} saved and active; protocol "
+                                              "not written")
                 self.last_status = "saved"
                 self.lbl_status.setText(f"Saved and activated {pid}.")
             else:
-                self._state(7, "warning", f"{pid} saved as NOT PLAUSIBLE, not activated")
                 self.last_status = "saved_implausible"
                 self.lbl_status.setText(f"Saved {pid} marked as not plausible; "
                                         f"not activated.")
         except Exception as e:                                # noqa: BLE001
             self._fail_msg(step, e)
+
+    def _final_check_states(self, wf, ev):
+        """Step 4/5/6 states from the FINAL checks (after the darks AFTER);
+        the values shown earlier were provisional."""
+        c = wf.checks
+        if c.get("stability_pct") is not None:
+            self._state(4, "ok" if c.get("stability_pass") else "warning",
+                        f"stability {c['stability_pct']:.2f} %"
+                        + (f", {c.get('stability_fail_pixels')} px masked"
+                           if c.get("stability_fail_pixels") else ""))
+        if c.get("itime_crosscheck_pct") is not None:
+            self._state(5, "ok" if c.get("itime_pass") else "warning",
+                        f"{c['itime_crosscheck_pct']:.2f} %"
+                        + (f", {c.get('itime_fail_pixels')} px masked"
+                           if c.get("itime_fail_pixels") else ""))
+        drift = list(wf.dark_drift or [])
+        warn = any(d.get("warn") for d in drift)
+        txt = ", ".join(f"{d['integration_us']/1000:.1f} ms: {d['mean_counts']:+.1f} cts"
+                        for d in drift) or "no drift data"
+        self._state(6, "warning" if warn else "ok", f"dark drift {txt}")
 
     def _result_text(self, res, plausibility, extra=()):
         t = _T()
@@ -1655,14 +1763,43 @@ class _SpectralWizardTab(QWidget):
                        else _span(t.DANGER, "<b>FAILED</b>"))
             lines.append(
                 f"Plausibility: {verdict} — coverage {m['coverage']*100:.0f} % "
-                f"(≥ {lim['min_coverage']*100:.0f} %), gain span ≤ {lim['max_gain_span']:.0f}×, "
+                f"(≥ {lim['min_coverage']*100:.0f} %), "
                 f"roughness {m['roughness']*100:.1f} % (≤ {lim['max_roughness']*100:.1f} %), "
                 f"isolated {m['isolated_frac']*100:.0f} % "
                 f"(≤ {lim['max_isolated_frac']*100:.0f} %)")
             for f in plausibility["failures"]:
                 lines.append(_span(t.DANGER, f"• {f}"))
+            for h in plausibility.get("hints") or []:
+                lines.append(_span(t.WARN, f"Hint: {h}"))
         lines.extend(extra)
         return "<br>".join(lines)
+
+    def _check_lines(self, wf):
+        """Stability / cross check / dark drift lines (percentage, verdict,
+        masked pixels, cause with magnitude)."""
+        t = _T()
+        c = wf.checks
+
+        def chk(name, pct, ok, nfail, cause):
+            if pct is None:
+                return f"{name}: skipped"
+            s = (f"{name}: {pct:.2f} % — "
+                 + _span(t.OK if ok else t.DANGER, "passed" if ok else "NOT passed")
+                 + f" · {int(nfail or 0)} px masked")
+            if cause:
+                s += f"<br>&nbsp;&nbsp;Cause: {cause}"
+            return s
+        out = [chk("Stability", c.get("stability_pct"), c.get("stability_pass"),
+                   c.get("stability_fail_pixels"), c.get("stability_cause")),
+               chk("Integration cross check (t/2)", c.get("itime_crosscheck_pct"),
+                   c.get("itime_pass"), c.get("itime_fail_pixels"),
+                   c.get("itime_cause"))]
+        for d in wf.dark_drift or []:
+            s = (f"Dark drift at {d['integration_us']/1000:.2f} ms: "
+                 f"{d['mean_counts']:+.1f} counts ({d.get('pct_of_peak', 0.0):+.2f} % "
+                 f"of the peak)")
+            out.append(_span(t.WARN, s + " — warning") if d.get("warn") else s)
+        return out
 
     def _show_lamp_result(self, wf, res):
         wl, valid = res["wl"], res["valid"]
@@ -1682,17 +1819,14 @@ class _SpectralWizardTab(QWidget):
                            pen=pg.mkPen((255, 170, 60), width=2))
         _shade_masked(self.plot_out, wl, segs)
         self.plot_out.autoRange()
-        c = wf.checks
         t = _T()
-
-        def chk(name, pct, ok):
-            if pct is None:
-                return f"{name}: skipped"
-            return (f"{name}: {pct:.2f} % — "
-                    + _span(t.OK if ok else t.DANGER, "passed" if ok else "NOT passed"))
-        extra = [chk("Stability", c.get("stability_pct"), c.get("stability_pass")),
-                 chk("Integration cross check", c.get("itime_crosscheck_pct"),
-                     c.get("itime_pass"))]
+        extra = self._check_lines(wf)
+        ver = getattr(wf, "verification", None)
+        if ver:
+            vl = cw.format_verification(ver)
+            ok = bool(ver.get("pass"))
+            extra.append(_span(t.OK if ok else t.WARN, f"<b>{vl[0]}</b>"))
+            extra.extend("<code>" + ln.replace(" ", "&nbsp;") + "</code>" for ln in vl[1:])
         other = [w for w in wf.warnings if not w.startswith("Plausibility check failed")]
         if other:
             extra.append(_span(t.WARN, "<br>".join(other)))

@@ -17,6 +17,7 @@ CONFIG_FILENAME = "spectrometer_config.json"
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "config_version": 2,
     # Appearance
     "theme": "dark",                         # "dark" or "light"
 
@@ -93,16 +94,60 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # unless the user confirms explicitly; such a profile is flagged and not
     # activated automatically.
     "calibration_min_coverage": 0.5,          # valid / (device ∩ reference) pixels
-    "calibration_max_gain_span": 40.0,        # max/min gain over the valid range
+    # max/min gain over the valid range — reported as a HINT only (a halogen
+    # lamp on a Si detector spans 50–100x between 380 and 950 nm); line
+    # sources are detected via coverage, roughness and isolated peaks.
+    "calibration_max_gain_span": 200.0,
     "calibration_max_roughness": 0.05,        # p95 |S/S_smoothed - 1|
     "calibration_max_isolated_frac": 0.2,     # share of valid pixels in isolated peaks
     "calibration_min_segment_nm": 5.0,        # narrower valid runs count as isolated
     "calibration_max_gap_nm": 2.0,            # masked gaps up to this width are bridged
     "calibration_min_largest_segment_frac": 0.5,
     "calibration_roughness_px": 21,           # smoothing window of the roughness metric
+    # Per-pixel stability / t/2 cross check: a pixel fails when its deviation
+    # exceeds k·σ (dark + shot noise of the captures) + the check threshold.
+    # Failing pixels are masked and limit the valid segments.
+    "calibration_pixel_check_k": 4.0,
+    # Cause model of the checks (dark drift / time offset or lamp drift /
+    # nonlinearity): a term is reported when its effect reaches this (%).
+    "calibration_cause_min_pct": 0.3,
+    # Dark before/after each light capture: warn when the dark level changed
+    # by more than this share of the net peak signal (%) (and > 3 σ).
+    "calibration_dark_drift_warn_pct": 0.5,
+    # Verification after saving a profile: reference source measured through
+    # the live pipeline, normalised over this range, deviation per band.
+    "calibration_verify_norm_lo_nm": 550.0,
+    "calibration_verify_norm_hi_nm": 650.0,
+    "calibration_verify_band_nm": 50.0,
+    "calibration_verify_warn_pct": 2.0,
+    # Reference curve overlay in the scope (reference source id, on/off).
+    "scope_reference_id": "",
+    "scope_reference_overlay": False,
+
+    # ── Linearity calibration (calibration_linearity.py) ──────────────────
+    # Records + active correction per unit (backend + serial).
+    "linearity_profiles_file": "linearity_profiles.json",
+    "linearity_steps": 8,                     # 6–10 integration times
+    "linearity_frac_lo": 0.10,                # raw peak of the shortest step (FS)
+    "linearity_frac_hi": 0.90,                # longest step (capped below saturation)
+    "linearity_ref_frac": 0.50,               # repeated reference step (lamp drift)
+    "linearity_ref_every": 3,
+    "linearity_capture_frames": 16,
+    "linearity_degree": 3,
+    "linearity_warn_residual_pct": 0.3,
+    "linearity_warn_lamp_drift_pct": 1.0,
     # Calibration dialog geometry [x, y, w, h] (clamped to the current screen).
     "calibration_dialog_geometry": None,
     "main_window_geometry": None,
+    # Display mode (Darstellungsart) of scope + heatmap: auto | raw | corrected
+    # | normalised | count_rate | absolute (processing.display_transform).
+    # auto = corrected with an active profile, else raw (or count_rate with
+    # display_unit counts_per_s). Evaluations always use the corrected data.
+    "display_mode": "auto",
+    # Manual y-axis limits per display mode {mode: {"auto": bool, "min": x,
+    # "max": y}} (scope) and {mode: {"auto": bool, "max": y}} (heatmap).
+    "y_limits_by_mode": {},
+    "heatmap_limits_by_mode": {},
     # Display unit of the main plot when NO v2 profile is active:
     # "counts" (unchanged legacy behaviour) or "counts_per_s".
     "display_unit": "counts",
@@ -133,11 +178,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "heatmap_buffer_size": 100,          # rolling history length (frames), step 10
     "heatmap_measure_interval_ms": 0,    # 0 = every frame; else log one frame per N ms
     "heatmap_autosave_enabled": False,
-    "heatmap_autosave_dir": "",          # "" = current working directory
+    "heatmap_autosave_dir": "",          # "" = the export folder
     "heatmap_autosave_fsync_s": 20,      # periodic fsync interval (crash safety)
 
     # ── Central export location + filename composition (all tabs/saves) ──
-    "export_dir": "",                    # "" = program folder
+    "export_dir": "",                    # "" = <Documents>/PS-2600A (never the program folder)
     "export_filename_template": "{kind}_{datetime}",
 
     # ── Out-of-spec shading (per device) ──────────────────────────────────
@@ -190,6 +235,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "demo_shot_noise": 1.0,                  # demo shot-noise scale (×sqrt(signal))
     "demo_serial": "DEMO-0001",              # virtual serial (change to emulate a 2nd unit)
     "demo_sensitivity": "none",              # "none" (flat, unchanged) | "synthetic" (known S(λ) for calibration tests)
+    "demo_nonlinearity": 0.0,                # test effect: response n·(1 + β·n/FS); 0 = linear
+    "demo_dark_drift": 0.0,                  # test effect: dark offset drift (counts per second)
 
     # ── Filter tab ──
     "filter_baseline_frames": 16,            # frames averaged into the 100% reference on "Set baseline" (1 = single frame)
@@ -256,8 +303,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+# Defaults that changed: a stored value equal to the OLD default is replaced
+# by the new one once (config_version). Values the user changed are kept.
+CONFIG_VERSION = 2
+_CHANGED_DEFAULTS = {
+    2: {"calibration_max_gain_span": (40.0, 200.0)},
+}
+
+
+def _migrate_defaults(data: dict, ver: int) -> bool:
+    """Apply changed defaults for a file written with config_version `ver`."""
+    if ver >= CONFIG_VERSION:
+        return False
+    for v in range(ver + 1, CONFIG_VERSION + 1):
+        for key, (old, new) in _CHANGED_DEFAULTS.get(v, {}).items():
+            try:
+                if key in data and float(data[key]) == float(old):
+                    data[key] = new
+            except (TypeError, ValueError):
+                pass
+    data["config_version"] = CONFIG_VERSION
+    return True
+
+
 class _Config:
     def __init__(self, path: str = CONFIG_FILENAME):
+        # relative names live in the user data directory (data_paths)
+        if not os.path.isabs(path):
+            import data_paths
+            path = data_paths.resolve(path)
         self.path = path
         self._data: dict[str, Any] = {}
         self.load()
@@ -271,13 +345,18 @@ class _Config:
             with open(self.path, "r", encoding="utf-8") as f:
                 user = json.load(f)
             # Merge defaults with whatever the user has (defaults fill gaps)
-            self._data = {**DEFAULT_CONFIG, **(user or {})}
+            user = user or {}
+            self._data = {**DEFAULT_CONFIG, **user}
+            if _migrate_defaults(self._data, int(user.get("config_version", 1) or 1)):
+                self.save()
         except Exception as e:
             print(f"[config] failed to read {self.path}: {e} — using defaults")
             self._data = dict(DEFAULT_CONFIG)
 
     def save(self) -> None:
         try:
+            d = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(d, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, sort_keys=True)
         except Exception as e:
@@ -300,5 +379,9 @@ class _Config:
         return dict(self._data)
 
 
-# Module-level singleton — import this from anywhere.
-Config = _Config()
+# Module-level singleton — import this from anywhere. The user data directory
+# is prepared first (one-time migration out of the program folder, templates).
+import data_paths as _data_paths            # noqa: E402
+
+_data_paths.initialize()
+Config = _Config(_data_paths.config_path())

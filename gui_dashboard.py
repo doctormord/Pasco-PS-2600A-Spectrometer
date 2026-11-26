@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox,
     QTabWidget, QFrame, QScrollArea, QToolTip, QFileDialog, QCheckBox, QSlider,
-    QLineEdit,
+    QLineEdit, QProgressBar, QAbstractSpinBox,
 )
 import pyqtgraph as pg
 
@@ -84,6 +84,7 @@ from spectrometer_core import (
 import device_manager as dm
 import processing
 from engine import Engine, LOCAL, ControlBusy, EngineError, NeedsConfirmation
+import engine as eng
 import export_paths
 
 
@@ -190,6 +191,17 @@ class DashboardWindow(QMainWindow):
         self.current_averaged_pixels = np.zeros(self.active_pixel_count)
         self._current_unit = "counts"
         self._shown_unit = None
+        # Display representation (engine FrameEvent.display): what the scope,
+        # overlays, cursors and heatmap show. current_averaged_pixels stays the
+        # CORRECTED data (evaluations, exports, clipboard).
+        self.current_display_pixels = np.zeros(self.active_pixel_count)
+        self._display_unit = "counts"
+        self._display_mode = None            # effective mode shown (None = none yet)
+        self._force_autoscale = False        # autoscale once after a mode change
+        self._hm_user_max = None             # manual heatmap upper limit of the mode
+        self._hm_max = 10.0                  # heatmap upper level currently applied
+        self._modes_sig = None
+        self._exposure_cls = None
 
         self.is_dark_correction_enabled = Config.get("dark_correction", False)
         self.is_despeckle_enabled       = Config.get("hot_pixel_filter", False)
@@ -206,7 +218,7 @@ class DashboardWindow(QMainWindow):
         self.overlay_diff      = False
         self.overlay_peak_hold = False
         self.overlay_persist   = False
-        self.freeze_xy         = None    # (wavelengths, intensities) snapshot
+        self.freeze_xy         = None    # (wavelengths, display values) snapshot of ONE mode
         self.csvbg_xy          = None    # (wavelengths, intensities) from a file
         self.peak_hold_env     = None    # per-pixel running max (np.ndarray)
         self.persist_ring      = []      # recent live frames, newest first
@@ -506,7 +518,7 @@ class DashboardWindow(QMainWindow):
         # count — e.g. 0 -> 20000 used to widen the box and push WAVELENGTH left.
         self.readout_pix = self._make_readout("PIXEL",      "—", min_w=64)
         self.readout_wl  = self._make_readout("WAVELENGTH", "—", unit="nm", accent=True, min_w=88)
-        self.readout_int = self._make_readout("INTENSITY",  "—", unit="ADC", min_w=92)
+        self.readout_int = self._make_readout("INTENSITY",  "—", min_w=150)   # unit in the text
         h.addWidget(self.readout_pix); h.addSpacing(18)
         h.addWidget(self.readout_wl);  h.addSpacing(18)
         h.addWidget(self.readout_int)
@@ -571,10 +583,19 @@ class DashboardWindow(QMainWindow):
             pen=pg.mkPen(QColor(T().FG1), width=1.4))
         self.plot_canvas.addItem(self.spectrum_curve)
 
+        # Faint raw ADC curve on a second (right-hand) axis: keeps the drive
+        # level visible in every corrected display mode.
+        self._build_raw_axis()
+
         # Reference overlay
         self.reference_curve = self.plot_canvas.plot(
             pen=pg.mkPen(QColor(T().WARN), width=1.5, style=Qt.PenStyle.DashLine))
         self.reference_curve.setVisible(False)
+
+        # Verified reference (engine.reference_overlay) — dashed, on every frame
+        self.scope_ref_curve = self.plot_canvas.plot(
+            pen=pg.mkPen(QColor(T().ACCENT), width=1.5, style=Qt.PenStyle.DashLine))
+        self.scope_ref_curve.setVisible(False)
 
         # ── Out-of-spec shading ────────────────────────────────────────────
         # Two translucent-red bands mark where the device still returns data but
@@ -881,12 +902,188 @@ class DashboardWindow(QMainWindow):
         plot.setLabel("bottom", xlabel, units=x_units, color=T().FG3, **{"font-size":"10px"})
         plot.setLabel("left",   ylabel, units=y_units, color=T().FG3, **{"font-size":"10px"})
 
+    # ──────────────── display mode / exposure / raw axis ────────────────
+    def _build_display_row(self) -> QWidget:
+        """Second scope-bar row: display-mode selector, raw-ADC toggle and the
+        exposure bar (drive level in % of full scale)."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 0, 10, 6); h.setSpacing(8)
+        lbl = QLabel("Display"); lbl.setObjectName("readoutLbl")
+        h.addWidget(lbl)
+        self.combo_display_mode = QComboBox()
+        self.combo_display_mode.setMinimumWidth(150)
+        self.combo_display_mode.setToolTip(
+            "What the scope plots. Evaluations (colour, CRI, filters, exports) "
+            "always use the corrected data. Unavailable modes are greyed out.")
+        h.addWidget(self.combo_display_mode)
+        self._fill_display_modes()
+        self.combo_display_mode.activated.connect(self._display_mode_picked)
+
+        self.btn_raw_axis = QPushButton("Raw ADC")
+        self.btn_raw_axis.setCheckable(True)
+        self.btn_raw_axis.setChecked(bool(Config.get("scope_raw_overlay", True)))
+        self.btn_raw_axis.setToolTip(
+            "Faint raw ADC curve on the right-hand axis (corrected modes) — shows "
+            "the detector drive level next to the corrected spectrum.")
+        self.btn_raw_axis.clicked.connect(self._toggle_raw_axis)
+        h.addWidget(self.btn_raw_axis)
+        h.addStretch(1)
+
+        self.lbl_exposure = QLabel("Peak — % FS")
+        self.lbl_exposure.setObjectName("readoutLbl")
+        self.lbl_exposure.setMinimumWidth(190)
+        self.lbl_exposure.setAlignment(Qt.AlignmentFlag.AlignRight
+                                       | Qt.AlignmentFlag.AlignVCenter)
+        self.bar_exposure = QProgressBar()
+        self.bar_exposure.setRange(0, 100)
+        self.bar_exposure.setTextVisible(False)
+        self.bar_exposure.setFixedSize(120, 10)
+        h.addWidget(self.lbl_exposure)
+        h.addWidget(self.bar_exposure)
+        self._sync_raw_button()
+        self._show_exposure(False)
+        return row
+
+    def _sync_raw_button(self) -> None:
+        on = self.btn_raw_axis.isChecked()
+        self.btn_raw_axis.setObjectName("toolToggleOn" if on else "toolToggleOff")
+        self.btn_raw_axis.style().unpolish(self.btn_raw_axis)
+        self.btn_raw_axis.style().polish(self.btn_raw_axis)
+
+    def _fill_display_modes(self) -> None:
+        """(Re)build the selector from engine.display_modes(); unavailable
+        modes stay listed but disabled. The selection follows the config."""
+        modes = self.engine.display_modes()
+        cb = self.combo_display_mode
+        want = str(Config.get("display_mode", processing.DISPLAY_AUTO))
+        cb.blockSignals(True)
+        cb.clear()
+        for m in modes:
+            cb.addItem(m["label"], m["value"])
+            if not m["available"]:
+                it = cb.model().item(cb.count() - 1)
+                it.setEnabled(False)
+                it.setToolTip("Not available with the active calibration profile")
+        i = cb.findData(want)
+        cb.setCurrentIndex(max(0, i))
+        cb.blockSignals(False)
+        self._modes_sig = tuple((m["value"], m["available"]) for m in modes)
+
+    def _refresh_display_modes(self) -> None:
+        sig = tuple((m["value"], m["available"]) for m in self.engine.display_modes())
+        if sig != self._modes_sig:
+            self._fill_display_modes()
+
+    def _display_mode_picked(self, *_):
+        mode = self.combo_display_mode.currentData()
+        if mode:
+            self._cfg({"display_mode": mode})
+
+    def _toggle_raw_axis(self, checked: bool) -> None:
+        Config.set("scope_raw_overlay", bool(checked))
+        self._sync_raw_button()
+        self._update_raw_curve(self.engine.last_frame)
+
+    def _show_exposure(self, on: bool) -> None:
+        self.lbl_exposure.setVisible(on)
+        self.bar_exposure.setVisible(on)
+
+    def _update_exposure(self, ev) -> None:
+        """Exposure bar + raw curve (drive level in ADC), in every mode other
+        than raw (raw mode IS the ADC view)."""
+        exp = getattr(ev, "exposure", None)
+        corrected = (getattr(ev, "display_mode", None) not in (None, processing.DISPLAY_RAW))
+        if not corrected or not exp:
+            self._show_exposure(False)
+            self._update_raw_curve(None)
+            return
+        pct = float(exp.get("peak_pct_fs", 0.0) or 0.0)
+        sat = int(exp.get("n_saturated", 0) or 0)
+        cls = "danger" if (sat or exp.get("saturated") or pct >= 98.0) \
+            else "warn" if pct >= 85.0 else "ok"
+        txt = f"Peak {pct:.0f} % FS"
+        if sat:
+            txt += f" · {sat} px saturated"
+        self.lbl_exposure.setText(txt)
+        self.bar_exposure.setValue(int(round(min(100.0, max(0.0, pct)))))
+        if cls != self._exposure_cls:
+            self._exposure_cls = cls
+            t = T()
+            col = {"ok": t.OK, "warn": t.WARN, "danger": t.DANGER}[cls]
+            self.bar_exposure.setStyleSheet(
+                f"QProgressBar {{ background:{t.BG2}; border:1px solid {t.BORDER2}; "
+                f"border-radius:4px; }} QProgressBar::chunk {{ background:{col}; "
+                f"border-radius:3px; }}")
+            self.lbl_exposure.setStyleSheet(f"color:{col};")
+        self._show_exposure(True)
+        self._update_raw_curve(ev)
+
+    def _build_raw_axis(self) -> None:
+        """Second ViewBox linked to the plot's x axis, drawn on a right axis."""
+        pi = self.plot_canvas.getPlotItem()
+        self.raw_vb = pg.ViewBox()
+        self.raw_vb.setMouseEnabled(x=False, y=False)
+        self.raw_vb.setMenuEnabled(False)
+        pi.scene().addItem(self.raw_vb)
+        ax = pi.getAxis("right")
+        ax.linkToView(self.raw_vb)
+        ax.enableAutoSIPrefix(False)
+        self.raw_vb.setXLink(pi)
+        self.raw_curve = pg.PlotCurveItem(pen=pg.mkPen(QColor(T().FG3), width=1))
+        self.raw_curve.setZValue(-5)
+        self.raw_vb.addItem(self.raw_curve)
+        self.raw_curve.setVisible(False)
+
+        def _sync():
+            self.raw_vb.setGeometry(pi.vb.sceneBoundingRect())
+            self.raw_vb.linkedViewChanged(pi.vb, self.raw_vb.XAxis)
+        pi.vb.sigResized.connect(_sync)
+        self._sync_raw_vb = _sync
+        self._restyle_raw_axis()
+        pi.hideAxis("right")
+
+    def _restyle_raw_axis(self) -> None:
+        if not hasattr(self, "raw_vb"):
+            return
+        ax = self.plot_canvas.getPlotItem().getAxis("right")
+        ax.setPen(pg.mkPen(QColor(T().BORDER2), width=1))
+        ax.setTextPen(pg.mkPen(QColor(T().FG3)))
+        font = QFont("JetBrains Mono"); font.setPointSize(9)
+        ax.setTickFont(font)
+        self.raw_curve.setPen(pg.mkPen(QColor(T().FG3), width=1))
+
+    def _update_raw_curve(self, ev) -> None:
+        pi = self.plot_canvas.getPlotItem()
+        exp = getattr(ev, "exposure", None) if ev is not None else None
+        on = (ev is not None and exp and self.btn_raw_axis.isChecked()
+              and getattr(ev, "display_mode", None) != processing.DISPLAY_RAW
+              and getattr(ev, "raw_averaged", None) is not None)
+        if not on:
+            self.raw_curve.setVisible(False)
+            pi.hideAxis("right")
+            return
+        fs = float(exp.get("full_scale") or 0.0) or max(
+            float(np.nanmax(ev.raw_averaged)), 1.0)
+        pi.showAxis("right")
+        pi.getAxis("right").setLabel("Raw ADC [counts]", color=T().FG3,
+                                     **{"font-size": "10px"})
+        self.raw_vb.setYRange(0.0, fs, padding=0)
+        self.raw_curve.setData(ev.wavelengths, ev.raw_averaged)
+        self.raw_curve.setVisible(True)
+        self._sync_raw_vb()
+
     def _build_scope_overlay_bar(self) -> QWidget:
         """Toolbar above the scope plot: freeze / diff / peak-hold / persist and
         a CSV background loader. Mirrors the web client's scope overlay bar."""
         w = QWidget(); w.setObjectName("scopeOverlayBar")
-        h = QHBoxLayout(w)
-        h.setContentsMargins(10, 6, 10, 6); h.setSpacing(8)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        row1 = QWidget()
+        h = QHBoxLayout(row1)
+        h.setContentsMargins(10, 6, 10, 3); h.setSpacing(8)
+        outer.addWidget(row1)
+        outer.addWidget(self._build_display_row())
 
         self.btn_freeze = QPushButton("❄  Freeze")
         self.btn_freeze.setCheckable(True)
@@ -1083,6 +1280,14 @@ class DashboardWindow(QMainWindow):
         if idx >= 0:
             self.combo_reference.setCurrentIndex(idx)
 
+        # Scope reference overlay (reference source, scaled onto the display)
+        self.button_scope_ref = ToggleSwitch(bool(Config.get("scope_reference_overlay", False)))
+        self.button_scope_ref.toggled.connect(self.toggle_scope_reference)
+        self.combo_scope_ref = QComboBox()
+        self.combo_scope_ref.setFixedWidth(170)
+        self._fill_scope_reference_combo()
+        self.combo_scope_ref.currentIndexChanged.connect(self._scope_reference_picked)
+
         # Fixed (non-scrolling) acquisition controls, in the header.
         for _lbl, _sub, _ctl in [
             ("Exposure",      "ms", [self.button_exposure_reset, self.spinbox_exposure]),
@@ -1116,8 +1321,16 @@ class DashboardWindow(QMainWindow):
         self.button_auto_y_axis = ToggleSwitch(self.is_auto_y_axis_enabled)
         self.button_auto_y_axis.toggled.connect(self.toggle_auto_y_axis)
 
-        self.spinbox_y_max = self._spin_int(Config.get("y_max_adc", 4000),
-                                            10, 65000, 100, 96)
+        # Upper Y limit of the CURRENT display mode (unit depends on the mode;
+        # limits are stored per mode in y_limits_by_mode).
+        self.spinbox_y_max = QDoubleSpinBox()
+        self.spinbox_y_max.setRange(1e-9, 1e9)
+        self.spinbox_y_max.setDecimals(0)
+        self.spinbox_y_max.setSuffix(" ADC")
+        self.spinbox_y_max.setValue(float(Config.get("y_max_adc", 4000)))
+        self.spinbox_y_max.setStepType(QAbstractSpinBox.StepType.AdaptiveDecimalStepType)
+        self.spinbox_y_max.setFixedWidth(120)
+        self.spinbox_y_max.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.spinbox_y_max.setKeyboardTracking(False)
         self.spinbox_y_max.valueChanged.connect(self.apply_manual_y_axis)
 
@@ -1136,7 +1349,9 @@ class DashboardWindow(QMainWindow):
         _sec_display = self._collapsible("Display", [
             ("Wavelength range", "nm", [self.spinbox_x_min, self.spinbox_x_max]),
             ("Auto-scale Y",     None, self.button_auto_y_axis),
-            ("Y max",            "ADC", [self.button_y_snap, self.spinbox_y_max]),
+            ("Y max",            None, [self.button_y_snap, self.spinbox_y_max]),
+            ("Reference overlay", None, self.button_scope_ref),
+            ("Overlay source",    None, self.combo_scope_ref),
         ])
 
         # ─── Processing ───
@@ -1814,12 +2029,13 @@ class DashboardWindow(QMainWindow):
             self._update_reference_curve_scale()
         if size_changed or force:
             self.current_averaged_pixels = np.zeros(self.active_pixel_count)
+            self.current_display_pixels = np.zeros(self.active_pixel_count)
             self.peak_hold_env = None
             self.persist_ring = []
             self.prev_live = None
             self._hm_go_live()
             self.slider_hm_scrub.setRange(0, 0)
-            self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
+            self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=self._hm_levels())
 
     # ── engine events ────────────────────────────────────────────────────
     def _from_engine(self, ev) -> None:
@@ -1992,11 +2208,15 @@ class DashboardWindow(QMainWindow):
         if idx == getattr(self, "_last_cursor_idx", -1):
             return
         self._last_cursor_idx = idx
-        sx, sy = self.active_wavelengths[idx], self.current_averaged_pixels[idx]
-        self.cursor_vline.setPos(sx); self.cursor_hline.setPos(sy)
+        disp = self.current_display_pixels
+        sx = self.active_wavelengths[idx]
+        sy = disp[idx] if idx < len(disp) else float("nan")
+        self.cursor_vline.setPos(sx)
+        if np.isfinite(sy):
+            self.cursor_hline.setPos(sy)
         self._set_readout(self.readout_pix, str(idx))
         self._set_readout(self.readout_wl,  f"{sx:.1f}")
-        self._set_readout(self.readout_int, f"{sy:.0f}")
+        self._set_readout(self.readout_int, processing.format_value(sy, self._display_unit))
 
     def handle_heatmap_mouse_movement(self, ev) -> None:
         pos = ev[0]
@@ -2017,7 +2237,8 @@ class DashboardWindow(QMainWindow):
         self.scrub_cursor_vline.setPos(sx)     # keep both crosshairs in lockstep
         self._set_readout(self.readout_pix, f"~{hw_pixel}")
         self._set_readout(self.readout_wl,  f"{sx:.1f}")
-        self._set_readout(self.readout_int, f"{intensity:.0f}")
+        self._set_readout(self.readout_int,
+                          processing.format_value(intensity, self._display_unit))
 
     def handle_scrub_mouse_movement(self, ev) -> None:
         """Hovering the scrubbed-frame spectrum (top) sweeps the SAME vertical
@@ -2126,6 +2347,64 @@ class DashboardWindow(QMainWindow):
         self.heatmap_canvas.setXRange(
             self.heatmap_linear_waves[0], self.heatmap_linear_waves[-1], padding=0)
 
+    # ── scope reference overlay (core: engine.reference_overlay) ───────────
+    def _fill_scope_reference_combo(self) -> None:
+        """Reference sources of the library; the selection follows the config
+        key scope_reference_id (the verification sets it)."""
+        import reference_sources as rs
+        want = str(Config.get("scope_reference_id", "") or "")
+        cb = self.combo_scope_ref
+        cb.blockSignals(True)
+        cb.clear()
+        try:
+            srcs = rs.ReferenceLibrary().list()
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[dashboard] reference library not readable: {e}")
+            srcs = []
+        for src in srcs:
+            label = f"{src.name} ({src.serial})" if src.serial else src.name
+            cb.addItem(label, src.id)
+            cb.setItemData(cb.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
+        i = cb.findData(want) if want else -1
+        if i >= 0:
+            cb.setCurrentIndex(i)
+        cb.blockSignals(False)
+
+    def sync_scope_reference(self) -> None:
+        """Re-read scope_reference_id and the library (after a verification)."""
+        self._fill_scope_reference_combo()
+        self._update_scope_reference(self.engine.last_frame)
+
+    def toggle_scope_reference(self, checked: bool) -> None:
+        Config.set("scope_reference_overlay", bool(checked))
+        self._update_scope_reference(self.engine.last_frame)
+
+    def _scope_reference_picked(self, *_):
+        rid = self.combo_scope_ref.currentData()
+        Config.set("scope_reference_id", rid or "")
+        self._update_scope_reference(self.engine.last_frame)
+
+    def _update_scope_reference(self, ev) -> None:
+        """Dashed reference curve for the values the scope plots right now
+        (ev.pixels in ev.unit)."""
+        curve = self.scope_ref_curve
+        rid = self.combo_scope_ref.currentData()
+        if ev is None or not rid or not Config.get("scope_reference_overlay", False):
+            curve.setVisible(False)
+            return
+        try:
+            vals = ev.display if getattr(ev, "display", None) is not None else ev.pixels
+            unit = getattr(ev, "display_unit", None) or ev.unit
+            y = self.engine.reference_overlay(rid, ev.wavelengths, vals, unit)
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[dashboard] reference overlay failed: {e}")
+            y = None
+        if y is None:
+            curve.setVisible(False)
+            return
+        curve.setData(ev.wavelengths, y, connect="finite")
+        curve.setVisible(True)
+
     def _update_reference_curve_scale(self, name: str | None = None) -> None:
         """Scale reference curve to 90% of the current visible Y maximum."""
         if name is None:
@@ -2158,7 +2437,7 @@ class DashboardWindow(QMainWindow):
             self.freeze_xy = None
             self.overlay_diff = False           # diff needs a freeze
         else:
-            live = self.current_averaged_pixels
+            live = self.current_display_pixels
             if live is not None and len(live) > 0:
                 self.freeze_xy = (np.array(self.active_wavelengths, dtype=float),
                                   np.array(live, dtype=float))
@@ -2239,7 +2518,7 @@ class DashboardWindow(QMainWindow):
         """Recompute the derived overlay curves from current state. Safe to call
         while paused — does not advance peak-hold / persistence."""
         wl = self.active_wavelengths
-        live = self.current_averaged_pixels
+        live = self.current_display_pixels
         n = len(wl)
 
         # CSV background — interp onto axis, normalise, scale to 90% of Y max.
@@ -2256,7 +2535,7 @@ class DashboardWindow(QMainWindow):
         else:
             self.csvbg_curve.setVisible(False)
 
-        # Freeze (grey, absolute ADC).
+        # Freeze (grey, in the display mode it was taken in).
         fz = self._freeze_aligned()
         if fz is not None:
             self.freeze_curve.setData(wl, fz)
@@ -2272,7 +2551,7 @@ class DashboardWindow(QMainWindow):
             self.diff_curve.setVisible(True)
             # Extend the Y floor so negative differences stay visible.
             dmin = float(np.min(diff))
-            if dmin < Y_AXIS_BOTTOM_MARGIN_ADC:
+            if dmin < self._y_floor(self._display_unit):
                 _, (_, y_hi) = self.plot_canvas.getViewBox().viewRange()
                 self.plot_canvas.setYRange(dmin * 1.1, y_hi, padding=0)
         else:
@@ -2308,10 +2587,14 @@ class DashboardWindow(QMainWindow):
 
     def toggle_auto_y_axis(self, checked: bool) -> None:
         self.is_auto_y_axis_enabled = checked
-        Config.set("auto_y", bool(checked))
-        if not checked:
+        if checked:
+            self._force_autoscale = True
+            self._hm_user_max = None
+        else:
+            self._hm_user_max = float(self.spinbox_y_max.value())
             self.plot_canvas.setYRange(
-                Y_AXIS_BOTTOM_MARGIN_ADC, self.spinbox_y_max.value(), padding=0)
+                self._y_floor(self._display_unit), self.spinbox_y_max.value(), padding=0)
+        self._save_mode_limits()
 
     def toggle_despeckle_filter(self, checked: bool) -> None:
         self.is_despeckle_enabled = checked
@@ -2573,18 +2856,21 @@ class DashboardWindow(QMainWindow):
                 self.plot_canvas.addItem(reg, ignoreBounds=True)
                 self._calib_gap_regions.append(reg)
 
-    def _apply_unit_to_axis(self, unit: str) -> None:
-        if unit == self._shown_unit:
+    def _apply_unit_to_axis(self, unit: str, mode: str | None = None) -> None:
+        """Y-axis label: mode label + unit (processing.unit_label)."""
+        key = (unit, mode)
+        if key == self._shown_unit:
             return
-        self._shown_unit = unit
-        if unit == "counts":
-            self.plot_canvas.setLabel("left", "Intensity", units="ADC",
-                                      color=T().FG3, **{"font-size": "10px"})
+        self._shown_unit = key
+        name = processing.DISPLAY_LABELS.get(mode or "", "Intensity")
+        if unit == processing.UNIT_NORMALISED:
+            text = name
+        elif unit == processing.UNIT_COUNTS_CORRECTED:
+            text = f"{name} [counts]"
         else:
-            name = ("Irradiance" if processing.is_absolute_unit(unit)
-                    else "Relative irradiance" if unit == "relative" else "Count rate")
-            self.plot_canvas.setLabel("left", f"{name} [{processing.unit_label(unit)}]",
-                                      units="", color=T().FG3, **{"font-size": "10px"})
+            text = f"{name} [{processing.unit_label(unit)}]"
+        self.plot_canvas.setLabel("left", text, units="", color=T().FG3,
+                                  **{"font-size": "10px"})
 
     def capture_snapshot(self):
         """Return (wavelengths, intensities) of the current dark-corrected,
@@ -2690,16 +2976,17 @@ class DashboardWindow(QMainWindow):
         Config.set("measure_b_nm", float(pb))
         ia = (np.abs(self.active_wavelengths - pa)).argmin()
         ib = (np.abs(self.active_wavelengths - pb)).argmin()
-        va = self.current_averaged_pixels[ia]
-        vb = self.current_averaged_pixels[ib]
+        disp = self.current_display_pixels
+        va = disp[ia] if ia < len(disp) else float("nan")
+        vb = disp[ib] if ib < len(disp) else float("nan")
         dx = abs(self.active_wavelengths[ib] - self.active_wavelengths[ia])
-        dy = abs(vb - va)
+        dy = abs(vb - va)                      # NaN (masked pixel) → "–"
         self.measure_label.setHtml(
             f'<div style="background:rgba(0,0,0,0.55);padding:3px 8px;'
             f'border:1px solid {T().WARN};border-radius:4px;'
             f'font-family:{FONT_MONO};font-size:11px;color:{T().WARN};">'
             f'A {self.active_wavelengths[ia]:.1f}  ·  B {self.active_wavelengths[ib]:.1f}  ·  '
-            f'Δλ {dx:.2f} nm  ·  Δy {dy:.0f} ADC'
+            f'Δλ {dx:.2f} nm  ·  Δy {processing.format_value(dy, self._display_unit)}'
             f'</div>')
         x_c = (pa + pb) / 2.0
         view_y_max = self.plot_canvas.getViewBox().viewRange()[1][1]
@@ -2721,9 +3008,10 @@ class DashboardWindow(QMainWindow):
 
     def _snap_y_to_peak(self) -> None:
         """Set Y max to the current frame peak and disable auto-scale."""
-        if self.current_averaged_pixels is not None and len(self.current_averaged_pixels):
-            peak = int(np.nan_to_num(np.nanmax(self.current_averaged_pixels)))
-            peak = max(peak, 10)   # guard: no signal yet / fully dark
+        disp = self.current_display_pixels
+        if disp is not None and len(disp) and np.isfinite(disp).any():
+            peak = float(np.nanmax(disp))
+            peak = max(peak, 10.0 if self._counts_like(self._display_unit) else 1e-6)
             self.spinbox_y_max.setValue(peak)
             # spinbox.valueChanged → apply_manual_y_axis → disables auto-Y + sets range
 
@@ -2731,15 +3019,110 @@ class DashboardWindow(QMainWindow):
         """Push all fusion_* config values into the engine's fusion stage."""
         self.engine._configure_fusion()
 
-    def apply_manual_y_axis(self, max_y: int) -> None:
-        Config.set("y_max_adc", int(max_y))
+    def apply_manual_y_axis(self, max_y: float) -> None:
         if self.is_auto_y_axis_enabled:
             self.button_auto_y_axis.blockSignals(True)
             self.button_auto_y_axis.setChecked(False)
             self.button_auto_y_axis.blockSignals(False)
             self.is_auto_y_axis_enabled = False
-            Config.set("auto_y", False)
-        self.plot_canvas.setYRange(Y_AXIS_BOTTOM_MARGIN_ADC, max_y, padding=0)
+        self._hm_user_max = float(max_y)
+        self.plot_canvas.setYRange(self._y_floor(self._display_unit), float(max_y),
+                                   padding=0)
+        self._save_mode_limits()
+
+    # ── display modes: y axis / heatmap limits per mode ──────────────────
+    @staticmethod
+    def _counts_like(unit: str) -> bool:
+        return unit in ("counts", processing.UNIT_COUNTS_CORRECTED)
+
+    def _y_floor(self, unit: str) -> float:
+        """Lower Y limit: the ADC margin for count-like units, else 0."""
+        return Y_AXIS_BOTTOM_MARGIN_ADC if self._counts_like(unit) else 0.0
+
+    def _hm_floor(self, unit: str) -> float:
+        return 10.0 if self._counts_like(unit) else 1e-9
+
+    def _hm_levels(self) -> tuple:
+        return (0, self._hm_max)
+
+    def _limits_for(self, mode: str):
+        """Stored manual Y limits {auto, min, max} of a mode, else None. A
+        legacy fixed ADC limit (auto_y off + y_max_adc) applies to 'raw'."""
+        ent = (Config.get("y_limits_by_mode", {}) or {}).get(mode)
+        if isinstance(ent, dict):
+            return ent
+        if mode == processing.DISPLAY_RAW and not Config.get("auto_y", True):
+            return {"auto": False, "min": Y_AXIS_BOTTOM_MARGIN_ADC,
+                    "max": float(Config.get("y_max_adc", 4000))}
+        return None
+
+    def _save_mode_limits(self) -> None:
+        mode = self._display_mode
+        if mode is None:
+            return
+        auto = bool(self.is_auto_y_axis_enabled)
+        y = dict(Config.get("y_limits_by_mode", {}) or {})
+        h = dict(Config.get("heatmap_limits_by_mode", {}) or {})
+        mx = float(self.spinbox_y_max.value())
+        y[mode] = {"auto": auto, "min": float(self._y_floor(self._display_unit)),
+                   "max": mx}
+        h[mode] = {"auto": auto, "max": mx if not auto else float(self._hm_max)}
+        Config.set("y_limits_by_mode", y)
+        Config.set("heatmap_limits_by_mode", h)
+
+    def _configure_y_spinbox(self, unit: str) -> None:
+        sb = self.spinbox_y_max
+        sb.blockSignals(True)
+        if self._counts_like(unit):
+            sb.setDecimals(0); sb.setSuffix(" ADC")
+        elif unit == processing.UNIT_NORMALISED:
+            sb.setDecimals(3); sb.setSuffix("")
+        elif unit == "counts/s":
+            sb.setDecimals(0); sb.setSuffix(" /s")
+        else:
+            sb.setDecimals(4); sb.setSuffix("")
+        sb.blockSignals(False)
+
+    def _on_display_mode_changed(self, mode: str, unit: str) -> None:
+        """The effective display mode (or its unit) changed: drop overlay state
+        that holds values of the previous mode (freeze / diff / peak-hold /
+        persistence — they only make sense in the mode they were taken in),
+        then restore this mode's manual Y / heatmap limits, or auto-scale once."""
+        self._display_mode = mode
+        self._display_unit = unit
+        self.freeze_xy = None
+        self.overlay_diff = False
+        self.peak_hold_env = None
+        self.persist_ring = []
+        self.prev_live = None
+        self._sync_overlay_buttons()
+        self._configure_y_spinbox(unit)
+        ent = self._limits_for(mode)
+        hm = (Config.get("heatmap_limits_by_mode", {}) or {}).get(mode)
+        floor = self._y_floor(unit)
+        def _num(v, default):
+            try:
+                return default if v is None else float(v)
+            except (TypeError, ValueError):
+                return default
+        # shared schema with the web client: {auto, min|None, max|None}
+        manual = (isinstance(ent, dict) and not ent.get("auto", True)
+                  and _num(ent.get("max"), 0.0) > floor)
+        self.button_auto_y_axis.blockSignals(True)
+        self.button_auto_y_axis.setChecked(not manual)
+        self.button_auto_y_axis.blockSignals(False)
+        self.is_auto_y_axis_enabled = not manual
+        if manual:
+            mx = _num(ent.get("max"), 0.0)
+            self.spinbox_y_max.blockSignals(True)
+            self.spinbox_y_max.setValue(mx)
+            self.spinbox_y_max.blockSignals(False)
+            self.plot_canvas.setYRange(_num(ent.get("min"), floor), mx, padding=0)
+            self._hm_user_max = (_num(hm.get("max"), mx) if isinstance(hm, dict)
+                                 and not hm.get("auto", True) else mx)
+        else:
+            self._hm_user_max = None
+            self._force_autoscale = True
 
     def apply_axes_limits(self) -> None:
         xmin = self.spinbox_x_min.value()
@@ -2886,20 +3269,11 @@ class DashboardWindow(QMainWindow):
         if self._heatmap_filled == 0 or index >= self.heatmap_buffer.shape[1]:
             return
         index = min(index, self._heatmap_filled - 1)
-        spec = self.heatmap_buffer[:, index]
         meta = self.export_meta()
         filename, path_err = export_paths.export_path(f"frame{index}", "csv", meta)
         try:
-            with open(filename, "w", newline="") as f:
-                w = csv.writer(f, delimiter=";")
-                age = self.heatmap_times[index]
-                age_s = (f"{time.monotonic() - age:.1f}" if np.isfinite(age) else "unknown")
-                w.writerow([f"# Time-lapse frame {index}"])
-                w.writerow([f"# Seconds before export"] if age_s == "unknown"
-                          else [f"# Seconds before export;{age_s}"])
-                w.writerow(["Wavelength_nm", "ADC_Counts"])
-                for wl, v in zip(self.heatmap_linear_waves, spec):
-                    w.writerow([f"{wl:.2f}", round(float(v), 2)])
+            # shared engine export: header, unit, masked pixels empty, UTF-8 BOM
+            eng.write_csv_text(filename, self.engine.export_heatmap_frame_csv(index))
             self._note_export_saved(filename, path_err)
         except OSError as e:
             QMessageBox.warning(self, "Export failed", str(e))
@@ -2971,7 +3345,7 @@ class DashboardWindow(QMainWindow):
         self._hm_go_live()
         self.slider_hm_scrub.setRange(0, 0)
         self.heatmap_canvas.setYRange(0, n, padding=0)
-        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
+        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=self._hm_levels())
         self._update_heatmap_span()
 
     def _on_heatmap_rate(self, ms: int) -> None:
@@ -2984,7 +3358,7 @@ class DashboardWindow(QMainWindow):
         self.engine.clear_heatmap()
         self._hm_go_live()
         self.slider_hm_scrub.setRange(0, 0)
-        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=(0, 10.0))
+        self.image_item.setImage(self.heatmap_buffer, autoLevels=False, levels=self._hm_levels())
 
     # ════════════════════════════════════════════════════════════
     # EXPORT
@@ -3017,48 +3391,13 @@ class DashboardWindow(QMainWindow):
             else:
                 frame_indices = list(range(filled))
         try:
-            with open(filename, "w", newline="") as f:
-                w = csv.writer(f, delimiter=";")
-                if is_heatmap:
-                    w.writerow(["Time_Frame"] +
-                               [f"{wl:.2f}" for wl in self.heatmap_linear_waves])
-                    for fi in frame_indices:
-                        w.writerow([fi] +
-                                   [round(v, 2) for v in self.heatmap_buffer[:, fi]])
-                else:
-                    w.writerow(["# Optical Black mean (ADC)", round(self.latest_ob_mean, 3)])
-                    w.writerow(["# Integration time (ms)",
-                                round(self.latest_integration_us / 1000.0, 1)])
-                    w.writerow(["# Dark correction",
-                                "ON" if self.is_dark_correction_enabled else "OFF"])
-                    w.writerow(["# Dark mode", self.dark_correction_mode])
-                    w.writerow(["# Response compensation",
-                                "ON" if self.calib_runtime.legacy_gain is not None else "OFF"])
-                    unit = getattr(self, "_current_unit", "counts")
-                    if unit == "counts":
-                        w.writerow(["Pixel_ID", "Wavelength_nm", "ADC_Counts"])
-                        for i, (wl, v) in enumerate(
-                                zip(self.active_wavelengths, self.current_averaged_pixels)):
-                            w.writerow([i, round(wl, 2), round(v, 2)])
-                    else:
-                        st = self.calib_runtime.status
-                        w.writerow(["# Unit", unit])
-                        if self.calib_runtime.active_v2:
-                            w.writerow(["# Calibration profile", st.get("label", "")])
-                            vr = st.get("valid_range_nm")
-                            if vr:
-                                w.writerow(["# Valid range (nm)", f"{vr[0]:.1f}–{vr[1]:.1f}"])
-                            segs = st.get("valid_segments_nm")
-                            if segs:
-                                w.writerow(["# Valid segments (nm)", ", ".join(
-                                    f"{a:.1f}–{b:.1f}" for a, b in segs)])
-                            if st.get("implausible"):
-                                w.writerow(["# Plausibility", "FAILED (saved on request)"])
-                        w.writerow(["Pixel_ID", "Wavelength_nm", f"Value_{unit}"])
-                        for i, (wl, v) in enumerate(
-                                zip(self.active_wavelengths, self.current_averaged_pixels)):
-                            w.writerow([i, round(wl, 2),
-                                        "" if not np.isfinite(v) else f"{v:.6g}"])
+            # ONE export implementation for desktop and web (engine.py):
+            # UTF-8 with BOM, header with the settings actually applied.
+            if is_heatmap:
+                text = self.engine.export_heatmap_csv(frame_indices)
+            else:
+                text = self.engine.export_spectrum_csv(getattr(self, "_export_ev", None))
+            eng.write_csv_text(filename, text)
             self._note_export_saved(filename, path_err)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Save CSV failed: {e}")
@@ -3138,46 +3477,59 @@ class DashboardWindow(QMainWindow):
                 self._restyle_live_pill(True, fps)
 
         self.current_averaged_pixels = ev.pixels
+        self._export_ev = ev                     # frame shown = frame exported
+        dvals = ev.display if getattr(ev, "display", None) is not None else ev.pixels
+        dunit = getattr(ev, "display_unit", None) or ev.unit
+        dmode = getattr(ev, "display_mode", None) or processing.DISPLAY_RAW
+        self.current_display_pixels = dvals
         self.latest_ob_mean = ev.ob_mean
         self.latest_integration_us = ev.integration_us
         self.update_ob_readout()
 
         unit = ev.unit
         self._current_unit = unit
-        self._apply_unit_to_axis(unit)
+        self._refresh_display_modes()
+        if (dmode, dunit) != (self._display_mode, self._display_unit) \
+                or self._display_mode is None:
+            self._on_display_mode_changed(dmode, dunit)
+        self._apply_unit_to_axis(dunit, dmode)
         if ev.dark_source != getattr(self, "_shown_dark_source", None):
             self._shown_dark_source = ev.dark_source
             self._update_calib_status()
-        # NaN = masked (outside the profile's valid range). The calibrated array
+        # NaN = masked (outside the profile's valid range). The corrected array
         # stays in current_averaged_pixels (exports); displays get finite data.
-        disp = (np.nan_to_num(self.current_averaged_pixels, nan=0.0)
-                if unit != "counts" else self.current_averaged_pixels)
+        disp = np.nan_to_num(dvals, nan=0.0)
 
-        # 3. Dynamic Y
+        # 3. Dynamic Y (mode-aware: floor, minimum span and unit follow the mode)
         current_y_max = self.plot_canvas.getViewBox().viewRange()[1][1]
-        ideal_heatmap_max = ADC_SATURATION_THRESHOLD
+        counts_like = self._counts_like(dunit)
+        floor = self._y_floor(dunit)
         if self.is_auto_y_axis_enabled:
+            ideal_heatmap_max = self._hm_max
             x_lo, x_hi = self.plot_canvas.getViewBox().viewRange()[0]
             vis = (self.active_wavelengths >= x_lo) & (self.active_wavelengths <= x_hi)
             if np.any(vis):
                 mv = float(np.max(disp[vis]))
-                ideal_y = (max(mv * 1.1, 50.0) if unit == "counts"
+                ideal_y = (max(mv * 1.1, 50.0) if counts_like
                            else (mv * 1.1 if mv > 0 else 1.0))
                 ideal_heatmap_max = ideal_y
-                if ideal_y > current_y_max or ideal_y < current_y_max * 0.7:
-                    self.plot_canvas.setYRange(
-                        Y_AXIS_BOTTOM_MARGIN_ADC if unit == "counts" else 0.0,
-                        ideal_y, padding=0)
+                if (self._force_autoscale or ideal_y > current_y_max
+                        or ideal_y < current_y_max * 0.7):
+                    self.plot_canvas.setYRange(floor, ideal_y, padding=0)
+                self._force_autoscale = False
         else:
-            ideal_heatmap_max = self.spinbox_y_max.value()
+            ideal_heatmap_max = (self._hm_user_max if self._hm_user_max is not None
+                                 else float(self.spinbox_y_max.value()))
 
         # 4. Scope
-        if unit == "counts":
-            self.spectrum_curve.setData(self.active_wavelengths, self.current_averaged_pixels)
+        if counts_like and dunit == "counts" and not np.isnan(dvals).any():
+            self.spectrum_curve.setData(self.active_wavelengths, dvals)
         else:   # masked pixels (NaN) as gaps
-            self.spectrum_curve.setData(self.active_wavelengths,
-                                        self.current_averaged_pixels, connect="finite")
+            self.spectrum_curve.setData(self.active_wavelengths, dvals,
+                                        connect="finite")
         self.spectrum_fill.setData(self.active_wavelengths, disp)
+        self._update_scope_reference(ev)
+        self._update_exposure(ev)
         if self.reference_curve.isVisible():
             self._update_reference_curve_scale()
         self._advance_overlays(disp)
@@ -3186,8 +3538,9 @@ class DashboardWindow(QMainWindow):
         # 5. Heatmap — the engine pushed a column (measurement-interval
         # decimation happens there); here only the image / scrub / autosave.
         if ev.heatmap_pushed:
+            self._hm_max = max(self._hm_floor(dunit), float(ideal_heatmap_max))
             self.image_item.setImage(self.heatmap_buffer, autoLevels=False,
-                                     levels=(0, max(10.0, ideal_heatmap_max)))
+                                     levels=self._hm_levels())
             # Keep the rewind slider's range covering the filled history, and —
             # if paused on a past frame — keep it pinned to that SAME frame as
             # the buffer keeps rolling underneath (see _hm_scrub_advance).
@@ -3225,7 +3578,8 @@ class DashboardWindow(QMainWindow):
         if peaks is None:
             ev = self.engine.last_frame
             peaks = ev.peaks if ev is not None else []
-        n = len(self.current_averaged_pixels)
+        shown = self.current_display_pixels
+        n = len(shown)
         idx = [int(p["index"]) for p in (peaks or []) if 0 <= int(p["index"]) < n]
         if not idx:
             self.scatter_peaks.clear()
@@ -3233,7 +3587,7 @@ class DashboardWindow(QMainWindow):
             return
         idx = np.asarray(sorted(idx))
         px = self.active_wavelengths[idx]
-        py = np.nan_to_num(self.current_averaged_pixels[idx], nan=0.0)
+        py = np.nan_to_num(shown[idx], nan=0.0)
         self.scatter_peaks.setData(px, py)
         self._refresh_peak_labels(px, py)
 
@@ -3275,6 +3629,10 @@ class DashboardWindow(QMainWindow):
                 ax.setPen(pg.mkPen(QColor(p.BORDER2), width=1))
                 ax.setTextPen(pg.mkPen(QColor(p.FG3)))
         self.spectrum_curve.setPen(pg.mkPen(QColor(p.FG1), width=1.4))
+        self._restyle_raw_axis()
+        self._exposure_cls = None
+        self.scope_ref_curve.setPen(pg.mkPen(QColor(p.ACCENT), width=1.5,
+                                             style=Qt.PenStyle.DashLine))
         self.reference_curve.setPen(pg.mkPen(QColor(p.WARN), width=1.5,
                                              style=Qt.PenStyle.DashLine))
         self.scatter_peaks.setBrush(pg.mkBrush(p.ACCENT))
@@ -3323,7 +3681,6 @@ class DashboardWindow(QMainWindow):
             "frames_to_average": int(self.spinbox_averaging.value()),
             "x_min_nm":         int(self.spinbox_x_min.value()),
             "x_max_nm":         int(self.spinbox_x_max.value()),
-            "y_max_adc":        int(self.spinbox_y_max.value()),
         })
         self._stop_autosave()
         if hasattr(self, "remote_panel"):

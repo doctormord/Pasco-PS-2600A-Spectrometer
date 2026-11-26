@@ -46,6 +46,7 @@ from typing import Any, Callable
 import numpy as np
 
 import calibration_capture as cc
+import calibration_linearity as callin
 import calibration_profiles as calprof
 import color_science as cs
 import device_manager as dm
@@ -83,8 +84,25 @@ CONTROL_KEYS = frozenset({
     "spatial_smoothing_width", "display_unit", "irradiance_unit",
     "radiometric_calibration_factor", "response_correction_active",
     "heatmap_buffer_size", "heatmap_measure_interval_ms",
+    # resets the shared time-lapse buffer → needs control like display_unit
+    "display_mode",
     *fusion.DEFAULTS.keys(),
 })
+DISPLAY_MODE_VALUES = (processing.DISPLAY_AUTO,) + processing.DISPLAY_MODES
+
+
+class _WithoutProfile:
+    """The calibration runtime seen WITHOUT its v2 profile ('Raw ADC' display
+    while a profile is active): same stored darks, no applier, no gain."""
+    applier = None
+    legacy_gain = None
+    active_v2 = False
+
+    def __init__(self, rt):
+        self._rt = rt
+
+    def dark_for(self, integration_us):
+        return self._rt.dark_for(integration_us)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -161,6 +179,12 @@ class FrameEvent:
     heatmap_pushed: bool
     heatmap_column: np.ndarray | None    # the pushed column (linear axis)
     heatmap_time: float | None           # monotonic time of the push
+    # display representation (processing.display_transform); pixels/unit stay
+    # the corrected data every evaluation uses
+    display: np.ndarray | None = None
+    display_unit: str | None = None
+    display_mode: str | None = None
+    exposure: dict | None = None         # drive level in ADC (processing.exposure_level)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -514,11 +538,17 @@ class Engine:
 
         # processed state
         self.calib = calprof.CalibrationRuntime()
+        self.linearity_info: dict = {"state": callin.STATE_NONE, "label": "n/a"}
+        self.last_verification: dict | None = None
+        self._overlay_cache: dict = {}
         self.current_pixels = np.zeros(self.pixel_count)
         self.current_raw = np.zeros(self.pixel_count)
         self.current_pre_response = np.zeros(self.pixel_count)
         self.current_peaks: list = []
         self.current_unit = "counts"
+        self.current_display = np.zeros(self.pixel_count)
+        self.current_display_unit = "counts"
+        self.current_display_mode = processing.DISPLAY_RAW
         self.current_dark_source: str | None = None
         self.latest_ob_mean = 0.0
         self.latest_integration_us = int(START_INTEGRATION_TIME_US)
@@ -814,6 +844,7 @@ class Engine:
             self.last_frame = None
             self.spectrum_history.clear()
             self._reset_heatmap()
+            self._install_linearity(backend, backend_name)
             self._rebuild_calibration(backend)
 
     def _reset_device_params(self) -> None:
@@ -827,6 +858,7 @@ class Engine:
             self.supports_ob = True
             self.spec_range_nm = (None, None)
             self.calib = calprof.CalibrationRuntime()
+            self.linearity_info = {"state": callin.STATE_NONE, "label": "n/a"}
             self.current_unit = "counts"
             self.current_pixels = np.zeros(self.pixel_count)
             self.current_raw = np.zeros(self.pixel_count)
@@ -896,6 +928,12 @@ class Engine:
                 eff["auto_exposure"] = False
             if "frames_to_average" in eff:
                 eff["frames_to_average"] = max(1, int(eff["frames_to_average"]))
+            if "display_mode" in eff:
+                dm = str(eff["display_mode"] or processing.DISPLAY_AUTO).strip().lower()
+                if dm not in DISPLAY_MODE_VALUES:
+                    raise EngineError(f"Unknown display mode '{dm}' "
+                                      f"(allowed: {', '.join(DISPLAY_MODE_VALUES)}).")
+                eff["display_mode"] = dm
             if "fast_preview_short_pct" in eff:
                 eff["fast_preview_short_pct"] = max(1, min(50, int(eff["fast_preview_short_pct"])))
             if "heatmap_buffer_size" in eff:
@@ -946,6 +984,10 @@ class Engine:
                     self.calib.refresh()
             if "heatmap_buffer_size" in eff:
                 self.set_heatmap_size(eff["heatmap_buffer_size"], persist=False)
+            if "display_mode" in eff:
+                # the time-lapse holds display values: never mix units/modes
+                with self._frame_lock:
+                    self._reset_heatmap()
             if "heatmap_measure_interval_ms" in eff:
                 self._heatmap_measure_ms = max(0, int(eff["heatmap_measure_interval_ms"] or 0))
         self._emit("config", json_safe(eff))
@@ -982,6 +1024,50 @@ class Engine:
                 self.calib.wl = np.asarray(self.wavelength_array, float)
                 self.calib.refresh()
 
+    def _install_linearity(self, backend, backend_name: str) -> None:
+        """Install the unit's linearity correction on the backend (applied to
+        every frame directly after the driver, see calibration_linearity)."""
+        if backend is None:
+            self.linearity_info = {"state": callin.STATE_NONE, "label": "n/a"}
+            return
+        try:
+            fn, info = callin.runtime_for(backend, backend_name)
+        except Exception as e:                                   # noqa: BLE001
+            print(f"[engine] linearity correction not loaded: {e!r}")
+            fn, info = None, {"state": callin.STATE_NONE, "label": "off",
+                              "error": str(e)}
+        try:
+            backend.set_linearizer(fn)
+        except AttributeError:
+            pass
+        backend.linearity_info = info
+        self.linearity_info = info
+
+    def reload_linearity(self) -> dict:
+        """Re-read the active linearity correction (after a linearity run or a
+        selection change) and re-resolve the calibration (linearity hint)."""
+        with self._lock:
+            b = self.acquisition
+            self._install_linearity(b, self.device_name)
+            self.spectrum_history.clear()
+            self.fusion.reset()
+            self._rebuild_calibration()
+        st = self.calibration_status()
+        self._emit("calibration", st)
+        return dict(self.linearity_info)
+
+    def select_linearity(self, entry_id: str | None, *, owner: str | None = LOCAL) -> dict:
+        """Activate a stored linearity correction of this unit (None = off)."""
+        self.check_control(owner)
+        b = self._require_backend()
+        try:
+            callin.set_active(self.device_name, getattr(b, "serial", None), entry_id)
+        except KeyError:
+            raise NotFound(f"Linearity record '{entry_id}' not found.")
+        except ValueError as e:
+            raise Unprocessable(str(e))
+        return self.reload_linearity()
+
     def rebuild_calibration(self) -> dict:
         """Re-resolve the active selection (after a profile was saved, deleted,
         imported or selected) and apply it live."""
@@ -991,9 +1077,19 @@ class Engine:
         self._emit("calibration", st)
         return st
 
+    def display_modes(self) -> list[dict]:
+        """Selectable display modes now ({value, label, available})."""
+        ap = self.calib.applier
+        avail = set(processing.available_display_modes(None if ap is None else ap.type))
+        out = [{"value": processing.DISPLAY_AUTO, "label": "Auto", "available": True}]
+        out += [{"value": m, "label": processing.DISPLAY_LABELS[m], "available": m in avail}
+                for m in processing.DISPLAY_MODES]
+        return out
+
     def calibration_status(self) -> dict:
         st = json_safe(dict(self.calib.status))
         st["display_unit"] = self.current_unit
+        st["linearity"] = json_safe(dict(self.linearity_info or {}))
         return st
 
     def calibration_context(self) -> tuple[str, str | None, str | None]:
@@ -1091,7 +1187,12 @@ class Engine:
         n = int(wl.size)
         self.heatmap_linear_waves = np.linspace(wl[0], wl[-1], n)
         self.heatmap_buffer = np.zeros((n, self.heatmap_size))
+        # False = masked pixel (outside the valid segments of the profile at
+        # push time); exported as an empty cell. The image itself shows 0.
+        self.heatmap_valid = np.ones((n, self.heatmap_size), bool)
         self.heatmap_times = np.full(self.heatmap_size, np.nan)
+        self.heatmap_unit = None
+        self.heatmap_mode = None
         self.heatmap_filled = 0
 
     def set_heatmap_size(self, n: int, *, persist: bool = True) -> int:
@@ -1221,7 +1322,31 @@ class Engine:
             self.current_peaks = result["peaks"]
             self.current_unit = result["unit"]
             self.current_dark_source = result["dark_source"]
-            disp = np.nan_to_num(self.current_pixels, nan=0.0)
+            # display representation (only what is plotted; evaluations use
+            # current_pixels = corrected data)
+            applier = self.calib.applier
+            mode = processing.effective_display_mode(
+                self.cfg.get("display_mode", processing.DISPLAY_AUTO),
+                None if applier is None else applier.type,
+                str(self.cfg.get("display_unit", "counts")))
+            raw_counts = None
+            if mode == processing.DISPLAY_RAW and applier is not None:
+                rr, _ = self._process(averaged, ob_mean, integration_us, wl,
+                                      runtime=_WithoutProfile(self.calib))
+                raw_counts = rr["pixels"]
+            dvals, dunit = processing.display_transform(
+                mode, values=result["pixels"], unit=result["unit"],
+                integration_us=integration_us, calibration=applier, raw_counts=raw_counts)
+            self.current_display = dvals
+            self.current_display_unit = dunit
+            self.current_display_mode = mode
+            b = self.acquisition
+            exposure = processing.exposure_level(
+                averaged, full_scale=float(getattr(b, "adc_full_scale", 0.0) or 0.0)
+                if b is not None else 0.0,
+                saturation_level=float(getattr(b, "adc_saturation_level", self.adc_saturation))
+                if b is not None else self.adc_saturation)
+            disp = np.nan_to_num(dvals, nan=0.0)
 
             # heatmap (optional measurement-interval decimation)
             pushed, col, ptime = False, None, None
@@ -1229,11 +1354,22 @@ class Engine:
             interval = self._heatmap_measure_ms / 1000.0
             if interval <= 0.0 or (mono - self._heatmap_last_push) >= interval:
                 self._heatmap_last_push = mono
-                if self.heatmap_buffer.shape[0] != wl.size:
+                if self.heatmap_buffer.shape[0] != wl.size or (
+                        self.heatmap_filled and (self.heatmap_unit, self.heatmap_mode)
+                        != (dunit, mode)):
+                    # never mix units / display modes in the time-lapse (also
+                    # an automatic raw <-> corrected switch by a profile change)
                     self._reset_heatmap()
+                self.heatmap_unit, self.heatmap_mode = dunit, mode
                 col = np.interp(self.heatmap_linear_waves, wl, disp)
+                vcol = np.interp(self.heatmap_linear_waves, wl,
+                                 np.isfinite(dvals).astype(float)) > 0.5
                 self.heatmap_buffer = np.roll(self.heatmap_buffer, 1, axis=1)
                 self.heatmap_buffer[:, 0] = col
+                if self.heatmap_valid.shape != self.heatmap_buffer.shape:
+                    self.heatmap_valid = np.ones(self.heatmap_buffer.shape, bool)
+                self.heatmap_valid = np.roll(self.heatmap_valid, 1, axis=1)
+                self.heatmap_valid[:, 0] = vcol
                 if self.heatmap_times.size != self.heatmap_buffer.shape[1]:
                     self.heatmap_times = np.full(self.heatmap_buffer.shape[1], np.nan)
                 self.heatmap_times = np.roll(self.heatmap_times, 1)
@@ -1244,7 +1380,8 @@ class Engine:
                 aw = self._autosave_writer
                 if aw is not None:
                     try:
-                        aw.write_frame(datetime.now().isoformat(timespec="milliseconds"), col)
+                        aw.write_frame(datetime.now().isoformat(timespec="milliseconds"),
+                                       np.where(vcol, col, np.nan))
                     except Exception as e:                       # noqa: BLE001
                         print(f"[engine] autosave write failed: {e!r}")
 
@@ -1271,7 +1408,9 @@ class Engine:
                 lux_calibration=self.lux_calibration(self.current_unit),
                 heatmap_pushed=pushed,
                 heatmap_column=None if col is None else col.copy(),
-                heatmap_time=ptime)
+                heatmap_time=ptime,
+                display=np.array(dvals, float), display_unit=dunit,
+                display_mode=mode, exposure=exposure)
             self.last_frame = ev
         if notify:
             self._emit("frame", ev)
@@ -1288,6 +1427,8 @@ class Engine:
         with self._frame_lock:
             return {"wavelengths": self.heatmap_linear_waves.copy(),
                     "buffer": self.heatmap_buffer.copy(),
+                    "valid": self.heatmap_valid.copy(),
+                    "unit": self.heatmap_unit, "mode": self.heatmap_mode,
                     "times": self.heatmap_times.copy(),
                     "filled": int(self.heatmap_filled),
                     "size": int(self.heatmap_buffer.shape[1])}
@@ -1328,6 +1469,10 @@ class Engine:
             "dark_correction": bool(cfg.get("dark_correction", False)),
             "dark_mode": cfg.get("dark_mode", "optical_black"),
             "display_unit": cfg.get("display_unit", "counts"),
+            "display_mode": cfg.get("display_mode", processing.DISPLAY_AUTO),
+            "display_mode_effective": self.current_display_mode,
+            "display_modes": self.display_modes(),
+            "display_value_unit": self.current_display_unit,
             "irradiance_unit": cfg.get("irradiance_unit", "uW/cm2/nm"),
             "unit": self.current_unit,
             "unit_label": processing.unit_label(self.current_unit),
@@ -1364,7 +1509,150 @@ class Engine:
             "Dark / baseline": (f"{ob:.0f} ADC" if ob is not None else None),
             "Peak ADC":        (f"{peak_adc:.0f}" if peak_adc is not None else None),
             "Calibration":     prof,
+            "Linearity correction": callin.onoff_na(self.linearity_info),
         }
+
+    # ── export (shared desktop + web; see module-level spectrum_csv) ──────
+    def _dark_applied_text(self, src: str | None) -> str:
+        return {None: "none (no dark subtracted)",
+                "stored": "stored per-pixel dark (same t_int)",
+                "stored_model": "stored per-pixel dark (b + r·t model)",
+                "optical_black": "optical-black / baseline scalar",
+                "parametric": "parametric scalar (bias + rate·t)"}.get(src, str(src))
+
+    def _smoothing_text(self) -> str:
+        c = self.cfg
+        parts = []
+        if c.get("fusion_enabled", False):
+            parts.append(f"temporal (strength {float(c.get('fusion_smoothing', 0.85)):.2f})")
+        if c.get("hot_pixel_filter", False):
+            parts.append(f"median despeckle {int(c.get('smoothing_width', 5))} px")
+        if c.get("spatial_smoothing", False):
+            parts.append(f"spatial boxcar {int(c.get('spatial_smoothing_width', 5))} px")
+        return ", ".join(parts) if parts else "off"
+
+    def export_meta_rows(self, ev: "FrameEvent | None" = None) -> list:
+        """Header rows of an export: the settings ACTUALLY applied to the data
+        of frame `ev` (default: the latest frame)."""
+        ev = ev if ev is not None else self.last_frame
+        b = self.acquisition
+        st = dict(self.calib.status or {})
+        prof = self.calib.profile
+        unit = (ev.unit if ev is not None else self.current_unit) or "counts"
+        t_us = ev.integration_us if ev is not None else self.latest_integration_us
+        dsrc = ev.dark_source if ev is not None else self.current_dark_source
+        lin = self.linearity_info or {}
+        rows = [
+            ("Spectrometer", self.connected_backend_name or (type(b).__name__ if b else "")),
+            ("Serial", getattr(b, "serial", None) or ""),
+            ("Date/time", _iso_from_epoch(ev.timestamp if ev is not None else None)),
+            ("Exported", now_iso()),
+            ("Integration time (ms)", f"{t_us / 1000.0:.3f}"),
+            ("Frames averaged", int(self.frames_avg)),
+            ("Smoothing", self._smoothing_text()),
+            ("Dark correction", _onoff(dsrc is not None)),
+            ("Dark mode (applied)", self._dark_applied_text(dsrc)),
+            ("Optical Black mean (ADC)", f"{(ev.ob_mean if ev is not None else self.latest_ob_mean):.3f}"),
+            ("NL correction (device)", {True: "on", False: "off"}.get(
+                calprof.device_nl_active(b), "n/a")),
+            ("Linearity correction", callin.onoff_na(lin)
+             + (f" ({lin.get('id')}, {str(lin.get('created') or '')[:10]})"
+                if lin.get("state") == callin.STATE_ACTIVE else "")),
+        ]
+        if prof is not None and self.calib.active_v2:
+            rows += [("Calibration profile", st.get("label", "")),
+                     ("Profile id", prof.get("id")),
+                     ("Profile name", (prof.get("optics") or {}).get("name", "")),
+                     ("Profile version", prof.get("version")),
+                     ("Profile type", prof.get("type")),
+                     ("Profile state", st.get("state"))]
+            if st.get("linearity_note"):
+                rows.append(("Profile note", st["linearity_note"]))
+        else:
+            rows.append(("Calibration profile", st.get("label") if self.calib.legacy_gain
+                         is not None else "None"))
+        if self.calib.legacy_gain is not None:
+            # legacy gain path only: the old switch is reported when it is in effect
+            rows.append(("Response compensation", "on (legacy gain table)"))
+        mode = getattr(ev, "display_mode", None) if ev is not None else None
+        dunit = getattr(ev, "display_unit", None) if ev is not None else None
+        if mode:
+            rows.append(("Display mode", processing.DISPLAY_LABELS.get(mode, mode)
+                         if hasattr(processing, "DISPLAY_LABELS") else mode))
+        if dunit:
+            rows.append(("Display unit", processing.unit_label(dunit)))
+        rows.append(("Unit", unit))
+        if self.calib.active_v2:
+            vr = st.get("valid_range_nm")
+            if vr:
+                rows.append(("Valid range (nm)", f"{float(vr[0]):.1f}–{float(vr[1]):.1f}"))
+            segs = st.get("valid_segments_nm")
+            rows.append(("Valid segments (nm)", _segments_text(segs) or
+                         (f"{float(vr[0]):.1f}–{float(vr[1]):.1f}" if vr else "")))
+            rows.append(("Masked pixels", MASKED_NOTE))
+            if st.get("implausible"):
+                rows.append(("Plausibility", "FAILED (saved on request)"))
+        return rows
+
+    def export_snapshot(self, ev: "FrameEvent | None" = None) -> dict:
+        """Data + header of one frame for export (desktop + web identical)."""
+        ev = ev if ev is not None else self.last_frame
+        with self._frame_lock:
+            if ev is not None:
+                d = {"wavelengths": np.array(ev.wavelengths, float),
+                     "values": np.array(ev.pixels, float), "unit": ev.unit,
+                     "raw": np.array(ev.raw_averaged, float),
+                     "display": (None if getattr(ev, "display", None) is None
+                                 else np.array(ev.display, float)),
+                     "display_unit": getattr(ev, "display_unit", None),
+                     "display_mode": getattr(ev, "display_mode", None)}
+            else:
+                d = {"wavelengths": np.array(self.wavelength_array, float),
+                     "values": np.array(self.current_pixels, float),
+                     "unit": self.current_unit, "raw": np.array(self.current_raw, float),
+                     "display": None, "display_unit": None, "display_mode": None}
+        d["meta"] = self.export_meta_rows(ev)
+        return d
+
+    def export_spectrum_csv(self, ev: "FrameEvent | None" = None) -> str:
+        return spectrum_csv(self.export_snapshot(ev))
+
+    def _heatmap_meta(self, h: dict) -> list:
+        meta = [r for r in self.export_meta_rows() if r[0] in (
+            "Spectrometer", "Serial", "Exported", "Integration time (ms)",
+            "Calibration profile", "Profile id", "Linearity correction")]
+        mode = h.get("mode")
+        meta += [("Display mode", processing.DISPLAY_LABELS.get(mode, mode) if mode else ""),
+                 ("Unit", h.get("unit") or ""),
+                 ("Content", "display representation of each logged frame "
+                             "(the time-lapse records what is plotted)")]
+        if h.get("valid") is not None and not bool(np.all(h["valid"])):
+            meta.append(("Masked pixels", MASKED_NOTE))
+        return meta
+
+    def export_heatmap_csv(self, indices=None) -> str:
+        h = self.heatmap_snapshot()
+        return heatmap_csv_text(h, indices, self._heatmap_meta(h))
+
+    def export_heatmap_frame_csv(self, index: int) -> str:
+        """One logged time-lapse frame as a (wavelength, value) CSV with the
+        same header conventions (desktop 'export this frame')."""
+        h = self.heatmap_snapshot()
+        i = max(0, min(int(index), max(int(h["filled"]) - 1, 0)))
+        t = h["times"][i]
+        meta = self._heatmap_meta(h) + [
+            ("Time-lapse frame", i),
+            ("Seconds before export", f"{time.monotonic() - t:.1f}" if np.isfinite(t)
+             else "unknown")]
+        unit = h.get("unit") or "counts"
+        buf = io.StringIO()
+        for k, v in meta:
+            buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
+        buf.write(f"Wavelength_nm;{_value_column(unit)}\n")
+        col, ok = h["buffer"][:, i], h["valid"][:, i]
+        for w, v, good in zip(h["wavelengths"], col, ok):
+            buf.write(f"{w:.3f};{'' if not (good and np.isfinite(v)) else f'{v:.6g}'}\n")
+        return buf.getvalue()
 
     # ══════════════════════════════════════════════════════════════════════
     #  Measurements (jobs, via frame taps — not the display pipeline)
@@ -1475,7 +1763,8 @@ class Engine:
                        "serial": getattr(b, "serial", None),
                        "device_path": self.connected_device_path,
                        "wl_fingerprint": cap.wl_fingerprint,
-                       "nl_correction": calprof.device_nl_active(b)},
+                       "nl_correction": calprof.device_nl_active(b),
+                       "linearity": callin.profile_linearity_tag(self.linearity_info)},
             "acquisition": {"integration_us": int(cap.integration_us),
                             "integration_ms": cap.integration_us / 1000.0,
                             "auto_exposure": auto, "frames": int(cap.n_frames),
@@ -1648,9 +1937,11 @@ class Engine:
 
     def submit_calibration(self, params: dict, *, owner: str) -> Job:
         """Calibration run (relative / absolute) with the fixed wizard order:
-        wavelength check → t_int → darks (cover) → calibration spectrum +
-        stability (uncover) → t_int cross check → compute + plausibility →
-        save (+ activate) → protocol (PDF + CSV)."""
+        wavelength check → t_int → darks before (cover) → calibration spectrum
+        + repeat (uncover) → t/2 capture → darks after (cover / uncover) →
+        per-pixel checks + cause model → compute + plausibility → save
+        (+ activate) → verification through the live pipeline → protocol
+        (PDF + CSV)."""
         import calibration_workflow as cw
         import reference_sources as rs
         b = self._require_backend()
@@ -1670,7 +1961,7 @@ class Engine:
 
         def run(ctx: JobContext):
             res: dict = {"status": "failed", "profile_ids": [], "protocol": []}
-            steps = 8
+            steps = 10
 
             def prog(i, msg, step):
                 ctx.progress(i / steps, msg, step=step)
@@ -1704,9 +1995,26 @@ class Engine:
                 res["stability"] = json_safe(cal.get("stability"))
                 prog(4, "integration-time cross check", "crosscheck")
                 cx = wf.crosscheck_integration()
-                res["crosscheck"] = json_safe({k: v for k, v in cx.items()
-                                               if k in ("skipped", "pass", "crosscheck")})
-                prog(5, "computing", "compute")
+                prog(5, "dark spectra after the light captures", "dark_after")
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the lamp again. The "
+                                      "dark spectra AFTER the light captures are taken "
+                                      "next.", action="cover")
+                ctx.check()
+                ev = wf.capture_darks_after()
+                self.calib.invalidate_darks()
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the lamp (for "
+                                      "the verification measurement).", action="uncover")
+                res["dark_drift"] = json_safe(ev.get("drift"))
+                res["stability"] = json_safe(wf.checks.get("stability_detail"))
+                res["crosscheck"] = json_safe({
+                    "skipped": cx.get("skipped", False), "pass": wf.checks.get("itime_pass"),
+                    "crosscheck": wf.checks.get("itime_detail")})
+                res["causes"] = json_safe({k: {"dominant": v.get("dominant"),
+                                               "message": v.get("message")}
+                                           for k, v in wf.causes.items()})
+                prog(6, "computing", "compute")
                 try:
                     r = wf.compute()
                 except ValueError as e:
@@ -1716,7 +2024,7 @@ class Engine:
                 res["gain_span"] = json_safe(r.get("gain_span"))
                 res["plausibility"] = json_safe(wf.plausibility)
                 res["checks"] = json_safe(wf.checks)
-                prog(6, "saving", "save")
+                prog(7, "saving", "save")
                 activate = bool(p.get("activate", True))
                 if not wf.plausible:
                     if not p.get("allow_implausible"):
@@ -1737,17 +2045,218 @@ class Engine:
                     calprof.set_active_selection(wf.backend_name, saved[0]["id"])
                     res["activated"] = saved[0]["id"]
                 self.rebuild_calibration()
+                if p.get("verify", True):
+                    prog(8, "verification: reference through the live pipeline",
+                         "verification")
+                    try:
+                        ver = self.verify_profile(saved[0]["id"], ref.id, ctx=ctx,
+                                                  owner=None)
+                        wf.verification = ver
+                        res["verification"] = json_safe(
+                            {k: v for k, v in ver.items() if k != "curve"})
+                    except JobCancelled:
+                        raise
+                    except Exception as e:                       # noqa: BLE001
+                        wf.warnings.append(f"Verification failed: {e}")
+                        res["verification_error"] = str(e)
                 return res
             finally:
                 res["warnings"] = list(wf.warnings)
                 if wf.result is not None or res.get("status") == "failed":
                     try:
-                        ctx.progress(7 / steps, "writing the protocol", step="protocol")
+                        ctx.progress(9 / steps, "writing the protocol", step="protocol")
                     except JobCancelled:
                         pass
                     res["protocol"], res["protocol_message"] = self._write_protocol(wf)
                 ctx.job.result = res
         return self.jobs.submit("calibration", run, p, owner)
+
+    # ── verification of a saved profile (point 6 of the hardware test) ────
+    def verify_profile(self, profile_id: str, reference_id: str, *,
+                       frames: int | None = None, integration_ms: float | None = None,
+                       ctx: JobContext | None = None, owner: str | None = LOCAL) -> dict:
+        """Measure the reference source WITH profile `profile_id` through the
+        live pipeline (frame-tap capture → processing.process_frame with the
+        same kwargs as the live display, stored dark at t_int) and compare it
+        with the reference file (calibration_workflow.verify_against_reference:
+        normalised, per 50-nm band and overall; absolute profiles also
+        unnormalised). The result is kept as last_verification (scope overlay)."""
+        import calibration_workflow as cw
+        import reference_sources as rs
+        self.check_control(owner)
+        self._require_backend()
+        ref = rs.ReferenceLibrary().get(str(reference_id))
+        if ref is None:
+            raise NotFound(f"Reference source '{reference_id}' not found.")
+        prof = calprof.get_profile_by_id(str(profile_id))
+        if prof is None:
+            raise NotFound(f"Profile '{profile_id}' not found.")
+        if prof.get("apply") != calprof.APPLY_V2:
+            raise Unprocessable("Only v2 profiles (wizard) can be verified.")
+        t_us = (int(float(integration_ms) * 1000) if integration_ms
+                else int((prof.get("acquisition") or {}).get("integration_us") or 0))
+        mp = {"frames": int(frames or self.cfg.get("calibration_capture_frames", 16)),
+              "dark": "stored", "include_color": False, "include_peaks": False,
+              "label": f"verification {profile_id}"}
+        if t_us:
+            mp["integration_ms"] = t_us / 1000.0
+        if ctx is not None:
+            ctx.progress(message="verification: measuring the reference source",
+                         step="verification")
+        with self._with_profile(str(profile_id), True, owner):
+            rec = self._measure_once(ctx, mp)
+        wl = np.asarray(rec["wavelengths"], float)
+        vals = np.asarray(rec["values"], float)
+        kind = prof.get("type", calprof.TYPE_RELATIVE)
+        unit = rec["unit"] if kind == calprof.TYPE_ABSOLUTE else None
+        e = ref.on_axis(wl, unit=unit) if unit else ref.on_axis(wl)
+        lo, hi = (self.cfg.get("calibration_verify_norm_lo_nm", 550.0),
+                  self.cfg.get("calibration_verify_norm_hi_nm", 650.0))
+        ver = cw.verify_against_reference(
+            wl, vals, e, kind=kind, band_nm=float(self.cfg.get("calibration_verify_band_nm", 50.0)),
+            norm_range_nm=(float(lo), float(hi)),
+            warn_pct=float(self.cfg.get("calibration_verify_warn_pct", 2.0)))
+        ver.update({"profile_id": prof["id"], "profile_label": calprof.profile_label(prof),
+                    "reference_id": ref.id, "reference_name": ref.name,
+                    "measurement_id": rec["id"], "timestamp": rec["timestamp"],
+                    "integration_us": rec["acquisition"]["integration_us"],
+                    "unit": rec["unit"], "type": kind,
+                    "warnings": list(rec.get("warnings") or [])})
+        self.last_verification = ver
+        self.cfg.set("scope_reference_id", ref.id, save=False)
+        self._emit("verification", json_safe({k: v for k, v in ver.items() if k != "curve"}))
+        return ver
+
+    def submit_verification(self, params: dict, *, owner: str) -> Job:
+        self._require_backend()
+        p = dict(params or {})
+
+        def run(ctx: JobContext):
+            ver = self.verify_profile(str(p.get("profile_id", "")),
+                                      str(p.get("reference_id", "")),
+                                      frames=p.get("frames"),
+                                      integration_ms=p.get("integration_ms"), ctx=ctx,
+                                      owner=ctx.job.owner)
+            ctx.progress(1.0, "verification done", step="done")
+            return json_safe(ver)
+        return self.jobs.submit("verification", run, p, owner)
+
+    # ── reference overlay for the scope (desktop + web identical) ─────────
+    def reference_overlay(self, reference_id: str | None, wl, display_values,
+                          display_unit: str) -> np.ndarray | None:
+        """Reference curve on the wavelength axis, scaled to the CURRENT
+        display: absolute display → the reference in the display unit
+        (unscaled); any other mode → least-squares scale onto the displayed
+        values over the finite (valid) pixels. None if not available."""
+        import reference_sources as rs
+        if not reference_id:
+            return None
+        wl = np.asarray(wl, float)
+        key = (str(reference_id), wl.size, float(wl[0]) if wl.size else 0.0,
+               float(wl[-1]) if wl.size else 0.0, display_unit if
+               processing.is_absolute_unit(display_unit) else "")
+        e = self._overlay_cache.get(key)
+        if e is None:
+            ref = rs.ReferenceLibrary().get(str(reference_id))
+            if ref is None:
+                return None
+            try:
+                e = (ref.on_axis(wl, unit=display_unit)
+                     if processing.is_absolute_unit(display_unit)
+                     and processing.is_absolute_unit(ref.unit) else ref.on_axis(wl))
+            except Exception:                                    # noqa: BLE001
+                e = ref.on_axis(wl)
+            self._overlay_cache = {key: e}
+        e = np.asarray(e, float)
+        if processing.is_absolute_unit(display_unit):
+            return e
+        v = np.asarray(display_values, float)
+        m = np.isfinite(v) & np.isfinite(e) & (e > 0)
+        if np.count_nonzero(m) < 3:
+            return None
+        den = float(np.sum(e[m] ** 2))
+        scale = float(np.sum(v[m] * e[m]) / den) if den > 0 else 0.0
+        return e * scale
+
+    # ── linearity calibration job ────────────────────────────────────────
+    def submit_linearity(self, params: dict, *, owner: str) -> Job:
+        """Linearity calibration of the connected unit (or a check on devices
+        with a factory linearisation): plan → darks before (cover) → light
+        steps incl. repeated reference (uncover) → darks after (cover /
+        uncover) → fit → save (+ activate) → protocol (PDF + CSV)."""
+        b = self._require_backend()
+        p = dict(params or {})
+        cfg = callin.LinearityConfig.from_config()
+        if p.get("steps"):
+            cfg.n_steps = int(min(10, max(6, int(p["steps"]))))
+        if p.get("frames"):
+            cfg.n_frames = max(2, int(p["frames"]))
+        wf = callin.LinearityWorkflow(b, self.device_name, cfg)
+
+        def run(ctx: JobContext):
+            res: dict = {"status": "failed", "mode": wf.mode, "protocol": []}
+            try:
+                ctx.progress(0.02, "probing the source", step="plan")
+                us = (None if p.get("integration_ms") in (None, "auto")
+                      else int(float(p["integration_ms"]) * 1000))
+                res["plan"] = json_safe(wf.plan(us))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the input. Dark "
+                                      "spectra at all integration times are captured "
+                                      "next.", action="cover")
+                wf.capture_darks("before", progress=lambda f, m: ctx.progress(
+                    0.05 + 0.15 * f, m, step="dark_before"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the input. The "
+                                      "light steps are captured next (keep the source "
+                                      "and the fibre untouched).", action="uncover")
+                wf.capture_steps(sleep=ctx.sleep, check=ctx.check,
+                                 progress=lambda f, m: ctx.progress(0.2 + 0.5 * f, m,
+                                                                    step="steps"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the input again. "
+                                      "The dark spectra AFTER the steps are captured "
+                                      "next.", action="cover")
+                wf.capture_darks("after", progress=lambda f, m: ctx.progress(
+                    0.7 + 0.15 * f, m, step="dark_after"))
+                if wf.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the input.",
+                                      action="uncover")
+                ctx.progress(0.87, "fitting the correction", step="compute")
+                try:
+                    res["result"] = json_safe(wf.compute())
+                except ValueError as e:
+                    res["error"] = str(e)
+                    return res
+                if p.get("save", True):
+                    saved = wf.save(activate=bool(p.get("activate", True)))
+                    res["entry_id"] = saved["id"]
+                    res["status"] = "saved" if wf.mode == callin.MODE_CORRECTION else "check_saved"
+                    self.reload_linearity()
+                    res["linearity"] = json_safe(self.linearity_info)
+                else:
+                    res["status"] = "computed"
+                return res
+            finally:
+                res["warnings"] = list(wf.warnings)
+                if wf.model is not None or res.get("error"):
+                    res["protocol"], res["protocol_message"] = self._write_linearity_protocol(wf)
+                ctx.job.result = res
+        return self.jobs.submit("linearity", run, p, owner)
+
+    def _write_linearity_protocol(self, wf) -> tuple[list[str], str]:
+        try:
+            import calibration_report as crp
+            import export_paths
+            rec = wf.record()
+            d, note = export_paths.calibration_protocol_dir()
+            base = crp.default_linearity_basename(rec)
+            paths = crp.write_linearity_protocol(rec, os.path.join(d, base + ".pdf"),
+                                                 os.path.join(d, base + ".csv"))
+            return list(paths or []), note or ""
+        except Exception as e:                                   # noqa: BLE001
+            return [], f"Protocol not written: {e}"
+
 
     def submit_derivation(self, params: dict, *, owner: str) -> Job:
         """Derive the relative profile of a NEW optics configuration from a
@@ -1848,19 +2357,30 @@ def measurement_to_json(rec: dict, *, include_arrays: bool = True) -> dict:
 def measurement_to_csv(rec: dict) -> str:
     buf = io.StringIO()
     acq, dev, cal = rec["acquisition"], rec["device"], rec["calibration"]
+    lin = dev.get("linearity") or {}
+    nl = dev.get("nl_correction")
     meta = [("Measurement id", rec["id"]), ("Timestamp", rec["timestamp"]),
             ("Label", rec.get("label", "")),
             ("Spectrometer", dev.get("backend")), ("Serial", dev.get("serial")),
             ("Integration time (ms)", f"{acq['integration_ms']:.3f}"),
             ("Frames averaged", acq["frames"]), ("Dark", f"{acq['dark']} ({acq['dark_source']})"),
+            ("NL correction (device)", {True: "on", False: "off"}.get(nl, "n/a")),
+            ("Linearity correction", callin.onoff_na(lin) + (
+                f" ({lin.get('id')})" if lin.get("active") else "")),
             ("Peak (fraction of full scale)", f"{acq['peak_frac']:.4f}"),
             ("Saturated pixels", acq["n_saturated"]),
-            ("Calibration profile", cal.get("label")), ("Unit", rec["unit"])]
+            ("Calibration profile", cal.get("label")),
+            ("Profile id", cal.get("profile_id") or ""), ("Profile type", cal.get("type") or ""),
+            ("Unit", rec["unit"])]
     vr = rec.get("valid_range_nm")
     if vr:
         meta.append(("Valid range (nm)", f"{float(vr[0]):.1f}-{float(vr[1]):.1f}"))
+        segs = cal.get("valid_segments_nm")
+        if segs:
+            meta.append(("Valid segments (nm)", _segments_text(segs)))
+        meta.append(("Masked pixels", MASKED_NOTE))
     for k, v in meta:
-        buf.write(f"# {k};{'' if v is None else v}\n")
+        buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
     unit = rec["unit"]
     col = "ADC_Counts" if unit == "counts" else f"Value_{unit}"
     buf.write(f"Pixel_ID;Wavelength_nm;{col}\n")
@@ -1871,4 +2391,108 @@ def measurement_to_csv(rec: dict) -> str:
             buf.write(f"{i};{w:.3f};{v:.2f}\n")
         else:
             buf.write(f"{i};{w:.3f};{v:.6g}\n")
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Spectrum / heatmap / measurement export (ONE implementation, desktop + web)
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  CSV: ';' separated, UTF-8 with BOM (Excel recognises the encoding; µ, ², –
+#  survive), header lines '# key;value' documenting the settings ACTUALLY
+#  applied to the exported data. Masked pixels (outside the valid segments of
+#  a profile) are written as empty cells.
+
+CSV_ENCODING = "utf-8-sig"
+CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
+MASKED_NOTE = ("empty cell = masked pixel (outside the valid segments of the "
+               "calibration profile)")
+
+
+def csv_bytes(text: str) -> bytes:
+    """CSV text → bytes with UTF-8 BOM (HTTP responses)."""
+    return text.encode(CSV_ENCODING)
+
+
+def write_csv_text(path: str, text: str) -> str:
+    """Write CSV text with UTF-8 BOM (desktop saves)."""
+    with open(path, "w", encoding=CSV_ENCODING, newline="") as f:
+        f.write(text)
+    return path
+
+
+def _segments_text(segs) -> str:
+    if not segs:
+        return ""
+    return ", ".join(f"{float(a):.1f}–{float(b):.1f}" for a, b in segs)
+
+
+def _onoff(v) -> str:
+    return "on" if v else "off"
+
+
+def _iso_from_epoch(ts: float | None) -> str:
+    if ts is None:
+        return now_iso()
+    return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+
+
+def _value_column(unit: str) -> str:
+    return "ADC_Counts" if unit == "counts" else f"Value_{unit}"
+
+
+def _fmt_value(v: float, unit: str) -> str:
+    if not np.isfinite(v):
+        return ""
+    if unit in ("counts", processing_unit_counts_corrected()):
+        return f"{v:.2f}"
+    return f"{v:.6g}"
+
+
+def processing_unit_counts_corrected() -> str:
+    return getattr(processing, "UNIT_COUNTS_CORRECTED", "counts_corrected")
+
+
+def spectrum_csv(snapshot: dict) -> str:
+    """CSV text of an export snapshot (Engine.export_snapshot)."""
+    buf = io.StringIO()
+    for k, v in snapshot["meta"]:
+        v = "" if v is None else str(v)
+        buf.write(f"# {k};{v.replace(';', ',')}\n")
+    wl = np.asarray(snapshot["wavelengths"], float)
+    vals = np.asarray(snapshot["values"], float)
+    unit = snapshot["unit"] or "counts"
+    cols = [("Pixel_ID", None), ("Wavelength_nm", None), (_value_column(unit), (vals, unit))]
+    disp = snapshot.get("display")
+    dunit = snapshot.get("display_unit")
+    if disp is not None and dunit and (dunit != unit or not np.array_equal(
+            np.asarray(disp, float), vals, equal_nan=True)):
+        cols.append((f"Display_{dunit}", (np.asarray(disp, float), dunit)))
+    raw = snapshot.get("raw")
+    if raw is not None and snapshot.get("include_raw", True):
+        cols.append(("Raw_ADC", (np.asarray(raw, float), "counts")))
+    buf.write(";".join(c for c, _ in cols) + "\n")
+    for i, w in enumerate(wl):
+        row = [str(i), f"{w:.3f}"]
+        for _c, spec in cols[2:]:
+            arr, u = spec
+            row.append(_fmt_value(float(arr[i]), u) if i < arr.size else "")
+        buf.write(";".join(row) + "\n")
+    return buf.getvalue()
+
+
+def heatmap_csv_text(h: dict, indices=None, meta: list | None = None) -> str:
+    """CSV of the time-lapse buffer (heatmap_snapshot()); indices = frame
+    columns (0 = newest), default all filled."""
+    buf = io.StringIO()
+    for k, v in meta or []:
+        buf.write(f"# {k};{'' if v is None else str(v).replace(';', ',')}\n")
+    idx = list(range(int(h["filled"]))) if indices is None else list(indices)
+    buf.write(";".join(["Time_Frame"] + [f"{w:.2f}" for w in h["wavelengths"]]) + "\n")
+    valid = h.get("valid")
+    for fi in idx:
+        col = h["buffer"][:, fi]
+        ok = valid[:, fi] if valid is not None else np.ones(col.size, bool)
+        buf.write(";".join([str(fi)] + [("" if not (g and np.isfinite(v)) else f"{v:.6g}")
+                                        for v, g in zip(col, ok)]) + "\n")
     return buf.getvalue()

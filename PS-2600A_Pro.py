@@ -5,6 +5,8 @@ PASCO PS-2600A Spectrum Analyzer — entry point.
     python PS-2600A_Pro.py --headless      engine + REST API / web UI, no Qt import
                           [--host 127.0.0.1] [--lan] [--port 8000] [--token T]
                           [--require-token] [--no-connect] [--backend NAME]
+    python PS-2600A_Pro.py --data-dir PATH  use PATH as the user data directory
+                                           (also: environment PS2600A_DATA_DIR)
 
 The application is split into focused modules:
 
@@ -19,8 +21,11 @@ The application is split into focused modules:
   color_science.py      CIE 1931 colorimetry math
   app_config.py         JSON-backed user preferences
 
-A `spectrometer_config.json` file is created on first launch and
-automatically updated as the user tweaks settings.
+Runtime data (spectrometer_config.json, calibration profiles, dark spectra,
+linearity records, lamp library, backups, protocols) lives in the per-user data
+directory (data_paths.py: %APPDATA%\\PS-2600A, ~/Library/Application
+Support/PS-2600A, $XDG_CONFIG_HOME/ps-2600a). On the first start existing files
+of the program folder are copied there once (originals kept, logged).
 """
 
 import sys
@@ -28,6 +33,8 @@ import sys
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    import data_paths
+    argv = data_paths.parse_cli(argv)          # --data-dir before any config import
     if "--headless" in argv:
         # No Qt import on this path (runs on machines without PyQt6).
         from server_runner import headless_main

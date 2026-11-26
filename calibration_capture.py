@@ -63,6 +63,20 @@ class Capture:
     serial: str | None = None
     wl_fingerprint: str = ""
     kind: str = "light"              # "light" | "dark"
+    # wall-clock (epoch seconds) of the first / last accepted frame — used to
+    # interpolate the dark measured before and after a light capture in time
+    t_start: float | None = None
+    t_end: float | None = None
+    linearity_bypassed: bool = False  # frames taken without the linearity correction
+    # per-pixel variance of `mean` when it is not std²/n_frames (time-
+    # interpolated dark from two captures); None → std² / n_frames
+    sem2: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def t_mid(self) -> float | None:
+        if self.t_start is None or self.t_end is None:
+            return None
+        return 0.5 * (float(self.t_start) + float(self.t_end))
 
     @property
     def peak_counts(self) -> float:
@@ -91,6 +105,8 @@ class Capture:
             "serial": self.serial,
             "wl_fingerprint": self.wl_fingerprint,
             "kind": self.kind,
+            "t_start": self.t_start,
+            "t_end": self.t_end,
         }
 
     @classmethod
@@ -113,6 +129,8 @@ class Capture:
             serial=d.get("serial"),
             wl_fingerprint=str(d.get("wl_fingerprint", "")),
             kind=str(d.get("kind", "light")),
+            t_start=d.get("t_start"),
+            t_end=d.get("t_end"),
         )
 
 
@@ -159,6 +177,8 @@ class FrameAccumulator:
         self.n = 0
         self._skipped = 0
         self._dark_sum = 0.0
+        self.t_first: float | None = None
+        self.t_last: float | None = None
         self.rejected: dict[str, int] = {}
 
     def _reject(self, why: str) -> None:
@@ -186,6 +206,11 @@ class FrameAccumulator:
                 self._sat = np.zeros(px.shape, bool)
                 self.n = 0
                 self._dark_sum = 0.0
+                self.t_first = None
+            now = time.time()
+            if self.t_first is None:
+                self.t_first = now
+            self.t_last = now
             try:
                 self._dark_sum += float(np.mean(dark))
             except (TypeError, ValueError):
@@ -232,8 +257,10 @@ class CaptureSession:
 
     def __init__(self, backend, n_frames: int, *, integration_us: int | None = None,
                  kind: str = "light", backend_name: str | None = None,
-                 skip_first: int = 1, timeout_s: float | None = None):
+                 skip_first: int = 1, timeout_s: float | None = None,
+                 raw: bool = False):
         self.backend = backend
+        self.raw = bool(raw)            # bypass the linearity correction
         self.n_frames = max(1, int(n_frames))
         self.integration_us = int(integration_us or backend.current_integration_time_us)
         self.kind = kind
@@ -253,7 +280,10 @@ class CaptureSession:
             "fast_preview_enabled": getattr(b, "fast_preview_enabled", False),
             "is_auto_exposure_active": getattr(b, "is_auto_exposure_active", False),
             "is_measurement_paused": getattr(b, "is_measurement_paused", False),
+            "linearity_bypass": getattr(b, "linearity_bypass", False),
         }
+        if self.raw:
+            b.linearity_bypass = True
         b.fast_preview_enabled = False
         b.is_auto_exposure_active = False
         if b.current_integration_time_us != self.integration_us:
@@ -297,6 +327,8 @@ class CaptureSession:
             b.fast_preview_enabled = self._restore.get("fast_preview_enabled", False)
             b.is_auto_exposure_active = self._restore.get("is_auto_exposure_active", False)
             b.is_measurement_paused = self._restore.get("is_measurement_paused", False)
+            if self.raw:
+                b.linearity_bypass = self._restore.get("linearity_bypass", False)
             self._active = False
 
     def finish(self) -> Capture:
@@ -319,16 +351,20 @@ class CaptureSession:
             saturation_level=float(b.adc_saturation_level),
             full_scale=float(b.adc_full_scale),
             backend=self.backend_name, serial=getattr(b, "serial", None),
-            wl_fingerprint=b.wl_fingerprint(), kind=self.kind)
+            wl_fingerprint=b.wl_fingerprint(), kind=self.kind,
+            t_start=self.acc.t_first, t_end=self.acc.t_last,
+            linearity_bypassed=bool(self.raw or getattr(b, "linearizer", None) is None))
 
 
 def capture(backend, n_frames: int, *, integration_us: int | None = None,
             kind: str = "light", backend_name: str | None = None,
-            skip_first: int = 1, timeout_s: float | None = None) -> Capture:
-    """Blocking capture of N clean frames (run from a worker thread in a GUI)."""
+            skip_first: int = 1, timeout_s: float | None = None,
+            raw: bool = False) -> Capture:
+    """Blocking capture of N clean frames (run from a worker thread in a GUI).
+    raw=True bypasses the unit's linearity correction (linearity measurement)."""
     s = CaptureSession(backend, n_frames, integration_us=integration_us, kind=kind,
                        backend_name=backend_name, skip_first=skip_first,
-                       timeout_s=timeout_s)
+                       timeout_s=timeout_s, raw=raw)
     s.start()
     try:
         s.wait()
@@ -339,7 +375,7 @@ def capture(backend, n_frames: int, *, integration_us: int | None = None,
 
 def capture_dark(backend, n_frames: int, *, integration_us: int | None = None,
                  backend_name: str | None = None, timeout_s: float | None = None,
-                 use_shutter: bool = True) -> Capture:
+                 use_shutter: bool = True, raw: bool = False) -> Capture:
     """Dark capture. Closes the backend's shutter if it has one (demo lamp,
     devices with a shutter); otherwise the caller must have blocked the light."""
     closed = False
@@ -349,7 +385,7 @@ def capture_dark(backend, n_frames: int, *, integration_us: int | None = None,
         # one extra skipped frame: the frame in flight may still contain light
         return capture(backend, n_frames, integration_us=integration_us,
                        kind="dark", backend_name=backend_name,
-                       skip_first=2 if closed else 1, timeout_s=timeout_s)
+                       skip_first=2 if closed else 1, timeout_s=timeout_s, raw=raw)
     finally:
         if closed:
             backend.set_shutter(False)
@@ -402,14 +438,80 @@ def count_rate(light: Capture, dark: Capture) -> CountRate:
     rate = (L - D) / t
     sig_d1 = _robust_frame_sigma(dark)
     sig_l = np.asarray(light.std, float)
-    sigma_rate = np.sqrt(sig_l ** 2 / max(light.n_frames, 1)
-                         + sig_d1 ** 2 / max(dark.n_frames, 1)) / t
+    var_dark_mean = (np.asarray(dark.sem2, float) if dark.sem2 is not None
+                     else sig_d1 ** 2 / max(dark.n_frames, 1))
+    sigma_rate = np.sqrt(sig_l ** 2 / max(light.n_frames, 1) + var_dark_mean) / t
     return CountRate(
         wl=np.asarray(light.wl, float), rate=rate, sigma_dark=sig_d1 / t,
         sigma_rate=sigma_rate, saturated=np.asarray(light.saturated, bool),
         integration_us=tl, n_frames=light.n_frames, n_dark_frames=dark.n_frames,
         warnings=warnings, wl_fingerprint=light.wl_fingerprint,
         peak_frac=light.peak_frac)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Dark before / after a light capture (time interpolation, drift)
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  A dark offset that changes between runs (LR-2T: +70 … −200 counts) biases
+#  C = (L − D)/t at weak pixels. Every light capture is therefore bracketed by
+#  a dark capture at the SAME t_int before and after it; the dark subtracted
+#  is the per-pixel linear interpolation of both to the light's mid time.
+
+def interpolate_dark(before: Capture, after: Capture | None,
+                     t_mid: float | None) -> Capture:
+    """Dark for a light capture with mid time t_mid (epoch s) taken between
+    `before` and `after` (same t_int, same pixels): per-pixel linear
+    interpolation in time. Without usable timestamps the mean of both is used;
+    without `after` the `before` dark is returned unchanged."""
+    if after is None:
+        return before
+    B = np.asarray(before.mean, float)
+    A = np.asarray(after.mean, float)
+    if A.shape != B.shape:
+        raise ValueError("Dark spectra before/after have different pixel counts.")
+    tb, ta = before.t_mid, after.t_mid
+    if tb is None or ta is None or t_mid is None or ta <= tb:
+        w = 0.5
+    else:
+        w = float(np.clip((float(t_mid) - tb) / (ta - tb), 0.0, 1.0))
+    sb, sa = _robust_frame_sigma(before), _robust_frame_sigma(after)
+    mean = (1.0 - w) * B + w * A
+    sem2 = ((1.0 - w) ** 2 * sb ** 2 / max(before.n_frames, 1)
+            + w ** 2 * sa ** 2 / max(after.n_frames, 1))
+    std = np.sqrt((1.0 - w) * sb ** 2 + w * sa ** 2)       # single-frame noise
+    return Capture(
+        wl=np.asarray(before.wl, float), mean=mean, std=std,
+        n_frames=int(before.n_frames + after.n_frames),
+        integration_us=int(before.integration_us),
+        saturated=np.asarray(before.saturated, bool) | np.asarray(after.saturated, bool),
+        saturation_level=before.saturation_level, full_scale=before.full_scale,
+        timestamp=after.timestamp, backend=before.backend, serial=before.serial,
+        wl_fingerprint=before.wl_fingerprint, kind="dark",
+        t_start=before.t_start, t_end=after.t_end,
+        linearity_bypassed=before.linearity_bypassed, sem2=sem2)
+
+
+def dark_drift(before: Capture, after: Capture) -> dict:
+    """Change of the dark level between the dark before and after a light
+    capture (same t_int). mean_counts = mean over pixels of (after − before);
+    sigma_counts = its expected noise (from the per-pixel frame noise), so
+    |mean| ≫ sigma means a real drift. p95_abs_counts: per-pixel spread."""
+    B = np.asarray(before.mean, float)
+    A = np.asarray(after.mean, float)
+    d = A - B
+    sb, sa = _robust_frame_sigma(before), _robust_frame_sigma(after)
+    var_px = sb ** 2 / max(before.n_frames, 1) + sa ** 2 / max(after.n_frames, 1)
+    sigma_mean = float(np.sqrt(np.mean(var_px) / max(d.size, 1)))
+    dt = None
+    if before.t_mid is not None and after.t_mid is not None:
+        dt = float(after.t_mid - before.t_mid)
+    return {"integration_us": int(before.integration_us),
+            "mean_counts": float(np.mean(d)) if d.size else 0.0,
+            "p95_abs_counts": float(np.percentile(np.abs(d), 95)) if d.size else 0.0,
+            "sigma_counts": sigma_mean, "seconds": dt,
+            "before_mean_counts": float(np.mean(B)) if B.size else 0.0,
+            "after_mean_counts": float(np.mean(A)) if A.size else 0.0}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -470,11 +572,12 @@ def auto_expose(backend, *, target_frac: tuple[float, float] = (0.70, 0.85),
 # ══════════════════════════════════════════════════════════════════════════
 
 def _dark_path() -> str:
+    import data_paths
     try:
         from app_config import Config
-        return Config.get("dark_spectra_file", DEFAULT_DARK_FILE)
+        return data_paths.resolve(Config.get("dark_spectra_file", DEFAULT_DARK_FILE))
     except Exception:
-        return DEFAULT_DARK_FILE
+        return data_paths.resolve(DEFAULT_DARK_FILE)
 
 
 def _load_darks() -> list[dict]:
@@ -493,6 +596,7 @@ def _load_darks() -> list[dict]:
 def _save_darks(darks: list[dict]) -> None:
     path = _dark_path()
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"schema": 1, "darks": darks}, f)
     except Exception as e:

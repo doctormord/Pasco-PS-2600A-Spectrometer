@@ -52,7 +52,8 @@ def test_csv(record, tmp_path):
     body = lines[len(head) + 1:]
     assert lines[len(head) + 1 - 1].split(";") == rep.CSV_COLUMNS
     assert len(body) == len(record["spectra"]["wl"])
-    assert all(len(l.split(";")) == 8 for l in body)
+    # check_fail column appended (deliberate format change: 8 -> 9 columns)
+    assert all(len(l.split(";")) == len(rep.CSV_COLUMNS) == 9 for l in body)
 
 
 def test_pdf(record, tmp_path):

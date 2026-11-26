@@ -77,7 +77,10 @@ def test_v2_profile_lifecycle(client, isolated_config):
     p0 = _wait_frame(lambda p: len(p["intensities"]) > 0)
     assert p0["unit"] == "counts" and None not in p0["intensities"]
     csv0 = client.get("/api/export/csv").text
-    assert "ADC_Counts" in csv0 and "# Unit" not in csv0
+    # header documents the applied settings (hardware test point 8), no legacy
+    # "Response compensation" entry without an active legacy gain
+    assert "ADC_Counts" in csv0 and "# Unit;counts" in csv0
+    assert "Response compensation" not in csv0
 
     prof = _make_profile()
     j = client.get("/api/calibration/profiles").json()
@@ -105,7 +108,7 @@ def test_v2_profile_lifecycle(client, isolated_config):
     csv = client.get("/api/export/csv").text
     assert "# Unit;uW/cm2/nm" in csv and "# Calibration profile;" in csv
     assert "# Valid range (nm);" in csv and "Value_uW/cm2/nm" in csv
-    assert ";\n" in csv                                   # masked pixel = empty cell
+    assert ";;" in csv   # masked value = empty cell (Raw_ADC column follows)
 
     # irradiance unit change refreshes the applier
     client.post("/api/config", json={"irradiance_unit": "W/m2/nm"})

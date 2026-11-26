@@ -470,6 +470,7 @@ def compute_calibration(
     snr_k: float = 10.0,
     max_gain: float = 50.0,
     smooth_px: int = 0,
+    pixel_ok=None,
 ) -> dict:
     """S (relative) or K (absolute) from a calibration count rate.
 
@@ -477,6 +478,9 @@ def compute_calibration(
                            [counts/s] (calibration_capture.CountRate fields).
     e_ref                : reference irradiance ON THE PIXEL AXIS, NaN outside the
                            source's valid range (ReferenceSource.on_axis, PCHIP).
+    pixel_ok             : optional bool mask of the per-pixel checks (stability,
+                           integration-time cross check, see pixel_check); False
+                           pixels are masked and so limit the valid segments.
     Returns a dict with per-pixel arrays (NaN where masked):
         S (peak 1), K (absolute only, else None), valid (bool), masks (dict of the
         individual criteria), valid_range_nm, gain_span, n_valid.
@@ -496,7 +500,9 @@ def compute_calibration(
     m_ref = np.isfinite(E) & (E > 0)
     m_snr = np.isfinite(C) & (C > float(snr_k) * np.maximum(sd, 0.0)) & (C > 0)
     m_sat = ~sat
-    valid0 = m_dev & m_ref & m_snr & m_sat
+    m_chk = (np.ones(wl.size, bool) if pixel_ok is None
+             else np.asarray(pixel_ok, bool))
+    valid0 = m_dev & m_ref & m_snr & m_sat & m_chk
     if not np.any(valid0):
         raise ValueError(
             "No valid pixels: the calibration signal is below the SNR limit, "
@@ -522,7 +528,7 @@ def compute_calibration(
     return {
         "wl": wl, "C": C, "E": E, "S": S, "K": K, "valid": valid,
         "masks": {"device": m_dev, "reference": m_ref, "snr": m_snr,
-                  "saturation": m_sat, "gain": m_gain | ~valid0,
+                  "saturation": m_sat, "checks": m_chk, "gain": m_gain | ~valid0,
                   # pixels where a calibration is expected at all
                   # (device spec range ∩ reference range): coverage basis
                   "base": m_dev & m_ref},
@@ -557,6 +563,173 @@ def compare_rates(c_ref, c_test, mask, *, min_frac: float = 0.1,
             "max_pct": float(np.max(d)),
             "mean_ratio": float(np.mean(rs[m])),
             "n": int(np.count_nonzero(m))}
+
+
+def pixel_check(c_ref, c_test, sigma_ref, sigma_test, mask, *,
+                threshold_pct: float, k: float = 4.0, expected_ratio=1.0) -> dict:
+    """Per-pixel comparison of two count-rate spectra with a NOISE-DEPENDENT
+    tolerance (stability: repeat at t; cross check: capture at ~t/2).
+
+    A tested pixel passes when
+        |c_test − r·c_ref| <= k·sqrt(σ_ref² + σ_test²) + threshold_pct/100·|c_ref|
+    with σ the per-pixel standard deviation of the mean rate (dark noise and
+    shot noise of the actual captures, calibration_capture.count_rate) and r the
+    expected ratio (1, or a lamp-drift correction). The relative term is the
+    systematic deviation the check accepts as a whole; the noise term keeps
+    weak pixels from failing on noise alone. Non-positive or non-finite rates
+    fail. Untested pixels (mask False) are reported as ok.
+    Returns {"ok", "tested", "fail", "n_tested", "n_fail", "fail_frac",
+    "ratio" (c_test/c_ref, NaN where not tested), "z"}."""
+    a = np.asarray(c_ref, float)
+    b = np.asarray(c_test, float)
+    sa = np.asarray(sigma_ref, float)
+    sb = np.asarray(sigma_test, float)
+    m = np.asarray(mask, bool)
+    r = np.broadcast_to(np.asarray(expected_ratio, float), a.shape)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sig = np.sqrt(np.maximum(sa, 0) ** 2 + np.maximum(sb, 0) ** 2)
+        tol = float(k) * sig + float(threshold_pct) / 100.0 * np.abs(a)
+        dev = b - r * a
+        bad = (~np.isfinite(a) | ~np.isfinite(b) | (b <= 0) | (a <= 0)
+               | ~(np.abs(dev) <= tol))
+        z = np.where(sig > 0, dev / sig, np.nan)
+        ratio = np.where(m & np.isfinite(a) & (a != 0), b / a, np.nan)
+    fail = m & bad
+    n_t = int(np.count_nonzero(m))
+    n_f = int(np.count_nonzero(fail))
+    return {"ok": ~fail, "tested": m, "fail": fail, "n_tested": n_t, "n_fail": n_f,
+            "fail_frac": (n_f / n_t) if n_t else 0.0, "ratio": ratio, "z": z,
+            "k": float(k), "threshold_pct": float(threshold_pct)}
+
+
+CAUSE_DARK = "dark_drift"            # constant count offset
+CAUSE_TIME = "time_offset"           # uniform factor between t and t/2
+CAUSE_LAMP = "lamp_drift"            # uniform factor between two captures at t
+CAUSE_NONLINEAR = "nonlinearity"     # signal-dependent deviation
+
+
+def check_causes(c_ref, c_test, sigma_ref, sigma_test, mask, *, t_ref_us: int,
+                 t_test_us: int, full_scale: float | None = None,
+                 nonlinear: bool | None = None, min_effect_pct: float = 0.3,
+                 sig_k: float = 3.0, lamp_scale: float = 1.0) -> dict:
+    """Cause model of a stability or cross check over all tested pixels.
+
+    In counts of the TEST capture (x = counts expected from the reference
+    rate, y = measured counts):
+        y = a + s·x + c·x²/FS                 (c = 0 for a repeat at the same t)
+      a  constant count offset  → dark drift / dark mismatch            [counts]
+      s  uniform factor         → time offset (t/2 check: effective exposure
+                                   t+δ instead of t) or lamp drift (repeat at t)
+      c  signal-dependent term  → detector nonlinearity
+    Weighted least squares (weights from the per-pixel noise), one robust
+    re-fit without > 5σ outliers. A term is reported as a cause when it is
+    significant (|value| > sig_k·standard error) AND its effect on the ratio
+    y/x reaches min_effect_pct. lamp_scale: expected lamp factor (from the
+    stability check) applied to the reference before a cross-check fit.
+
+    Returns {"kind", "causes": [{cause, value, unit, effect_pct, se,
+    significant, message}], "dominant": cause | None, "message", "fit"}."""
+    a = np.asarray(c_ref, float)
+    b = np.asarray(c_test, float)
+    sra = np.asarray(sigma_ref, float)
+    srb = np.asarray(sigma_test, float)
+    m = (np.asarray(mask, bool) & np.isfinite(a) & np.isfinite(b)
+         & np.isfinite(sra) & np.isfinite(srb))
+    t_test = max(int(t_test_us), 1) / 1e6
+    t_ref = max(int(t_ref_us), 1) / 1e6
+    same_t = abs(t_test - t_ref) <= 0.005 * t_ref
+    if nonlinear is None:
+        nonlinear = not same_t
+    out = {"kind": "stability" if same_t else "crosscheck", "causes": [],
+           "dominant": None, "message": "", "fit": None}
+    if np.count_nonzero(m) < 8:
+        out["message"] = "too few pixels for the cause analysis"
+        return out
+    x = a[m] * t_test * float(lamp_scale)
+    y = b[m] * t_test
+    fs = float(full_scale) if full_scale and full_scale > 0 else float(np.max(np.abs(y)))
+    var = (srb[m] * t_test) ** 2 + (sra[m] * t_test * float(lamp_scale)) ** 2
+    var = np.maximum(var, 1e-12)
+    cols = [np.ones_like(x), x] + ([x * x / fs] if nonlinear else [])
+    X = np.column_stack(cols)
+    keep = np.ones(x.size, bool)
+    coef = cov = None
+    chi2 = 1.0
+    for _ in range(3):
+        w = 1.0 / var[keep]
+        Xk = X[keep]
+        try:
+            A = Xk.T @ (Xk * w[:, None])
+            coef = np.linalg.solve(A, Xk.T @ (y[keep] * w))
+            cov0 = np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            out["message"] = "cause analysis: fit singular"
+            return out
+        resid = y - X @ coef
+        dof = max(int(np.count_nonzero(keep)) - X.shape[1], 1)
+        chi2 = float(np.sum(resid[keep] ** 2 / var[keep]) / dof)
+        cov = cov0 * max(chi2, 1.0)
+        new_keep = np.abs(resid) <= 5.0 * np.sqrt(var * max(chi2, 1.0))
+        if np.array_equal(new_keep, keep) or np.count_nonzero(new_keep) < 8:
+            break
+        keep = new_keep
+    se = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    xk = x[keep] if np.any(keep) else x
+    x_ref = float(np.median(xk))
+    x_lo, x_hi = float(np.percentile(xk, 5)), float(np.percentile(xk, 95))
+    a0, s0 = float(coef[0]), float(coef[1])
+    c0 = float(coef[2]) if nonlinear else 0.0
+    causes = []
+
+    def add(cause, value, unit, effect, se_effect, msg, **extra):
+        sig = (abs(effect) > sig_k * se_effect) and abs(effect) >= float(min_effect_pct)
+        d = {"cause": cause, "value": float(value), "unit": unit,
+             "effect_pct": float(effect), "se_effect_pct": float(se_effect),
+             "significant": bool(sig), "message": msg}
+        d.update(extra)
+        causes.append(d)
+
+    off_eff = 100.0 * a0 / x_ref if x_ref else 0.0
+    add(CAUSE_DARK, a0, "counts", off_eff,
+        100.0 * se[0] / abs(x_ref) if x_ref else float("inf"),
+        f"dark drift: constant offset {a0:+.1f} counts "
+        f"({off_eff:+.2f} % at the median signal of {x_ref:.0f} counts)",
+        offset_counts=a0)
+    scale_eff = 100.0 * (s0 - 1.0)
+    if same_t:
+        add(CAUSE_LAMP, s0 - 1.0, "fraction", scale_eff, 100.0 * se[1],
+            f"lamp drift: uniform change {scale_eff:+.2f} % between the captures")
+    else:
+        th, tf = t_test * 1e6, t_ref * 1e6
+        den = s0 * th - tf
+        delta = (tf * th * (1.0 - s0) / den) if abs(den) > 1e-12 else float("nan")
+        add(CAUSE_TIME, s0 - 1.0, "fraction", scale_eff, 100.0 * se[1],
+            f"time offset: uniform factor {scale_eff:+.2f} % between t and t/2 "
+            f"(effective exposure offset ≈ {delta:+.0f} µs)",
+            time_offset_us=float(delta) if np.isfinite(delta) else None)
+    if nonlinear:
+        span = (x_hi - x_lo) / fs
+        nl_eff = 100.0 * c0 * span
+        add(CAUSE_NONLINEAR, c0, "per full scale", nl_eff, 100.0 * se[2] * span,
+            f"nonlinearity: ratio changes by {nl_eff:+.2f} % between "
+            f"{100 * x_lo / fs:.0f} % and {100 * x_hi / fs:.0f} % FS "
+            f"(detector response ≈ {-100.0 * c0 / max(t_ref / t_test - 1.0, 1e-9):+.2f} % "
+            f"per 100 % FS)",
+            response_pct_per_fs=float(-100.0 * c0 / max(t_ref / t_test - 1.0, 1e-9)))
+    sig = [c for c in causes if c["significant"]]
+    if sig:
+        sig.sort(key=lambda c: -abs(c["effect_pct"]))
+        out["dominant"] = sig[0]["cause"]
+        out["message"] = "; ".join(c["message"] for c in sig)
+    else:
+        out["message"] = "no significant systematic deviation"
+    out["causes"] = causes
+    out["fit"] = {"offset_counts": a0, "scale": s0, "nonlinear_c": c0,
+                  "se": [float(v) for v in se], "chi2_red": chi2,
+                  "n_pixels": int(np.count_nonzero(keep)), "x_ref_counts": x_ref,
+                  "x_range_counts": [x_lo, x_hi], "full_scale": fs,
+                  "lamp_scale": float(lamp_scale)}
+    return out
 
 
 def derive_relative_from_ratio(wl, s_known, c_new, c_known, *, valid_known=None,
@@ -610,7 +783,7 @@ def derive_relative_from_ratio(wl, s_known, c_new, c_known, *, valid_known=None,
 @dataclass(frozen=True)
 class PlausibilityLimits:
     min_coverage: float = 0.5        # valid / (device ∩ reference) pixels
-    max_gain_span: float = 40.0      # max/min gain over the valid pixels
+    max_gain_span: float = 200.0     # max/min gain: reported as a HINT only
     max_roughness: float = 0.05      # p95 |S / S_smoothed − 1|
     max_isolated_frac: float = 0.2   # share of valid pixels in short islands
     min_segment_nm: float = 5.0      # a valid run shorter than this is an island
@@ -693,12 +866,13 @@ def broadband_check(result: dict, limits: PlausibilityLimits | None = None) -> d
     Metrics (all reported, each with its limit):
       coverage            valid pixels / pixels where a calibration is expected
                           (masks['base']: device spec ∩ reference range)
-      gain_span           max/min gain over the valid pixels
+      gain_span           max/min gain over the valid pixels (HINT only)
       roughness           p95 of |S / S_smoothed − 1| (line sources: S jumps
                           within every line)
       isolated_frac       share of valid pixels in runs < min_segment_nm
       largest_segment_frac widest bridged segment / width of the base range
-    Returns {"pass", "failures": [str], "metrics", "limits", "segments_nm"}."""
+    Returns {"pass", "failures": [str], "hints": [str], "metrics", "limits",
+    "segments_nm"}."""
     lim = limits or PlausibilityLimits()
     wl = np.asarray(result["wl"], float)
     valid = np.asarray(result["valid"], bool)
@@ -728,11 +902,17 @@ def broadband_check(result: dict, limits: PlausibilityLimits | None = None) -> d
     gain_span = float(result.get("gain_span", float("nan")))
 
     failures = []
+    hints = []
     if coverage < lim.min_coverage:
         failures.append(f"coverage {coverage * 100:.0f} % < {lim.min_coverage * 100:.0f} % "
                         f"of the expected range")
+    # The gain span is a property of detector + source (a halogen lamp on a
+    # Si detector easily spans 50-100x between 380 and 950 nm); it does not
+    # identify a line source. Reported as a hint; line sources are caught by
+    # coverage, roughness and isolated peaks.
     if not np.isfinite(gain_span) or gain_span > lim.max_gain_span:
-        failures.append(f"gain span {gain_span:.1f}× > {lim.max_gain_span:.1f}×")
+        hints.append(f"gain span {gain_span:.1f}× > {lim.max_gain_span:.1f}× "
+                     f"(hint only: weak signal at the range ends)")
     if roughness > lim.max_roughness:
         failures.append(f"roughness {roughness * 100:.1f} % > {lim.max_roughness * 100:.1f} % "
                         f"(not a smooth broadband response)")
@@ -746,6 +926,7 @@ def broadband_check(result: dict, limits: PlausibilityLimits | None = None) -> d
     return {
         "pass": not failures,
         "failures": failures,
+        "hints": hints,
         "metrics": {"coverage": coverage, "gain_span": gain_span,
                     "roughness": roughness, "isolated_frac": isolated_frac,
                     "largest_segment_frac": largest_frac,
@@ -795,11 +976,13 @@ STATE_UNBOUND = "unbound"           # legacy / no serial known: not bound to a u
 
 
 def _registry_path() -> str:
+    import data_paths
     try:
         from app_config import Config
-        return Config.get("calibration_profiles_file", DEFAULT_REGISTRY_FILE)
+        return data_paths.resolve(Config.get("calibration_profiles_file",
+                                             DEFAULT_REGISTRY_FILE))
     except Exception:
-        return DEFAULT_REGISTRY_FILE
+        return data_paths.resolve(DEFAULT_REGISTRY_FILE)
 
 
 def _now_iso() -> str:
@@ -888,7 +1071,7 @@ def save_registry(reg: dict) -> None:
                 except Exception:
                     old = None
             if isinstance(old, dict) and old and old.get("schema") != SCHEMA_VERSION:
-                bak = os.path.splitext(path)[0] + ".v1.bak.json"
+                bak = os.path.splitext(path)[0] + ".v1.bak.json"   # data dir
                 if not os.path.exists(bak):
                     with open(bak, "w", encoding="utf-8") as fb:
                         json.dump(old, fb, indent=2)
@@ -957,7 +1140,27 @@ def _onoff(v: bool) -> str:
 
 
 def profile_status(p: dict, backend: str, serial: str | None,
-                   fingerprint: str | None, nl_active: bool | None = None) -> dict:
+                   fingerprint: str | None, nl_active: bool | None = None,
+                   linearity: dict | None = None) -> dict:
+    """See _profile_status. `linearity`: the unit's current linearity state
+    (calibration_linearity.runtime_for info); when the profile was made with a
+    different linearity correction a 'linearity_note' hint is added (the
+    profile is still applied — no confirmation needed)."""
+    st = _profile_status(p, backend, serial, fingerprint, nl_active)
+    if linearity is not None and st["state"] != STATE_OTHER_DEVICE:
+        try:
+            import calibration_linearity as cl
+            note = cl.linearity_mismatch((p.get("acquisition") or {}).get("linearity"),
+                                         linearity)
+        except Exception:                                   # noqa: BLE001
+            note = None
+        if note:
+            st["linearity_note"] = note
+    return st
+
+
+def _profile_status(p: dict, backend: str, serial: str | None,
+                    fingerprint: str | None, nl_active: bool | None = None) -> dict:
     """Is profile p usable on this device as it is calibrated right now?
 
     Besides device/serial binding, two conditions of the calibration must still
@@ -1434,6 +1637,10 @@ class CalibrationApplier:
         self.valid = valid
         self.factor = np.where(valid, factor, np.nan)
         self.valid_range_nm = (float(lo), float(hi))
+        # "Corrected counts" display: corrected rate × t_int, normalised so that
+        # in the pixel of maximum sensitivity (smallest factor) Corrected = Raw.
+        fv = self.factor[valid & np.isfinite(self.factor) & (self.factor > 0)]
+        self.counts_norm = float(1.0 / np.min(fv)) if fv.size else 1.0
 
     def apply(self, rate: np.ndarray) -> np.ndarray:
         return np.asarray(rate, float) * self.factor
@@ -1455,6 +1662,7 @@ class CalibrationRuntime:
         self.serial = None
         self.fingerprint = None
         self.nl_active = None
+        self.linearity = None            # calibration_linearity info of the unit
         self.wl = None
         self.device_default_table = None
         self.applier: CalibrationApplier | None = None
@@ -1473,6 +1681,7 @@ class CalibrationRuntime:
         except Exception:
             self.fingerprint = None
         self.nl_active = device_nl_active(backend)
+        self.linearity = getattr(backend, "linearity_info", None) if backend is not None else None
         if wl is None and backend is not None:
             wl = backend.wavelength_array
         self.wl = None if wl is None else np.asarray(wl, float)
@@ -1524,9 +1733,12 @@ class CalibrationRuntime:
             self.status = st
             return
         ps = profile_status(p, self.backend_name, self.serial, self.fingerprint,
-                            self.nl_active)
+                            self.nl_active, linearity=self.linearity)
         st.update(state=ps["state"], message=ps["message"], profile_id=p["id"],
                   type=p.get("type"))
+        if ps.get("linearity_note"):
+            st["linearity_note"] = ps["linearity_note"]
+            st["message"] = ((st.get("message") or "") + " " + ps["linearity_note"]).strip()
         if ps["state"] == STATE_OTHER_DEVICE:
             self.status = st
             return

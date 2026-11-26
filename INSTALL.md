@@ -14,6 +14,33 @@ ASEQ/Lasertack LR-2T, and the hardware-free Demo device).
 
 ---
 
+## Quick start (all platforms)
+
+The program is started from Python only; there is no packaged executable.
+
+```bash
+python -m venv venv
+# Windows: venv\Scripts\activate      macOS / Linux: source venv/bin/activate
+pip install -r requirements.txt
+python PS-2600A_Pro.py                       # desktop GUI
+python PS-2600A_Pro.py --headless            # web UI + REST API, no Qt
+python PS-2600A_Pro.py --data-dir PATH       # optional: use another data directory
+```
+
+`--data-dir` works with both modes (see [Data directory](#data-directory)).
+
+---
+
+
+> **Updating an existing installation (git):** up to this version
+> `calibration_profiles.json` and `spectrometer_config.json` were part of the
+> repository. A `git pull` removes them from the program folder. On the first
+> start the migration restores them automatically from the git history into the
+> data directory (logged as `restored_from_git` in `migration.log`). To be on the
+> safe side, copy both files (and `dark_spectra.json`, `reference_sources.json`)
+> out of the program folder before updating. Manual recovery:
+> `git show 91d533b:calibration_profiles.json > calibration_profiles.json`.
+
 ## Prerequisites — all platforms
 
 - Python 3.9+ (64-bit); 3.11+ recommended and fully tested.
@@ -99,7 +126,8 @@ Nothing to install. Always present in the back-end list.
    pip install -r requirements.txt
    ```
 3. Run the desktop GUI `python PS-2600A_Pro.py`, or the web client
-   `python web_server.py` (then open `http://localhost:8000`). The web client
+   `python PS-2600A_Pro.py --headless` (then open `http://localhost:8000`;
+   `python web_server.py` forwards to the same server). The web client
    does not require the WinUSB driver swap to start — but PASCO hardware still
    does, to be reachable.
 
@@ -171,7 +199,7 @@ then log out/in). Verify a connected PASCO with `lsusb | grep 0945` (Ocean:
 cd /path/to/project
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-python PS-2600A_Pro.py        # or: python web_server.py
+python PS-2600A_Pro.py        # or: python PS-2600A_Pro.py --headless
 ```
 
 **Raspberry Pi:** Pi OS (Bookworm) ships Python 3.11 which works. PyQt6 may take a
@@ -206,10 +234,72 @@ different data-capable cable/port.
 
 ---
 
+## Data directory
+
+Runtime data never lives in the program folder. Settings, calibration data and
+backups are kept per user:
+
+| OS | Default location |
+|---|---|
+| Windows | `%APPDATA%\PS-2600A\` |
+| macOS | `~/Library/Application Support/PS-2600A/` |
+| Linux | `$XDG_CONFIG_HOME/ps-2600a/` (default `~/.config/ps-2600a/`) |
+
+**Override** (highest priority first): the command-line option
+`--data-dir PATH`, then the environment variable `PS2600A_DATA_DIR`. Both work
+for the desktop app and for `--headless`.
+
+**What lives there:**
+
+- `spectrometer_config.json` — settings (created with defaults on first start)
+- `calibration_profiles.json` — spectral calibration profiles (and the backup
+  `calibration_profiles.v1.bak.json` of the old format)
+- `dark_spectra.json` — stored per-pixel dark spectra per unit
+- `reference_sources.json` — lamp library
+- `linearity_profiles.json` — detector linearity records per unit (serial number)
+- `protocols/` — calibration and linearity protocols (PDF/CSV)
+- `backup/` — backups made by the migration
+- `migration.json` (marker) and `migration.log`
+
+**First-start migration.** If the data directory has no `migration.json`, the
+application looks for runtime files in the program folder (the files above,
+`*.bak.json`, `old_calib_data_*.json`, earlier `calib_*` / `linearity_*`
+protocols) and **copies** them (never moves) into the data directory. An
+existing file in the data directory is never overwritten; the program-folder
+version is then kept next to it as `<name>.from-program-dir-<timestamp>.json`.
+Every source file is also copied into `backup/migration-<timestamp>/`. The result
+is recorded in `migration.json` and appended to `migration.log`. The originals
+in the program folder stay untouched and are no longer used. Set
+`PS2600A_SKIP_MIGRATION=1` to skip the migration.
+
+**Templates.** The repository contains only `*.example.json` templates (empty
+or default files); the real data files are not part of the repository and are
+listed in `.gitignore`.
+
+**Export folder.** Exports (CSV/PDF/PNG) default to `<Documents>/PS-2600A`
+(the user's Documents folder), not to the program folder. It can be changed in
+the settings (`export_dir`).
+
+---
+
 ## First launch
 
-On first launch the app creates `spectrometer_config.json` (defaults) and
-generates `reference_spectra.csv` (the reference-spectrum library). Delete
-`reference_spectra.csv` to regenerate it after an upgrade. Configuration is saved
-automatically as you change settings; a corrupt config file falls back to
-defaults rather than crashing.
+On first launch the app creates the data directory (see above), migrates
+existing runtime files from the program folder once, writes
+`spectrometer_config.json` (defaults) and generates `reference_spectra.csv`
+(the reference-spectrum library, program folder). Delete `reference_spectra.csv`
+to regenerate it after an upgrade. Configuration is saved automatically as you
+change settings; a corrupt config file falls back to defaults rather than
+crashing.
+
+## What is new in this version
+
+- **Display modes** (Raw ADC, Corrected counts, Normalised, Count rate,
+  Absolute) for scope and heatmap; spectrum and measurement exports and all evaluations use the corrected data; the time-lapse (heatmap, its export and autosave) records the display representation.
+- **Spectral calibration**: darks before and after (time-interpolated),
+  per-pixel checks with cause analysis, verification against the reference
+  file with scope overlay.
+- **Linearity calibration** per unit (LR-2T, PASCO); Ocean HDX: check only.
+- **Data directory** with one-time migration (above).
+
+Details: [`docs/manual.pdf`](docs/manual.pdf).

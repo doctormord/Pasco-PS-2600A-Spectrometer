@@ -57,3 +57,8 @@ def test_server_runner_import_qt_free():
                     reason="mcp_server/server.py not present")
 def test_mcp_server_import_qt_free():
     _run("import mcp_server.server")
+
+
+def test_core_calibration_modules_qt_free():
+    _run("import calibration_linearity\nimport calibration_workflow\n"
+         "import calibration_capture\nimport processing")
