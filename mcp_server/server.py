@@ -461,7 +461,7 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
           "averaged; dark: auto (like live view) | stored (stored dark at this t_int) | capture "
           "(capture new dark first; may need a user step) | none (raw counts, no calibration); "
           "profile: calibration selection for this measurement only. Returns a compact result: "
-          "acquisition (peak_frac should be 0.3-0.9, n_saturated must be 0), colour metrics "
+          "acquisition (peak_frac should be above ~0.3 and below the configured saturation_warn_frac, default 0.90; n_saturated must be 0), colour metrics "
           "(cct, duv, x, y, Ra, R9, lux, peak/dominant/centroid nm, fwhm), top peaks, warnings, "
           "a 32-point preview, and csv_path of the full spectrum. If the job waits for a user "
           "step, a job + instruction is returned instead - then use continue_job.")

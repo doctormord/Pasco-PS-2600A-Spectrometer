@@ -489,19 +489,56 @@ def normalise(values: np.ndarray) -> np.ndarray:
     return v / mx if mx > 0 else v
 
 
-def exposure_level(raw_averaged, *, full_scale: float, saturation_level: float) -> dict:
+DEFAULT_SATURATION_WARN_FRAC = 0.90
+EXPOSURE_OK, EXPOSURE_WARN, EXPOSURE_DANGER = "ok", "warn", "danger"
+
+
+def saturation_warn_frac(value=None) -> float:
+    """THE saturation warning threshold (fraction of full scale) for the
+    exposure meter (desktop + web) and the calibration runs: config key
+    'saturation_warn_frac' (default 0.90), clamped to 0.5 … 1.0."""
+    if value is None:
+        try:
+            from app_config import Config
+            value = Config.get("saturation_warn_frac", DEFAULT_SATURATION_WARN_FRAC)
+        except Exception:                                   # noqa: BLE001
+            value = DEFAULT_SATURATION_WARN_FRAC
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = DEFAULT_SATURATION_WARN_FRAC
+    if not np.isfinite(v):
+        v = DEFAULT_SATURATION_WARN_FRAC
+    return float(min(1.0, max(0.5, v)))
+
+
+def exposure_level(raw_averaged, *, full_scale: float, saturation_level: float,
+                   warn_frac: float | None = None) -> dict:
     """Detector drive level in ADC (independent of the display mode):
-    peak counts, % of full scale, saturated pixel count."""
+    peak counts, % of full scale, saturated pixel count, and the meter state
+    shared by desktop and web: 'danger' when a pixel reached the saturation
+    level, 'warn' when the peak reached saturation_warn_frac of full scale,
+    else 'ok'."""
     r = np.asarray(raw_averaged, float)
     fin = r[np.isfinite(r)]
     peak = float(np.max(fin)) if fin.size else 0.0
     fs = float(full_scale) if full_scale else 0.0
+    wf = saturation_warn_frac(warn_frac)
+    n_sat = int(np.count_nonzero(fin >= float(saturation_level))) if saturation_level else 0
+    saturated = bool(saturation_level and peak >= float(saturation_level))
+    pct = (100.0 * peak / fs) if fs > 0 else None
+    if saturated or n_sat:
+        state = EXPOSURE_DANGER
+    elif pct is not None and pct >= 100.0 * wf:
+        state = EXPOSURE_WARN
+    else:
+        state = EXPOSURE_OK
     return {"peak_counts": peak,
-            "peak_pct_fs": (100.0 * peak / fs) if fs > 0 else None,
+            "peak_pct_fs": pct,
             "full_scale": fs, "saturation_level": float(saturation_level),
-            "n_saturated": int(np.count_nonzero(fin >= float(saturation_level)))
-            if saturation_level else 0,
-            "saturated": bool(saturation_level and peak >= float(saturation_level))}
+            "n_saturated": n_sat,
+            "saturated": saturated,
+            "warn_frac": wf, "warn_pct_fs": 100.0 * wf, "state": state}
 
 
 def format_value(v, unit: str) -> str:
