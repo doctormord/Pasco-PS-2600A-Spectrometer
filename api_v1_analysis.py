@@ -116,12 +116,16 @@ def register(router: APIRouter, ctx: V1Context) -> None:
             wl, values, unit, m = resolve_spectrum(engine, body)
             if body.lux_calibration is not None:
                 spd, _ = processing.photometric_inputs(values, unit)
-                met = cs.measure_all(wl, spd, lux_calibration=float(body.lux_calibration))
+                met = cs.measure_all(wl, spd, lux_calibration=float(body.lux_calibration),
+                                     quantity=processing.photometric_quantity(unit))
             else:
                 met = engine.color_metrics_for(wl, values, unit)
             met = dict(met)
             met.pop("tcs_swatches", None)
-            return {"source": _source(body, m), "unit": unit, "metrics": met}
+            q = processing.photometric_quantity(unit)
+            return {"source": _source(body, m), "unit": unit, "quantity": q,
+                    "luminance_cd_m2": met.get("luminance") if q == "radiance" else None,
+                    "metrics": met}
         return json_safe(await ctx.call(work))
 
     @router.post("/analyze/peaks", tags=["analysis"], summary="Peak detection")
@@ -198,17 +202,20 @@ def register(router: APIRouter, ctx: V1Context) -> None:
             wl, values, unit, m = resolve_spectrum(engine, sel)
             spd, lc = processing.photometric_inputs(values, unit)
             lux = float(lc) if lc is not None else _lux_cal(engine, unit)
+            quantity = processing.photometric_quantity(unit)
             peak = float(np.max(spd)) if spd.size else None
             meta = engine.report_meta(peak_adc=peak if unit == "counts" else None)
             if m is not None:
                 meta = _meta_for_measurement(m, meta)
             meta["Language"] = body.language
             if fmt == "csv":
-                data = _rows_csv(cs.color_report_rows(wl, spd, lux)).encode("utf-8")
+                data = _rows_csv(cs.color_report_rows(wl, spd, lux,
+                                                      quantity=quantity)).encode("utf-8")
                 return data, "csv", meta, wl
             buf = io.BytesIO()
             try:
-                cs.render_color_report(buf, wl, spd, fmt=fmt, lux_calibration=lux, meta=meta)
+                cs.render_color_report(buf, wl, spd, fmt=fmt, lux_calibration=lux, meta=meta,
+                                       quantity=quantity)
             except ImportError:
                 raise ApiError(503, "unavailable", "matplotlib is not installed on the server.")
             return buf.getvalue(), fmt, meta, wl

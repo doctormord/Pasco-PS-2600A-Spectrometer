@@ -33,6 +33,25 @@ PREFIX = "/api/v1"
 GROUPS = ("api_v1_analysis", "api_v1_calibration", "api_v1_display", "api_v1_wavelength")
 
 
+def _luminance_of(engine, ev):
+    """Luminance [cd/m²] of a radiance frame (None for irradiance units)."""
+    if processing.photometric_quantity(ev.unit) != "radiance":
+        return None
+    c = ev.color if ev.color_fresh and ev.color else None
+    try:
+        if c is not None:
+            return c.get("luminance")
+        # only the photometric integral (no full colour / CRI computation per
+        # request): the same inputs as the engine's colour metrics
+        import color_science as cs
+        spd, cal = processing.photometric_inputs(ev.pixels, ev.unit)
+        v = cs.luminance_cd_m2(np.asarray(ev.wavelengths, float), spd,
+                               1.0 if cal is None else cal)
+        return float(v) if np.isfinite(v) else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 @dataclass
 class V1Context:
     """What group modules need."""
@@ -312,6 +331,9 @@ def add_v1_routes(app: FastAPI, engine: Engine, settings: ServerSettings,
             "timestamp": datetime.fromtimestamp(ev.timestamp).astimezone().isoformat(
                 timespec="milliseconds"),
             "unit": ev.unit, "unit_label": processing.unit_label(ev.unit),
+            "quantity": getattr(ev, "quantity", None)
+            or processing.photometric_quantity(ev.unit),
+            "luminance_cd_m2": _luminance_of(engine, ev),
             "integration_us": ev.integration_us, "fps": ev.fps,
             "n_points": int(wl.size), "downsample": step,
             "wavelengths": [round(float(x), 3) for x in wl],

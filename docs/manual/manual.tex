@@ -1071,10 +1071,167 @@ $K$, validity, repeat and half-$t_{\mathrm{int}}$ rates. Default file name:
         uncertainty in the blue.
   \item Bare fibre: for spatially or angularly inhomogeneous sources the spectrum
         depends on alignment (not a calibration error).
-  \item Absolute only with a defined entrance area; no luminous or radiant flux
-        (integrating sphere) and no radiance.
+  \item Absolute irradiance only with a defined entrance area (CC, sphere as
+        collector); absolute radiance only with a bare fibre or an objective in
+        front of an extended source (\S\ref{sec:radiance}); no luminous or radiant
+        flux.
   \item $S$ and $K$ are valid only for the wavelength calibration of their
         fingerprint and for the optics configuration and unit they were made on.
+\end{itemize}
+
+% =====================================================================
+\section{Spectral radiance}\label{sec:radiance}
+Optics that look at an extended source with a limited field of view --- a
+microscope objective, a bare fibre in front of a luminous surface --- measure
+\emph{radiance} $L(\lambda)$, not irradiance. The absolute radiance calibration
+is traced back to the existing absolute irradiance calibration with the cosine
+corrector (CC): an integrating sphere with a Lambertian exit port is
+characterised with the CC and then serves as a radiance reference.
+
+\subsection{Measurement quantities}
+The measurement quantity is a property of every reference source and profile
+(field \code{quantity}):
+\begin{longtable}{@{}p{2.6cm}p{5.4cm}p{6.2cm}@{}}
+\toprule \textbf{Quantity} & \textbf{Units} & \textbf{Photometric value}\\ \midrule\endhead
+\code{irradiance} & W/(m$^2$\,nm), mW/(m$^2$\,nm), $\mu$W/(cm$^2$\,nm) &
+  illuminance $E_v = 683\,\mathrm{lm/W}\int E\,V\,\mathrm d\lambda$ [lx]\\
+\code{radiance} & W/(m$^2$\,sr\,nm), mW/(m$^2$\,sr\,nm), $\mu$W/(cm$^2$\,sr\,nm) &
+  luminance $L_v = 683\,\mathrm{lm/W}\int L\,V\,\mathrm d\lambda$ [cd/m$^2$]\\
+\bottomrule
+\end{longtable}
+Units convert only within the same quantity. Profiles and library sources
+stored before this field existed are irradiance (migration on load; the
+profile store is rewritten with \code{quantity} on the next save). The display
+unit setting (\key{irradiance\_unit}) selects the prefix; a radiance profile
+uses the radiance unit with the same prefix.
+
+\paragraph{Admissible input optics.}
+\begin{longtable}{@{}p{4.2cm}p{10.0cm}@{}}
+\toprule \textbf{Type / quantity} & \textbf{Input optics}\\ \midrule\endhead
+relative (either quantity) & CC, bare, sphere, objective\\
+absolute irradiance & CC, sphere (as collector)\\
+absolute radiance & bare, objective\\
+\bottomrule
+\end{longtable}
+The same rule (\code{calibration\_profiles.admissible}) applies in the desktop
+wizard, the web dialog, \code{/api/v1} and the MCP tools.
+
+\subsection{The sphere as a radiance reference}
+A Lambertian disk of radius $r$ and uniform radiance $L$ produces on its axis,
+at the distance $d$ from the disk plane, the irradiance
+\[
+  E(d) = \pi L\,\frac{r^2}{r^2+d^2}
+  \qquad\Longrightarrow\qquad
+  L = E\,\frac{r^2+d^2}{\pi r^2}.
+\]
+The plane of the disk is the knife edge of the port aperture. For the printed
+sphere (exit port diameter 14.00\,mm, knife-edge plane 11.00\,mm below the top
+surface of the housing) the distance is
+\[
+  d_i = a + h_i + c ,
+\]
+with $a$ = knife-edge plane $\to$ housing top (measured, default 11.00\,mm),
+$h_i$ = housing top $\to$ CC support surface at position $i$ (spacers) and
+$c$ = CC reference plane relative to its support surface (default 0; positive
+= farther from the port). Radius and depth are measured at the part and
+entered; their standard uncertainties $u(r)$, $u(d)$ enter the uncertainty
+budget.
+
+\paragraph{Run.}
+Prerequisite: an \emph{active} absolute irradiance profile with input CC for the
+connected unit, valid with the current wavelength calibration and
+linearisation; otherwise the run is refused with a message. Sequence:
+CC on the port at the smallest distance $\to$ integration time (auto exposure
+at this, the brightest, position, kept for the whole run) $\to$ dark before
+$\to$ $E(\lambda)$ at $N\ge 3$ distances (the distance $h_i$ is entered for
+every position) $\to$ repeat of the first distance (source drift) $\to$ dark
+after. Every light capture is corrected with the dark interpolated in time;
+$E$ is the count rate times the CC profile's $K$, masked outside its valid range
+and below the SNR limit. The first position uses the mean of its capture and
+the repeat (mid-run level).
+
+\paragraph{Evaluation per wavelength.}
+\begin{itemize}
+  \item $L_i = E_i\,(r^2+d_i^2)/(\pi r^2)$ for every distance.
+  \item Fit of $E(d) = \pi L\,r^2/(r^2+(d+d_0)^2)$ with $L(\lambda)$ free per
+        wavelength and a common offset $d_0$ (relative residuals, i.e.\ in
+        $\ln E$), overall and per 50-nm band. $d_0$ absorbs a constant error of
+        the reference planes. If $|d_0|$ is below \key{sphere\_d0\_max\_mm}
+        (default 1.0\,mm) the fitted $L$ is used, else the mean of $L_i$
+        (nominal geometry) and a warning.
+  \item Consistency: relative spread (standard deviation / mean) of $L_i$ over
+        the distances --- with the geometry actually used ($d_i+d_0$) --- per
+        50-nm band and overall; the check passes when all values are at most
+        \key{sphere\_consistency\_max\_pct} (default 2\,\%). A clearly
+        non-uniform or non-Lambertian port, a wrong radius or wrong distances
+        show up here. A \emph{slightly} non-Lambertian port
+        ($L\propto\cos^n\theta$ with small $n$) cannot be told apart from an
+        offset of the reference planes on the axis: $d_0$ absorbs it and the
+        spread stays small. Therefore $d_0$ always enters the uncertainty
+        (below), and a warning is given when $|d_0|$ exceeds twice the
+        distance uncertainty $u(d)$.
+  \item Drift: p95 of $|E_{\mathrm{repeat}}/E_1-1|$, the ratio smoothed over
+        the band width \key{sphere\_band\_nm} (a source drift is spectrally
+        smooth, per-pixel noise is not), against
+        \key{sphere\_drift\_max\_pct} (default 1\,\%).
+\end{itemize}
+
+\paragraph{Uncertainty (simplified GUM, $k=1$).}
+\[
+  \frac{u^2(L)}{L^2} = (c_r\,u_r)^2 + (c_d\,u_d)^2 + \frac{s^2}{N}
+     + \frac{\delta_{\mathrm{drift}}^2}{3} + u_{\mathrm{CC}}^2
+     + \frac{(c_d\,d_0)^2}{3} ,
+\]
+\[
+  c_r = \overline{\frac{2d_i^2}{r\,(r^2+d_i^2)}}, \qquad
+  c_d = \overline{\frac{2d_i}{r^2+d_i^2}},
+\]
+with $s$ the relative spread of $L_i$ at this wavelength, $\delta_{\mathrm{drift}}$
+the mean relative drift (rectangular distribution) and $u_{\mathrm{CC}}$ the
+relative standard uncertainty of the CC calibration (input, default
+\key{sphere\_cc\_uncertainty\_pct} = 3\,\%). The inputs are treated as
+uncorrelated. The fitted offset is carried as a rectangular contribution of
+half-width $c_d\,|d_0|$; for a $\cos^n$ port this covers the bias of $L$ at
+$k=1$ (verified for $n\le 1$ in the tests). The cosine error of the CC at the
+irradiation angles of the run (up to $\arctan(r/d)$, about 32$^\circ$ at
+$d=11$\,mm) is part of $u_{\mathrm{CC}}$ and not modelled separately. The
+protocol lists every component, the combined $u$ per band and $U=2u$.
+
+\paragraph{Result.}
+A library source with \code{quantity = radiance}, unit $\mu$W/(cm$^2$\,sr\,nm),
+valid range = the largest contiguous range inside the CC profile's valid range
+in which $E>0$ at every distance, smoothed like a calibration
+(\key{calibration\_smooth\_px}). Its metadata hold the geometry, date, device,
+CC profile id/version, consistency, drift and uncertainty; the per-point
+standard uncertainty is stored with the values. Protocol PDF and CSV.
+
+\subsection{Absolute radiance calibration}
+The spectral calibration wizard accepts radiance sources: type absolute,
+input bare or objective, reference = the characterised sphere. Result: profile
+\code{absolute}, \code{quantity = radiance},
+$K$ in $\mu$W/(cm$^2$\,sr\,nm) per count/s (plus the derived relative profile).
+\textbf{The source must fill the field of view of the optics completely and
+uniformly}: sphere port under the objective, focus on the port plane; a bare
+fibre close above the port with its acceptance cone inside the port. The
+derivation (\S\ref{sec:speccal-derive}) accepts absolute radiance profiles as
+the known optics and derives relative profiles with the same quantity.
+
+\subsection{Measuring radiance}
+With an active radiance profile the display, exports, \code{/api/v1} and MCP
+report the quantity and unit; the photometric value is the luminance in cd/m$^2$
+instead of the illuminance in lx (desktop Color tab and web).
+
+\subsection{Limits}
+\begin{itemize}
+  \item The disk formula assumes a uniform Lambertian port; the consistency
+        check reveals deviations but does not correct them.
+  \item The radiance scale inherits the CC calibration (reference lamp,
+        cosine response of the CC); its uncertainty is an input, not measured.
+  \item The field of view of the radiance optic must lie entirely inside the
+        uniform part of the port; vignetting or a field of view larger than the
+        port gives too low values.
+  \item Polarisation and the angular distribution inside the acceptance cone
+        of the radiance optic are not modelled.
 \end{itemize}
 
 % =====================================================================

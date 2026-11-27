@@ -102,11 +102,14 @@ Restart the app afterwards. If `python` is not on the PATH, give the full path o
 | `measure` | Single measurement; compact result + CSV of the full spectrum |
 | `start_series` / `job_status` / `cancel_job` / `continue_job` | Series and job control, including user steps |
 | `get_spectrum` | Spectrum summary, thinned points (max 512), optional full CSV |
-| `analyze_color` | CCT, Duv, CRI, lux, wavelengths |
+| `analyze_color` | CCT, Duv, CRI, lux (irradiance) or `luminance_cd_m2` (radiance; `quantity` says which), wavelengths |
 | `find_peaks` | Peak detection |
 | `analyze_filter` | Transmission of a filter (reference vs. sample) |
 | `list_profiles` / `select_profile` / `calibration_status` | Calibration profiles |
-| `list_references` / `start_calibration` | Calibration run (job with user steps) |
+| `list_references` / `start_calibration` | Calibration run (job with user steps); `list_references` shows `quantity` (irradiance / radiance) and a short `meta`; `optics_input` CC / sphere / bare / objective, an inadmissible combination is refused with the reason (422) |
+| `start_sphere_characterization` | Integrating sphere as radiance reference with the CC (job with user steps `mount`, `cover`, `uncover`, `position` per height, `repeat`); result `status` saved / not_saved_checks_failed, `source_id`, d0, consistency, drift, uncertainty |
+
+`status`, `calibration_status`, `get_spectrum` and `measure` report `quantity` (`irradiance`: unit `.../nm`, lux; `radiance`: unit `.../sr/nm`, `luminance_cd_m2`). Job results of calibration runs use the statuses `saved`, `saved_implausible`, `not_saved_implausible`, `not_saved_checks_failed` (a derivation also `drift_check_failed`).
 | `export_measurement` | Measurement as CSV / JSON file |
 | `create_report` | Colour / filter / measurement report (PDF, PNG, CSV) |
 

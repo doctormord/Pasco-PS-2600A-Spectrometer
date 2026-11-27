@@ -42,6 +42,7 @@ const State = {
                              // (null = none); outside it is shaded grey.
   unit: 'counts',            // unit of msg.intensities (from the frame)
   unitLabel: 'counts',
+  quantity: 'irradiance',    // measurement quantity of the data (lx vs. cd/m²)
   dispUnit: 'counts',        // unit of the plotted `display` values
   dispUnitLabel: 'counts',
   displayModeEff: null,      // effective display mode of the last frame
@@ -244,6 +245,7 @@ function handleFrame(msg) {
   State.validRange = Array.isArray(msg.valid_range_nm) ? msg.valid_range_nm : null;
   State.validSegments = Array.isArray(msg.valid_segments_nm) ? msg.valid_segments_nm : null;
   State.luxCal = msg.lux_calibration || null;
+  State.quantity = msg.quantity || 'irradiance';
   if (msg.unit !== undefined && (msg.unit !== State.unit || msg.unit_label !== State.unitLabel)) {
     State.unit = msg.unit;
     State.unitLabel = msg.unit_label || msg.unit;
@@ -1334,7 +1336,8 @@ function saveColorReport(fmt) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ format: fmt,
       wavelengths: Array.from(wl), intensities: Array.from(ys),
-      lux_calibration: State.luxCal || 0 }),
+      lux_calibration: State.luxCal || 0, quantity: State.quantity || 'irradiance',
+      unit: (State.lastFrame && State.lastFrame.unit) || null }),
   })
     .then(r => r.ok ? r.blob() : Promise.reject(r.status))
     .then(blob => {
@@ -1370,8 +1373,17 @@ function updateColorTab(c) {
   $('#c-fwhm').innerHTML  = `${f('fwhm_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
   $('#c-cent').innerHTML  = `${f('centroid_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
   $('#c-sp').textContent  = f('sp_ratio', v => v.toFixed(3));
-  $('#c-lux').innerHTML   = `${f('lux', v => fmtLux(v))}<span class="unit"> lx</span>`;
-  $('#c-fc').innerHTML    = `${f('fc', v => fmtLux(v))}<span class="unit"> fc</span>`;
+  // radiance (unit .../sr/nm): luminance in cd/m² instead of illuminance; no foot-candles
+  const rad = State.quantity === 'radiance';
+  $('#c-lux-lbl').textContent = rad ? 'Luminance (cd/m²)' : 'Illuminance (lx)';
+  $('#c-lux').parentElement.title = rad
+    ? 'Photopic luminance of the measured radiance. “—” = not available.'
+    : 'Photopic illuminance. Calibrated only with an absolute profile or a Radiometric factor; otherwise an uncalibrated relative value. “—” = not available.';
+  $('#c-lux').innerHTML   = rad
+    ? `${f('luminance', v => fmtLux(v))}<span class="unit"> cd/m²</span>`
+    : `${f('lux', v => fmtLux(v))}<span class="unit"> lx</span>`;
+  $('#c-fc').innerHTML    = rad ? '—<span class="unit"> fc</span>'
+    : `${f('fc', v => fmtLux(v))}<span class="unit"> fc</span>`;
   $('#c-central').innerHTML = `${f('central_nm', v => v.toFixed(1))}<span class="unit"> nm</span>`;
   $('#c-u60').textContent = f('u60', v => v.toFixed(4));
   $('#c-v60').textContent = f('v60', v => v.toFixed(4));
@@ -2184,6 +2196,11 @@ const Cal = (() => {
       txt += ' ⚠ Saved although the plausibility check failed.';
       if (el.className.indexOf('wl_changed') < 0) el.className += ' wl_changed';
     }
+    if (st.legacy_note) {
+      // the note is already part of st.message; only the warning colour is added
+      if (txt.indexOf(st.legacy_note) < 0) txt += ' ' + st.legacy_note;
+      if (el.className.indexOf('wl_changed') < 0) el.className += ' wl_changed';
+    }
     if (st.dark_source === 'stored') txt += ' Dark: stored (this t_int).';
     else if (st.dark_source === 'stored_model') txt += ' Dark: per-pixel model b+r·t.';
     if (st.dark_warning) {
@@ -2629,6 +2646,8 @@ const Jobs = (() => {
     cover: 'Cover the light path', uncover: 'Uncover the light path',
     mount_known: 'Mount the known optics', swap_optics: 'Mount the new optics',
     swap_back: 'Mount the known optics again',
+    mount: 'Mount the cosine corrector on the sphere port',
+    position: 'Set the next distance', repeat: 'Repeat the first distance',
   };
 
   function renderBar() {
@@ -3009,15 +3028,19 @@ const CalMgr = (() => {
     if (note) note.textContent = profiles && profiles.device
       ? `${profiles.device}${profiles.serial ? ' · ' + profiles.serial : ''}` : 'no device';
     fill('cal-table',
-      ['', 'Profile', 'State', 'Type', 'Unit', 'Valid range', 'Created', 'Plausible'],
+      ['', 'Profile', 'State', 'Type', 'Quantity', 'Unit', 'Valid range', 'Created', 'Plausible'],
       items.map((it) => {
         const warn = it.state === 'wl_changed' || it.state === 'nl_changed' || it.state === 'error';
+        const lr = it.legacy_valid_range_nm;
+        const state = (it.state || '') + (it.legacy && lr && lr.length === 2
+          ? ` · legacy, masked outside ${Math.round(lr[0])}–${Math.round(lr[1])} nm` : '');
         const pl = it.type == null ? '—' : (it.plausible === false ? '<span class="warn">⚠ no</span>' : 'yes');
         return `<tr class="${it.value === sel ? 'active' : ''}">` +
           `<td>${it.value === sel ? '●' : ''}</td>` +
           `<td title="${esc(it.message || '')}">${esc(it.label)}</td>` +
-          `<td class="${warn ? 'warn' : ''}">${esc(it.state)}</td>` +
-          `<td>${esc(it.type || '—')}</td><td>${esc(it.unit || '—')}</td>` +
+          `<td class="${warn || it.legacy ? 'warn' : ''}">${esc(state)}</td>` +
+          `<td>${esc(it.type || '—')}</td>` +
+          `<td>${esc(it.type ? (it.quantity || '—') : '—')}</td><td>${esc(it.unit || '—')}</td>` +
           `<td>${esc(rangeText(it.valid_range_nm, it.valid_segments_nm))}</td>` +
           `<td>${esc(fmtDate(it.created))}</td><td>${pl}</td></tr>`;
       }), 'No profiles (connect a device).');
@@ -3030,9 +3053,10 @@ const CalMgr = (() => {
   }
 
   function renderRefs() {
-    fill('ref-table', ['Name', 'Serial', 'Unit', 'Range', 'Input', 'Built-in', ''],
+    fill('ref-table', ['Name', 'Serial', 'Quantity', 'Unit', 'Range', 'Input', 'Built-in', ''],
       refs.map((s) => `<tr><td>${esc(s.name)}</td><td>${esc(s.serial || '—')}</td>` +
-        `<td>${esc(s.unit || '—')}</td>` +
+        `<td>${esc(s.quantity || 'irradiance')}</td>` +
+        `<td>${esc(s.unit_label || s.unit || '—')}</td>` +
         `<td>${fmtNm(s.valid_min_nm)}–${fmtNm(s.valid_max_nm)} nm</td>` +
         `<td>${esc(s.input_optic || '—')}</td><td>${s.builtin ? 'yes' : 'no'}</td>` +
         `<td>${s.builtin ? '' : `<button class="row-btn" data-ref-del="${esc(s.id)}" ` +
@@ -3084,9 +3108,9 @@ const CalMgr = (() => {
     const num = (id) => { const v = $(id).value; return v === '' ? null : Number(v); };
     const name = ($('#ref-name').value || '').trim() || f.name.replace(/\.[^.]+$/, '');
     const body = {
-      name, serial: $('#ref-serial').value.trim(), unit: $('#ref-unit').value.trim() || 'uW/cm2/nm',
+      name, serial: $('#ref-serial').value.trim(), unit: $('#ref-unit').value || 'uW/cm2/nm',
       valid_min_nm: num('#ref-min'), valid_max_nm: num('#ref-max'),
-      input_optic: $('#ref-input').value.trim(), notes: $('#ref-notes').value.trim(),
+      input_optic: $('#ref-input').value, notes: $('#ref-notes').value.trim(),
       filename: f.name, content,
     };
     const { r, j } = await apiPost('/api/v1/calibration/references', body);
@@ -3127,8 +3151,9 @@ const CalMgr = (() => {
 
 // ── Calibration run / derivation dialog (P-10) ───────────────
 const CalRun = (() => {
-  let mode = 'lamp';            // 'lamp' | 'derive'
+  let mode = 'lamp';            // 'lamp' | 'derive' | 'sphere'
   let refs = [], profiles = null;
+  let adm = null;               // /calibration/admissibility (one rule set, server side)
   let jobId = null, running = false, order = [], lastJob = null;
 
   const PLAN = {
@@ -3137,6 +3162,8 @@ const CalRun = (() => {
     derive: ['mount_known', 'integration_known', 'dark_known', 'light_known', 'swap_optics',
              'integration_new', 'dark_new', 'light_new', 'dark_new_after', 'swap_back',
              'repeat_known', 'dark_known_after', 'compute', 'save'],
+    sphere: ['mount', 'integration', 'dark_before', 'position', 'repeat', 'dark_after',
+             'compute', 'save', 'protocol'],
   };
   const LABELS = {
     wavelength_check: 'Wavelength check', integration: 'Integration time',
@@ -3152,6 +3179,9 @@ const CalRun = (() => {
     dark_new_after: 'Dark after (new optics)', swap_back: 'Mount the known optics again',
     repeat_known: 'Repeat with the known optics (source drift)',
     dark_known_after: 'Dark after (known optics)',
+    mount: 'Mount the CC on the sphere port', dark_before: 'Dark before',
+    position: 'Irradiance at each distance', repeat: 'Repeat of the first distance (source drift)',
+    dark_after: 'Dark after',
   };
   const label = (s) => LABELS[s] || String(s).replace(/_/g, ' ');
 
@@ -3165,9 +3195,48 @@ const CalRun = (() => {
     for (const s of refs) {
       const rng = (s.valid_min_nm != null && s.valid_max_nm != null)
         ? ` · ${Number(s.valid_min_nm).toFixed(0)}–${Number(s.valid_max_nm).toFixed(0)} nm` : '';
-      sel.appendChild(new Option(`${s.name}${s.serial ? ' · ' + s.serial : ''}${rng}`, s.id));
+      const q = s.quantity === 'radiance' ? ' · radiance' : '';
+      sel.appendChild(new Option(`${s.name}${s.serial ? ' · ' + s.serial : ''}${q}${rng}`, s.id));
     }
     if (keep) sel.value = keep;
+    updateAdm();
+  }
+
+  async function loadAdm() {
+    const { r, j } = await apiJson('/api/v1/calibration/admissibility');
+    if (r.ok && j && Array.isArray(j.matrix)) adm = j;
+    updateAdm();
+  }
+  function admissible(kind, quantity, input) {
+    const row = ((adm && adm.matrix) || []).find(
+      (x) => x.type === kind && x.quantity === quantity && x.input === input);
+    return row ? { allowed: !!row.allowed, reason: row.reason || '' } : { allowed: true, reason: '' };
+  }
+  // Lamp run: disable the calibration types that are not allowed for the chosen
+  // reference quantity and input optic (with the reason), show the radiance hint.
+  function updateAdm() {
+    const kind = $('#cr-kind'), note = $('#cr-adm-note'), hint = $('#cr-radiance-hint');
+    if (!kind || !note || !hint) return;
+    const ref = refs.find((x) => x.id === ($('#cr-ref') && $('#cr-ref').value));
+    const q = (ref && ref.quantity) || 'irradiance';
+    const input = $('#cr-input').value;
+    const reasons = [];
+    for (const o of kind.options) {
+      const v = admissible(o.value, q, input);
+      o.disabled = !v.allowed;
+      o.title = v.allowed ? '' : v.reason;
+      if (!v.allowed && v.reason) reasons.push(v.reason);
+    }
+    if (kind.selectedOptions[0] && kind.selectedOptions[0].disabled) {
+      const ok = [...kind.options].find((o) => !o.disabled);
+      if (ok) kind.value = ok.value;
+    }
+    note.textContent = reasons.join(' ');
+    note.hidden = mode !== 'lamp' || !reasons.length;
+    hint.textContent = (adm && adm.radiance_source_hint) || '';
+    hint.hidden = mode !== 'lamp' || q !== 'radiance' || !hint.textContent;
+    $('#cr-sphere-hint').textContent = (adm && adm.sphere_source_hint) || '';
+    $('#cr-sphere-hint').hidden = mode !== 'sphere' || !$('#cr-sphere-hint').textContent;
   }
   function fillKnown() {
     const sel = $('#cr-known'); if (!sel) return;
@@ -3184,15 +3253,21 @@ const CalRun = (() => {
     mode = m;
     $('#cr-mode-lamp').classList.toggle('on', m === 'lamp');
     $('#cr-mode-derive').classList.toggle('on', m === 'derive');
+    $('#cr-mode-sphere').classList.toggle('on', m === 'sphere');
     document.querySelectorAll('#calrun-dialog .lamp-only').forEach((e) => { e.hidden = m !== 'lamp'; });
     document.querySelectorAll('#calrun-dialog .derive-only').forEach((e) => { e.hidden = m !== 'derive'; });
+    document.querySelectorAll('#calrun-dialog .sphere-only').forEach((e) => { e.hidden = m !== 'sphere'; });
+    document.querySelectorAll('#calrun-dialog .nonsphere-only').forEach((e) => { e.hidden = m === 'sphere'; });
     $('#cr-save-failed-text').textContent = m === 'lamp' ? 'Save although checks failed'
-      : 'Save although the drift check failed';
-    $('#calrun-title').textContent = m === 'lamp' ? 'Calibration run' : 'Derive new optics';
+      : (m === 'derive' ? 'Save although the drift check failed'
+        : 'Save although the drift or consistency check failed');
+    $('#calrun-title').textContent = m === 'lamp' ? 'Calibration run'
+      : (m === 'derive' ? 'Derive new optics' : 'Characterise sphere (radiance reference)');
+    updateAdm();
   }
 
   function updateWarn() {
-    const on = $('#cr-allow-implausible').checked || $('#cr-save-failed').checked;
+    const on = ($('#cr-allow-implausible').checked && mode !== 'sphere') || $('#cr-save-failed').checked;
     $('#cr-warn').hidden = !on;
   }
 
@@ -3221,12 +3296,52 @@ const CalRun = (() => {
     setMode(m);
     showForm();
     showModal('calrun-dialog', true);
-    await Promise.all([CalMgr.loadRefs(), Cal.refresh()]);
+    await Promise.all([CalMgr.loadRefs(), Cal.refresh(), loadAdm()]);
     fillRefs(); fillKnown();
   }
   function close() { if (!running) showModal('calrun-dialog', false); }
 
+  async function startSphere() {
+    const num = (id) => { const v = $(id).value; return v === '' ? null : Number(v); };
+    const orv = (v, d) => (v == null || !isFinite(v)) ? d : v;
+    const name = $('#cr-sp-name').value.trim();
+    if (!name) { toast('Enter a sphere name'); $('#cr-sp-name').focus(); return; }
+    const radius = num('#cr-sp-radius');
+    if (!(radius > 0)) { toast('Enter the port radius in mm (measured at the part)'); $('#cr-sp-radius').focus(); return; }
+    const heights = $('#cr-sp-heights').value.split(/[;,\s]+/).filter(Boolean).map(Number);
+    if (heights.length < 3 || heights.some((h) => !isFinite(h))) {
+      toast('Enter at least 3 heights in mm, separated by commas'); $('#cr-sp-heights').focus(); return;
+    }
+    if (new Set(heights).size !== heights.length) { toast('The heights must all differ'); return; }
+    const sphere = {
+      name, serial: $('#cr-sp-serial').value.trim(), port_radius_mm: radius,
+      edge_depth_mm: orv(num('#cr-sp-edge'), 11.0), cc_ref_offset_mm: orv(num('#cr-sp-offset'), 0),
+      u_radius_mm: orv(num('#cr-sp-ur'), 0), u_distance_mm: orv(num('#cr-sp-ud'), 0),
+    };
+    const ucc = num('#cr-sp-ucc');
+    if (ucc != null && isFinite(ucc)) sphere.cc_uncertainty_pct = ucc;
+    const body = { sphere, heights_mm: heights, save_on_failed_checks: $('#cr-save-failed').checked,
+                   integration_ms: 'auto' };
+    if ($('#cr-sp-int-mode').value === 'fixed') {
+      const v = parseFloat($('#cr-sp-int-ms').value);
+      if (!(v > 0)) { toast('Enter a valid integration time'); return; }
+      body.integration_ms = v;
+    }
+    const frames = parseInt($('#cr-frames').value, 10);
+    if (isFinite(frames)) body.frames = frames;
+    if (body.save_on_failed_checks && !window.confirm('Warning: a result that fails the drift or ' +
+        'consistency check will be saved anyway as a reference source.\n\nStart with this option?')) return;
+    $('#cr-start').disabled = true;
+    const { r, j } = await apiPost('/api/v1/calibration/spheres', body);
+    $('#cr-start').disabled = false;
+    if (!r.ok) { toast(errText(j, r), 5000); return; }
+    jobId = j.job.id; running = true;
+    showRun();
+    Jobs.track(jobId, onJob);
+  }
+
   async function start() {
+    if (mode === 'sphere') { await startSphere(); return; }
     const name = $('#cr-name').value.trim();
     if (!name) { toast('Enter an optics name'); $('#cr-name').focus(); return; }
     const optics = { name, input: $('#cr-input').value, notes: $('#cr-notes').value.trim() };
@@ -3268,7 +3383,7 @@ const CalRun = (() => {
     $('#cr-start').disabled = true;
     const { r, j } = await apiPost(url, body);
     $('#cr-start').disabled = false;
-    if (!r.ok) { toast(errText(j, r), 4000); return; }
+    if (!r.ok) { toast(errText(j, r), 5000); return; }
     jobId = j.job.id; running = true;
     showRun();
     Jobs.track(jobId, onJob);
@@ -3306,7 +3421,13 @@ const CalRun = (() => {
     saved_implausible: ['warn', 'Saved, but flagged as implausible (not activated)'],
     not_saved_implausible: ['bad', 'Not saved: the plausibility check failed'],
     not_saved_checks_failed: ['bad', 'Not saved: the stability / integration-time checks failed'],
+    drift_check_failed: ['bad', 'Drift check failed'],
     failed: ['bad', 'Failed'],
+  };
+
+  const SPHERE_STATUS_TEXT = {
+    saved: ['ok', 'Saved as radiance reference'],
+    not_saved_checks_failed: ['bad', 'Not saved: the drift or consistency check failed'],
   };
 
   // ── result detail renderers (checks, dark drift, verification) ──
@@ -3363,6 +3484,48 @@ const CalRun = (() => {
     if (ck.itime_match_new === false) bad.push('integration times of the new optics differ between dark and light');
     if (ck.linearity_consistent === false) bad.push('the linearity correction changed between the captures');
     if (bad.length) out.push('<div><b>Consistency</b></div><ul>' + bad.map((b) => `<li>${esc(b)}</li>`).join('') + '</ul>');
+    return out;
+  }
+  // sphere characterisation: geometry offset, consistency over the distances, drift, uncertainty
+  function sphereHtml(res) {
+    const out = [];
+    const cons = res.consistency || {};
+    const ov = cons.overall || {};
+    const pf = (p) => p === true ? 'pass' : (p === false ? 'FAIL' : 'n/a');
+    if (res.d0_mm != null) {
+      out.push('<div class="cr-sub">Result</div><div class="tbl-wrap"><table class="mini-table">' +
+        '<thead><tr><th>Offset d0</th><th>Plausible</th><th>Method</th><th>Valid range</th></tr></thead><tbody>' +
+        `<tr class="${res.d0_plausible === false ? 'bad' : ''}"><td class="num">${fnum(res.d0_mm, 3)} mm</td>` +
+        `<td>${res.d0_plausible ? 'yes' : 'NO'}</td><td>${res.method === 'fit' ? 'fit of d0' : 'mean over the distances'}</td>` +
+        `<td class="num">${Array.isArray(res.valid_range_nm) ? fnum(res.valid_range_nm[0], 0) + '–' + fnum(res.valid_range_nm[1], 0) + ' nm' : '—'}</td></tr>` +
+        '</tbody></table></div>');
+    }
+    if (cons.overall) {
+      const bands = Array.isArray(cons.bands) ? cons.bands : [];
+      out.push('<div class="cr-sub">Consistency of L over the distances · ' + pf(cons.pass) + '</div>' +
+        '<div class="tbl-wrap"><table class="mini-table"><thead><tr><th>Band (nm)</th><th>Spread</th>' +
+        '<th>d0</th><th>u</th><th></th></tr></thead><tbody>' +
+        bands.map((b) => `<tr class="${b.pass === false ? 'bad' : ''}">` +
+          `<td class="num">${fnum(b.lo, 0)}–${fnum(b.hi, 0)}</td><td class="num">${fnum(b.spread_pct, 2)} %</td>` +
+          `<td class="num">${fnum(b.d0_mm, 3)} mm</td><td class="num">${fnum(b.u_rel_pct, 2)} %</td>` +
+          `<td>${b.pass === false ? '⚠' : ''}</td></tr>`).join('') +
+        `<tr><td><b>Overall</b></td><td class="num">${fnum(ov.spread_pct, 2)} % (limit ${fnum(cons.max_pct, 2)} %)</td>` +
+        `<td></td><td></td><td></td></tr></tbody></table></div>`);
+    }
+    const d = res.drift;
+    if (d && typeof d === 'object') {
+      out.push('<div class="cr-sub">Source drift (first distance vs. repeat)</div><div class="tbl-wrap">' +
+        '<table class="mini-table"><thead><tr><th>p95</th><th>Mean</th><th>Limit</th><th>Result</th></tr></thead><tbody>' +
+        `<tr class="${d.pass === false ? 'bad' : ''}"><td class="num">${fnum(d.p95_pct, 2)} %</td>` +
+        `<td class="num">${fnum(d.mean_pct, 2)} %</td><td class="num">${fnum(d.limit_pct, 2)} %</td>` +
+        `<td>${pf(d.pass)}</td></tr></tbody></table></div>`);
+    }
+    const u = res.uncertainty;
+    if (u && typeof u === 'object') {
+      out.push(`<div class="kv">Uncertainty of L: median u = ${fnum(u.u_rel_median_pct, 2)} % ` +
+        `(U, k = 2: ${fnum(u.U_rel_median_pct_k2, 2)} %), maximum u = ${fnum(u.u_rel_max_pct, 2)} %.</div>`);
+    }
+    if (res.source_id) out.push(`<div class="kv">Reference source: ${esc(res.source_id)} (quantity radiance).</div>`);
     return out;
   }
   function darkDriftHtml(dd) {
@@ -3431,17 +3594,31 @@ const CalRun = (() => {
       cls = 'bad'; title = 'Failed';
       extra.push(`<div>${esc((job.error && job.error.message) || 'The job failed.')}</div>`);
     } else {
-      const t = STATUS_TEXT[res.status] || ['warn', res.status || 'Finished'];
+      const t = (job.kind === 'sphere' && SPHERE_STATUS_TEXT[res.status])
+        || STATUS_TEXT[res.status] || ['warn', res.status || 'Finished'];
       cls = t[0]; title = t[1];
+      if (job.kind === 'sphere' && res.status === 'saved' && res.saved_checks_failed) {
+        cls = 'warn';
+        title = 'Saved although the checks failed (' + (res.failed_checks || []).join(', ') + ')';
+      }
       if (res.status === 'saved' && res.activated) title += ' and activated';
       if (res.status === 'saved' && !res.activated) title += ' (not activated)';
+      if (res.status === 'drift_check_failed') {
+        // the drift is the primary cause: shown instead of "not plausible"
+        const ds = res.drift_status || {};
+        title = ds.message || (res.drift && isFinite(res.drift.p95_pct)
+          ? `Drift check failed: ${Number(res.drift.p95_pct).toFixed(2)} % (limit ${Number(res.drift.threshold_pct).toFixed(2)} %)`
+          : 'Drift check failed');
+        extra.push('<div class="kv">Not saved. Run again with “Save although the drift check failed” to store it anyway.</div>');
+      }
       if (res.error) extra.push(`<div>${esc(res.error)}</div>`);
       if (res.status === 'not_saved_implausible') {
         extra.push('<div class="kv">Run again with “Save even if implausible” to store it flagged.</div>');
       }
       if (res.status === 'not_saved_checks_failed') {
         extra.push('<div class="kv">Run again with “Save although ' +
-          (job.kind === 'derivation' ? 'the drift check failed' : 'checks failed') +
+          (job.kind === 'derivation' ? 'the drift check failed'
+            : (job.kind === 'sphere' ? 'the drift or consistency check failed' : 'checks failed')) +
           '” to store it anyway.</div>');
       }
     }
@@ -3453,6 +3630,7 @@ const CalRun = (() => {
       extra.push('<div class="kv">Plausibility: passed.</div>');
     }
     if (job.kind === 'derivation') extra.push(...derivationHtml(res));
+    else if (job.kind === 'sphere') extra.push(...sphereHtml(res));
     else extra.push(...checksHtml(res));
     extra.push(...darkDriftHtml(res.dark_drift));
     const hints = pl && Array.isArray(pl.hints) ? pl.hints : [];
@@ -3483,7 +3661,7 @@ const CalRun = (() => {
     }
     const prot = Array.isArray(res.protocol) ? res.protocol.map((p) => String(p).toLowerCase()) : [];
     const links = [];
-    if ((job.kind === 'calibration' || job.kind === 'derivation') && prot.length) {
+    if (['calibration', 'derivation', 'sphere'].includes(job.kind) && prot.length) {
       if (prot.some((p) => p.endsWith('.pdf'))) links.push(['pdf', 'Protocol (PDF)']);
       if (prot.some((p) => p.endsWith('.csv'))) links.push(['csv', 'Protocol (CSV)']);
     }
@@ -3512,6 +3690,7 @@ const CalRun = (() => {
     if (st === 'saved' || st === 'saved_implausible') {
       Cal.refresh();
       CalMgr.loadDarks();
+      if (job.kind === 'sphere') CalMgr.loadRefs();
     }
   }
 
@@ -3524,6 +3703,13 @@ const CalRun = (() => {
   function init() {
     $('#cal-run-open').addEventListener('click', () => open('lamp'));
     $('#cal-derive-open').addEventListener('click', () => open('derive'));
+    $('#cal-sphere-open').addEventListener('click', () => open('sphere'));
+    $('#cr-mode-sphere').addEventListener('click', () => { if (!running) { setMode('sphere'); updateWarn(); } });
+    $('#cr-sp-int-mode').addEventListener('change', () => {
+      $('#cr-sp-int-ms').disabled = $('#cr-sp-int-mode').value !== 'fixed';
+    });
+    $('#cr-ref').addEventListener('change', updateAdm);
+    $('#cr-input').addEventListener('change', updateAdm);
     $('#cr-mode-lamp').addEventListener('click', () => { if (!running) { setMode('lamp'); updateWarn(); } });
     $('#cr-mode-derive').addEventListener('click', () => { if (!running) { setMode('derive'); updateWarn(); } });
     $('#cr-int-mode').addEventListener('change', () => {
@@ -3546,8 +3732,10 @@ const CalRun = (() => {
       if (e.target.closest('[data-verify-again]')) { verifyAgain(); return; }
       const a = e.target.closest('[data-protocol]');
       if (a && jobId) {
-        apiDownload(`/api/v1/calibration/runs/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.protocol}`,
-                    `${mode === 'derive' ? 'derivation' : 'calibration'}_protocol.${a.dataset.protocol}`);
+        const kind = (lastJob && lastJob.kind) || 'calibration';
+        const base = kind === 'sphere' ? 'spheres' : 'runs';
+        apiDownload(`/api/v1/calibration/${base}/${encodeURIComponent(jobId)}/protocol?format=${a.dataset.protocol}`,
+                    `${kind === 'derivation' ? 'derivation' : (kind === 'sphere' ? 'sphere' : 'calibration')}_protocol.${a.dataset.protocol}`);
       }
     });
   }

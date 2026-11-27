@@ -263,7 +263,8 @@ def process_frame(
     if peak_detection:
         p = peak_params or {}
         peaks = detect_peaks(
-            np.nan_to_num(arr, nan=0.0) if calibrated else arr, wavelengths,
+            np.nan_to_num(arr, nan=0.0) if (calibrated or np.isnan(arr).any()) else arr,
+            wavelengths,
             savgol_window  = p.get("peak_savgol_window", 11),
             savgol_order   = p.get("peak_savgol_order", 3),
             min_prominence = p.get("peak_prominence", 50.0),
@@ -347,10 +348,20 @@ UNIT_LABELS = {
     "uW/cm2/nm": "µW/(cm²·nm)",
     "W/m2/nm": "W/(m²·nm)",
     "mW/m2/nm": "mW/(m²·nm)",
+    "uW/cm2/sr/nm": "µW/(cm²·sr·nm)",
+    "W/m2/sr/nm": "W/(m²·sr·nm)",
+    "mW/m2/sr/nm": "mW/(m²·sr·nm)",
 }
 
-# factor to W/(m²·nm) for the absolute units
-_TO_W_M2_NM = {"uW/cm2/nm": 0.01, "W/m2/nm": 1.0, "mW/m2/nm": 1e-3}
+# factor to the SI unit of the quantity: W/(m²·nm) (irradiance) resp.
+# W/(m²·sr·nm) (radiance)
+_TO_SI = {"uW/cm2/nm": 0.01, "W/m2/nm": 1.0, "mW/m2/nm": 1e-3,
+          "uW/cm2/sr/nm": 0.01, "W/m2/sr/nm": 1.0, "mW/m2/sr/nm": 1e-3}
+_TO_W_M2_NM = {k: v for k, v in _TO_SI.items() if "/sr/" not in k}   # irradiance only
+_RADIANCE_UNITS = tuple(k for k in _TO_SI if "/sr/" in k)
+
+QUANTITY_IRRADIANCE = "irradiance"
+QUANTITY_RADIANCE = "radiance"
 
 
 def unit_label(unit: str) -> str:
@@ -358,20 +369,38 @@ def unit_label(unit: str) -> str:
 
 
 def is_absolute_unit(unit: str) -> bool:
-    return unit in _TO_W_M2_NM
+    """Absolute irradiance OR radiance unit."""
+    return unit in _TO_SI
+
+
+def unit_quantity(unit: str) -> str | None:
+    """'irradiance' / 'radiance' for an absolute unit, else None."""
+    if unit in _RADIANCE_UNITS:
+        return QUANTITY_RADIANCE
+    if unit in _TO_W_M2_NM:
+        return QUANTITY_IRRADIANCE
+    return None
+
+
+def photometric_quantity(unit: str) -> str:
+    """The photometric quantity a spectrum in this unit yields: radiance →
+    luminance (cd/m²), everything else → illuminance (lx)."""
+    return QUANTITY_RADIANCE if unit in _RADIANCE_UNITS else QUANTITY_IRRADIANCE
 
 
 def photometric_inputs(values: np.ndarray, unit: str):
     """Spectrum + lux calibration for color_science.measure_all().
 
     Masked (NaN) pixels → 0. For an absolute unit the spectrum is returned in
-    W/(m²·nm) and lux_calibration = 1.0, so illuminance_lux() gives true lux
-    directly from E(λ) (radiometric_calibration_factor is then ignored). For
-    any other unit returns lux_calibration None (= use the configured factor)."""
+    the SI unit of its quantity (W/(m²·nm) or W/(m²·sr·nm)) and
+    lux_calibration = 1.0, so color_science gives true lux (irradiance) or
+    cd/m² (radiance, quantity from photometric_quantity(unit)) directly
+    (radiometric_calibration_factor is then ignored). For any other unit
+    returns lux_calibration None (= use the configured factor)."""
     v = np.nan_to_num(np.asarray(values, dtype=float), nan=0.0,
                       posinf=0.0, neginf=0.0)
     if is_absolute_unit(unit):
-        return v * _TO_W_M2_NM[unit], 1.0
+        return v * _TO_SI[unit], 1.0
     return v, None
 
 

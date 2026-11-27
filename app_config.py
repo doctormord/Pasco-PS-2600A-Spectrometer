@@ -114,10 +114,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Dark before/after each light capture: warn when the dark level changed
     # by more than this share of the net peak signal (%) (and > 3 σ).
     "calibration_dark_drift_warn_pct": 0.5,
+    # Dark and light count as "same integration time" within this tolerance (%).
+    "calibration_itime_match_tol_pct": 0.5,
+    # "Dark unusually bright" warning: dark peak fraction > this factor times
+    # the light peak fraction (light probably not blocked during the dark).
+    "calibration_dark_bright_frac": 0.5,
     # Derivation of an optics configuration from a known one: the known optics
     # is measured again at the end; a source drift (p95 over the tested
     # pixels, %) above this fails the drift check, failing pixels are masked.
     "calibration_derivation_drift_pct": 2.0,
+    # Sphere as a radiance reference (calibration_sphere.py): number of
+    # distances (>= 3), band width of the evaluation, consistency limit of L
+    # over the distances (%, per band and overall), plausible |d0| of the fit
+    # (mm), drift limit of the repeat of the first distance (p95 of the ratio
+    # smoothed over the band width, %), default
+    # relative standard uncertainty of the CC calibration (%, k = 1).
+    "sphere_min_positions": 3,
+    "sphere_band_nm": 50.0,
+    "sphere_consistency_max_pct": 2.0,
+    "sphere_d0_max_mm": 1.0,
+    "sphere_drift_max_pct": 1.0,
+    "sphere_cc_uncertainty_pct": 3.0,
     # Saturation warning threshold (fraction of full scale, raw ADC peak):
     # exposure meter (desktop + web) and calibration runs. The auto-exposure
     # target band (calibration_target_frac_hi) is capped at this value.

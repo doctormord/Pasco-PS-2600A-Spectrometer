@@ -216,7 +216,9 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
     px = np.asarray(px, dtype=float)
     unit = unit or "counts"
     rnd = _round_counts if unit in _COUNT_UNITS else _round_sig
-    if engine.calib.active_v2:
+    if engine.calib.active_v2 or getattr(engine.calib, "legacy_gain", None) is not None:
+        # masked pixels (v2 profile, or a migrated legacy profile outside its
+        # valid range) are gaps (null), never 0
         finite = np.isfinite(px)
         intens = [rnd(float(v)) if f else None for v, f in zip(px, finite)]
     else:
@@ -247,6 +249,7 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
         "intensities": intens,
         "unit": unit,
         "unit_label": processing.unit_label(unit),
+        "quantity": getattr(ev, "quantity", None) or processing.photometric_quantity(unit),
         "calibration": calib_status,
         "valid_range_nm": calib_status.get("valid_range_nm"),
         "valid_segments_nm": calib_status.get("valid_segments_nm"),
@@ -548,11 +551,26 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
         except (KeyError, TypeError, ValueError):
             raise HTTPException(400, "expected numeric wavelengths and intensities arrays")
         lux_cal = float(payload.get("lux_calibration", 0.0) or 0.0)
+        quantity = "radiance" if payload.get("quantity") == "radiance" else "irradiance"
+        unit = payload.get("unit")
+        if isinstance(unit, str) and unit:
+            # the same photometric inputs as the engine (desktop CIE tab):
+            # masked pixels → 0, absolute units → SI unit of the quantity
+            # with factor 1 (true lx / cd/m²)
+            spd, cal = processing.photometric_inputs(inten, unit)
+            inten = spd
+            if cal is not None:
+                lux_cal = cal
+                quantity = processing.photometric_quantity(unit)
+        else:
+            inten = np.nan_to_num(inten, nan=0.0, posinf=0.0, neginf=0.0)
         if fmt == "csv":
-            return _csv_response(cs.color_report_rows(wl, inten, lux_cal), "color_report.csv")
+            return _csv_response(cs.color_report_rows(wl, inten, lux_cal, quantity=quantity),
+                                 "color_report.csv")
         buf = io.BytesIO()
         try:
             cs.render_color_report(buf, wl, inten, fmt=fmt, lux_calibration=lux_cal,
+                                   quantity=quantity,
                                    meta=engine.report_meta(
                                        peak_adc=float(np.max(inten)) if inten.size else None))
         except ImportError:
@@ -844,7 +862,13 @@ def _profile_item(engine: Engine, p: dict, dev, serial, fp) -> dict:
             "valid_range_nm": p.get("valid_range_nm"),
             "valid_segments_nm": p.get("valid_segments_nm"),
             "plausible": not calprof.is_implausible(p),
-            "unit": p.get("unit")}
+            "unit": p.get("unit"),
+            "quantity": calprof.profile_quantity(p),
+            "input": (p.get("optics") or {}).get("input"),
+            "legacy": p.get("apply") == calprof.APPLY_LEGACY_GAIN,
+            "legacy_valid_range_nm": (list(calprof.legacy_valid_range(p) or [])
+                                      or None) if p.get("apply") == calprof.APPLY_LEGACY_GAIN
+            else None}
 
 
 def profiles_payload(engine: Engine, include_old: bool = False, *, raw: bool = False) -> dict:
@@ -899,8 +923,23 @@ def reference_list() -> list[dict]:
     import reference_sources as rs
     return json_safe([{"id": s.id, "name": s.name, "serial": s.serial, "unit": s.unit,
                        "valid_min_nm": s.valid_min_nm, "valid_max_nm": s.valid_max_nm,
-                       "input_optic": s.input_optic, "builtin": bool(s.builtin)}
+                       "input_optic": s.input_optic, "builtin": bool(s.builtin),
+                       "quantity": s.quantity, "unit_label": rs.unit_label(s.unit),
+                       "meta": _reference_meta_summary(s)}
                       for s in rs.ReferenceLibrary().list()])
+
+
+def _reference_meta_summary(s) -> dict:
+    """Short form of ReferenceSource.meta for lists (no arrays)."""
+    m = s.meta or {}
+    g = m.get("geometry") or {}
+    out = {"kind": m.get("kind"), "date": m.get("date"),
+           "port_radius_mm": g.get("port_radius_mm"), "d0_mm": g.get("d0_mm"),
+           "cc_profile_id": (m.get("cc_profile") or {}).get("id"),
+           "consistency_pct": m.get("consistency_pct"),
+           "u_rel_median_pct": (m.get("uncertainty") or {}).get("u_rel_median_pct"),
+           "has_uncertainty": s.uncertainty is not None}
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def heatmap_csv(engine: Engine) -> str:

@@ -176,7 +176,7 @@
             <div class="card" title="Excitation purity — how saturated the color is (0% = white, 100% = monochromatic)."><div class="lbl">Purity</div><div class="val" id="c-pur">—<span class="unit"> %</span></div></div>
             <div class="card" title="Full Width at Half Maximum of the main spectral peak — a measure of spectral bandwidth."><div class="lbl">FWHM</div><div class="val" id="c-fwhm">—<span class="unit"> nm</span></div></div>
             <div class="card" title="Spectral centroid — the intensity-weighted mean wavelength (center of mass of the spectrum)."><div class="lbl">Centroid λ</div><div class="val" id="c-cent">—<span class="unit"> nm</span></div></div>
-            <div class="card" title="Photopic illuminance. Calibrated only with an absolute profile or a Radiometric factor; otherwise an uncalibrated relative value. “—” = not available."><div class="lbl">Illuminance (lx)</div><div class="val" id="c-lux">—<span class="unit"> lx</span></div></div>
+            <div class="card" title="Photopic illuminance. Calibrated only with an absolute profile or a Radiometric factor; otherwise an uncalibrated relative value. “—” = not available."><div class="lbl" id="c-lux-lbl">Illuminance (lx)</div><div class="val" id="c-lux">—<span class="unit"> lx</span></div></div>
             <div class="card" title="Illuminance in foot-candles (1 fc = 10.764 lx). “—” = not available."><div class="lbl">Foot-candle (fc)</div><div class="val" id="c-fc">—<span class="unit"> fc</span></div></div>
             <div class="card" title="Central wavelength — the wavelength that splits the spectrum into two halves of equal integrated intensity (median wavelength)."><div class="lbl">Central λ</div><div class="val" id="c-central">—<span class="unit"> nm</span></div></div>
             <div class="card" title="CIE 1960 u chromaticity coordinate (used for CCT / Duv)."><div class="lbl">u (1960)</div><div class="val" id="c-u60">—</div></div>
@@ -397,10 +397,12 @@
             <option value="counts">counts</option>
             <option value="counts_per_s">counts/s</option>
           </select></div>
-        <div class="row"><label>Irradiance unit</label>
-          <select id="cfg-irradiance_unit">
+        <div class="row"><label>Absolute unit</label>
+          <select id="cfg-irradiance_unit"
+                  title="Prefix of the absolute unit. A radiance profile uses the same prefix per sr (e.g. µW/(cm²·sr·nm)).">
             <option value="uW/cm2/nm">µW/(cm²·nm)</option>
             <option value="W/m2/nm">W/(m²·nm)</option>
+            <option value="mW/m2/nm">mW/(m²·nm)</option>
           </select></div>
         <div class="row"><label>Radiometric factor</label>
           <input type="number" id="cfg-radiometric_calibration_factor" min="0" step="any" value="0" data-lock="control"
@@ -424,6 +426,8 @@
                 title="Lamp calibration (relative / absolute) as a guided job on the server">Calibration run…</button>
         <button id="cal-derive-open" class="full" data-lock="control"
                 title="Derive the profile of new optics from a known profile">Derive new optics…</button>
+        <button id="cal-sphere-open" class="full" data-lock="control"
+                title="Characterise an integrating sphere as a radiance reference (needs an absolute CC profile)">Characterise sphere…</button>
         <button id="lin-open" class="full"
                 title="Linearity calibration / check of the detector (counts vs. integration time)">Linearity…</button>
         <button id="cal-manage" class="full"
@@ -535,8 +539,10 @@
           <div class="seg cr-mode-seg" id="cr-mode-seg">
             <button type="button" id="cr-mode-lamp" class="on">Lamp calibration</button>
             <button type="button" id="cr-mode-derive">Derive new optics</button>
+            <button type="button" id="cr-mode-sphere">Characterise sphere</button>
           </div>
           <div class="fgrid">
+            <div class="fgrid-sub nonsphere-only">
             <label for="cr-name">Optics name</label>
             <input type="text" id="cr-name" placeholder="e.g. CC-1 cosine corrector" maxlength="80">
             <label for="cr-input">Input</label>
@@ -544,14 +550,42 @@
               <option value="CC">CC (cosine corrector)</option>
               <option value="sphere">sphere</option>
               <option value="bare">bare (fiber / slit)</option>
+              <option value="objective">objective</option>
             </select>
             <label for="cr-notes">Notes</label>
             <input type="text" id="cr-notes" maxlength="200">
+            </div>
+            <div class="fgrid-sub sphere-only" hidden>
+              <label for="cr-sp-name">Sphere name</label>
+              <input type="text" id="cr-sp-name" placeholder="e.g. Printed sphere" maxlength="80">
+              <label for="cr-sp-serial">Serial</label>
+              <input type="text" id="cr-sp-serial" maxlength="80">
+              <label for="cr-sp-radius">Port radius (mm)</label>
+              <input type="number" id="cr-sp-radius" min="0.01" step="0.01" title="Measured at the part">
+              <label for="cr-sp-edge">Knife edge to housing top (mm)</label>
+              <input type="number" id="cr-sp-edge" min="0" step="0.01" value="11.00">
+              <label for="cr-sp-offset">CC reference plane offset (mm)</label>
+              <input type="number" id="cr-sp-offset" step="0.01" value="0" title="CC reference plane relative to its support surface; positive = farther from the port">
+              <label for="cr-sp-heights">Heights (mm)</label>
+              <input type="text" id="cr-sp-heights" placeholder="e.g. 0, 6, 16" title="Distance housing top to the CC support surface per position, smallest first, at least 3, separated by commas">
+              <label for="cr-sp-ur">Uncertainty of r (mm)</label>
+              <input type="number" id="cr-sp-ur" min="0" step="0.01" value="0">
+              <label for="cr-sp-ud">Uncertainty of a distance (mm)</label>
+              <input type="number" id="cr-sp-ud" min="0" step="0.01" value="0">
+              <label for="cr-sp-ucc">CC calibration uncertainty (%)</label>
+              <input type="number" id="cr-sp-ucc" min="0" step="0.1" placeholder="default">
+              <label for="cr-sp-int-mode">Integration</label>
+              <span class="fpair">
+                <select id="cr-sp-int-mode"><option value="auto">auto</option><option value="fixed">fixed</option></select>
+                <input type="number" id="cr-sp-int-ms" min="0.01" step="0.01" value="20" disabled title="Integration time in ms">
+                <span class="hm-u">ms</span>
+              </span>
+            </div>
             <div class="fgrid-sub lamp-only">
               <label for="cr-kind">Type</label>
               <select id="cr-kind">
                 <option value="relative">relative (shape only)</option>
-                <option value="absolute">absolute (W/m²/nm)</option>
+                <option value="absolute">absolute (W/m²/nm · W/m²/sr/nm)</option>
               </select>
               <label for="cr-ref">Reference</label>
               <select id="cr-ref"></select>
@@ -583,9 +617,12 @@
             <label for="cr-frames">Frames</label>
             <input type="number" id="cr-frames" min="2" max="1000" step="1" placeholder="default">
           </div>
+          <div class="cr-hint-box lamp-only" id="cr-adm-note" hidden></div>
+          <div class="cr-hint-box lamp-only" id="cr-radiance-hint" hidden></div>
+          <div class="cr-hint-box sphere-only" id="cr-sphere-hint" hidden></div>
           <div class="cr-hint-box derive-only" id="cr-source-hint" hidden>Source: a diffuse, uniformly luminous, extended target that fills the field of view of BOTH optics (e.g. back-illuminated opal glass in the object plane). Keep the source, its position and its power unchanged during the whole run.</div>
           <div class="cr-save">
-            <label class="cr-chk"><input type="checkbox" id="cr-allow-implausible"> Save even if implausible</label>
+            <label class="cr-chk nonsphere-only"><input type="checkbox" id="cr-allow-implausible"> Save even if implausible</label>
             <label class="cr-chk"><input type="checkbox" id="cr-save-failed"> <span id="cr-save-failed-text">Save although checks failed</span></label>
             <div class="cr-warn" id="cr-warn" hidden>Warning: a result that fails the plausibility check is stored flagged as implausible and is NOT activated. A result that only fails the stability, cross or source drift check is stored and activated like a passing one. Only use this when you know why the check fails.</div>
           </div>
@@ -661,10 +698,23 @@
             <input type="file" id="ref-file" accept=".lmp,.csv,.txt,text/csv,text/plain">
             <label for="ref-name">Name</label><input type="text" id="ref-name">
             <label for="ref-serial">Serial</label><input type="text" id="ref-serial">
-            <label for="ref-unit">Unit</label><input type="text" id="ref-unit" value="uW/cm2/nm">
+            <label for="ref-unit">Unit</label>
+            <select id="ref-unit">
+              <option value="uW/cm2/nm" selected>µW/cm²/nm (irradiance)</option>
+              <option value="W/m2/nm">W/m²/nm (irradiance)</option>
+              <option value="mW/m2/nm">mW/m²/nm (irradiance)</option>
+              <option value="uW/cm2/sr/nm">µW/cm²/sr/nm (radiance)</option>
+              <option value="W/m2/sr/nm">W/m²/sr/nm (radiance)</option>
+              <option value="mW/m2/sr/nm">mW/m²/sr/nm (radiance)</option>
+            </select>
             <label for="ref-min">Valid from (nm)</label><input type="number" id="ref-min" step="1">
             <label for="ref-max">Valid to (nm)</label><input type="number" id="ref-max" step="1">
-            <label for="ref-input">Input optic</label><input type="text" id="ref-input">
+            <label for="ref-input">Input optic</label>
+            <select id="ref-input">
+              <option value="">(not specified)</option>
+              <option value="CC">CC</option><option value="sphere">sphere</option>
+              <option value="bare">bare</option><option value="objective">objective</option>
+            </select>
             <label for="ref-notes">Notes</label><input type="text" id="ref-notes">
           </div>
           <div class="ref-form-btns"><button id="ref-import-go" class="primary" data-lock="control">Import</button>

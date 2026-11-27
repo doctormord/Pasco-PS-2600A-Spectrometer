@@ -527,6 +527,15 @@ def illuminance_lux(wavelengths_nm: np.ndarray,
     return LM_PER_WATT_PHOTOPIC * float(np.sum(spd * Y_BAR)) * dx * calibration
 
 
+def luminance_cd_m2(wavelengths_nm: np.ndarray,
+                    radiance: np.ndarray,
+                    calibration: float = 0.0) -> float:
+    """Photopic luminance in cd/m² = 683 lm/W · ∫ L(λ)·V(λ) dλ, with L(λ) in
+    W/(m²·sr·nm) (calibration = factor to that unit; 1.0 for an absolute
+    radiance profile). Returns NaN when calibration == 0.0."""
+    return illuminance_lux(wavelengths_nm, radiance, calibration)
+
+
 def illuminance_fc(wavelengths_nm: np.ndarray,
                    intensities: np.ndarray,
                    calibration: float = 0.0) -> float:
@@ -739,15 +748,36 @@ def sdcm(x: float, y: float, cct: float) -> float:
 # ════════════════════════════════════════════════════════════
 # Top-level convenience: compute everything in one go
 # ════════════════════════════════════════════════════════════
+QUANTITY_IRRADIANCE = "irradiance"
+QUANTITY_RADIANCE = "radiance"
+
+
+def _fmt_sig(v: float) -> str:
+    """Luminance text: 3 significant digits below 1000, else integer."""
+    a = abs(float(v))
+    if a >= 1000:
+        return f"{v:.0f}"
+    if a == 0:
+        return "0"
+    from math import floor, log10
+    nd = max(0, 2 - int(floor(log10(a))))
+    return f"{v:.{nd}f}"
+
+
 def measure_all(wavelengths_nm: np.ndarray,
                 intensities: np.ndarray,
-                lux_calibration: float = 0.0) -> dict:
+                lux_calibration: float = 0.0,
+                quantity: str = QUANTITY_IRRADIANCE) -> dict:
     """
     Compute every metric exposed by this module. Returns a flat dict keyed by
     short names. Numeric fields are NaN where the measurement is degenerate
     (e.g. all-zero spectrum).
+
+    quantity 'irradiance' (default): photometric value = illuminance (lux, fc).
+    quantity 'radiance': the spectrum is a radiance; the photometric value is
+    the luminance in cd/m² ('luminance'), lux and fc are NaN.
     """
-    out: dict = {}
+    out: dict = {"quantity": quantity, "luminance": float('nan')}
     if intensities is None or intensities.size == 0 or np.sum(intensities) <= 0:
         out.update(dict(X=0, Y=0, Z=0, x=float('nan'), y=float('nan'),
                         cct=float('nan'), duv=float('nan'),
@@ -773,8 +803,13 @@ def measure_all(wavelengths_nm: np.ndarray,
         cct = float('nan')        # off-locus → CCT undefined (shown as "—")
     u60, v60 = xy_to_uv60(x, y)
     u76, v76 = xy_to_uv76(x, y)
-    lux = illuminance_lux(wavelengths_nm, intensities, lux_calibration)
-    fc  = illuminance_fc (wavelengths_nm, intensities, lux_calibration)
+    if quantity == QUANTITY_RADIANCE:
+        lum = luminance_cd_m2(wavelengths_nm, intensities, lux_calibration)
+        lux = fc = float('nan')
+    else:
+        lum = float('nan')
+        lux = illuminance_lux(wavelengths_nm, intensities, lux_calibration)
+        fc  = illuminance_fc (wavelengths_nm, intensities, lux_calibration)
     try:
         Ra, Ri, _ = cri_ra(wavelengths_nm, intensities)
     except Exception:
@@ -795,7 +830,7 @@ def measure_all(wavelengths_nm: np.ndarray,
     out.update(dict(X=X, Y=Y, Z=Z, x=x, y=y,
                     cct=cct, duv=duv,
                     u60=u60, v60=v60, u76=u76, v76=v76,
-                    lux=lux, fc=fc,
+                    lux=lux, fc=fc, luminance=lum,
                     Ra=Ra, Ri=Ri,
                     sp_ratio=sp, sdcm=sd,
                     peak_nm=pk, dominant_nm=dom,
@@ -819,11 +854,13 @@ TCS_DISPLAY_COLORS = [
 ]
 
 
-def color_report_rows(wavelengths_nm, intensities, lux_calibration: float = 0.0):
+def color_report_rows(wavelengths_nm, intensities, lux_calibration: float = 0.0,
+                      quantity: str = QUANTITY_IRRADIANCE):
     """Flatten measure_all() into ordered (label, value-string) rows for a CSV /
-    report table. The single authoritative metric set for both apps."""
+    report table. The single authoritative metric set for both apps.
+    quantity 'radiance': the row "Luminance" (cd/m²) replaces "Illuminance"."""
     m = measure_all(np.asarray(wavelengths_nm, dtype=float),
-                     np.asarray(intensities, dtype=float), lux_calibration)
+                     np.asarray(intensities, dtype=float), lux_calibration, quantity)
 
     def f(v, nd=2, suf=""):
         if v is None or (isinstance(v, float) and not np.isfinite(v)):
@@ -833,6 +870,12 @@ def color_report_rows(wavelengths_nm, intensities, lux_calibration: float = 0.0)
     lux_str = "—"
     if m.get("lux") is not None and np.isfinite(m["lux"]):
         lux_str = f"{m['lux']:.0f} lx" + ("" if lux_calibration else " (uncal.)")
+    photo_row = ("Illuminance", lux_str)
+    if quantity == QUANTITY_RADIANCE:
+        lum_str = "—"
+        if m.get("luminance") is not None and np.isfinite(m["luminance"]):
+            lum_str = f"{_fmt_sig(m['luminance'])} cd/m²"
+        photo_row = ("Luminance", lum_str)
 
     rows = [
         ("CCT", f(m["cct"], 0, " K")),
@@ -841,7 +884,7 @@ def color_report_rows(wavelengths_nm, intensities, lux_calibration: float = 0.0)
         ("CIE y", f(m["y"], 4)),
         ("CIE u' (1976)", f(m["u76"], 4)),
         ("CIE v' (1976)", f(m["v76"], 4)),
-        ("Illuminance", lux_str),
+        photo_row,
         ("S/P ratio", f(m["sp_ratio"], 3)),
         ("SDCM (MacAdam steps)", f(m["sdcm"], 1)),
         ("CRI Ra", f(m["Ra"], 0)),
@@ -901,7 +944,8 @@ def _render_report_meta(fig, meta: dict | None) -> None:
 def render_color_report(dst, wavelengths_nm, intensities,
                         fmt: str = "pdf", dpi: int = 150,
                         lux_calibration: float = 0.0,
-                        meta: dict | None = None) -> None:
+                        meta: dict | None = None,
+                        quantity: str = QUANTITY_IRRADIANCE) -> None:
     """Render a self-contained colour / CRI report — SPD plot, the R1–R15 colour-
     rendering bar chart, and the full metrics table — on a WHITE background, to
     ``dst`` (path or binary file-like). ``fmt`` is 'pdf' or 'png'. ``meta`` is an
@@ -914,7 +958,7 @@ def render_color_report(dst, wavelengths_nm, intensities,
 
     wl = np.asarray(wavelengths_nm, dtype=float)
     inten = np.asarray(intensities, dtype=float)
-    m = measure_all(wl, inten, lux_calibration)
+    m = measure_all(wl, inten, lux_calibration, quantity)
     Ri = m.get("Ri") or [float("nan")] * 15
     vals = [r if (r is not None and np.isfinite(r)) else 0.0 for r in Ri[:15]]
     t = tm30_metrics(wl, inten)              # None if colour-science missing
@@ -990,7 +1034,7 @@ def render_color_report(dst, wavelengths_nm, intensities,
         _draw_cri_patches(fig.add_axes(patch_box), sw)
 
     # 4) Metrics table
-    rows = color_report_rows(wl, inten, lux_calibration)
+    rows = color_report_rows(wl, inten, lux_calibration, quantity)
     tax = fig.add_axes(tbl_box); tax.axis("off")
     half = (len(rows) + 1) // 2
     left, right = rows[:half], rows[half:]

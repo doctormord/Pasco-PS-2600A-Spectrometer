@@ -134,7 +134,7 @@ Arbeitsweise: Branch `feature/api-mcp` von aktuellem `future`, ein Commit je Pha
 - `api.py` mit `create_app(engine, settings)`: bestehende Endpunkte unverändert übernommen, `/api/v1` nach Abschnitt 5, Pydantic-Modelle, Fehlerformat, Token-Prüfung, OpenAPI.
 - `server_runner.py`: uvicorn im eigenen Thread mit sauberem Start/Stopp.
 - GUI: Bereich „Remote-Zugriff“ (Ein/Aus, Port, nur lokal / LAN, Token anzeigen/erneuern, URL), Statusanzeige Steuerrecht und laufender Remote-Job mit Abbruch; Sperre konkurrierender Bedienelemente während Remote-Jobs. Einstellungen in der Konfiguration.
-- Einstieg: `PS-2600A_Pro.py --headless` ohne Qt-Import; `web_server.py` als Weiterleitung. PyInstaller-Spec (`PS-2600A_Pro.spec`) um benötigte Hidden Imports ergänzen.
+- Einstieg: `PS-2600A_Pro.py --headless` ohne Qt-Import; `web_server.py` als Weiterleitung.
 - Tests: API mit `TestClient` (alle `/api/v1`-Endpunkte, Token, 409 bei belegtem Steuerrecht, Kalibrierlauf-Job mit Benutzerschritten im Demo-Backend), Start/Stopp des Server-Threads.
 
 **Abnahme:** App mit Demo-Backend starten, Remote-Zugriff einschalten, per REST messen, Ergebnis identisch zur GUI-Anzeige; Headless-Start ohne installiertes PyQt lauffähig.

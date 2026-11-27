@@ -55,7 +55,7 @@ Date and time with time zone; instrument and serial number; optics / input; cali
 
 ## Rules
 
-- Lux / illuminance only with absolute calibration (or a configured radiometric factor); otherwise state "not available".
+- Lux / illuminance only with absolute irradiance calibration (or a configured radiometric factor); otherwise state "not available". With an absolute radiance calibration state luminance in cd/m2 instead (no lux). Always state the measurement quantity.
 - Quote the unit of every value; wavelengths in nm, CCT in K, t_int in ms.
 - Round sensibly (CCT to 10 K, Duv to 4 decimals, Ra to 1 decimal); state the number of frames averaged as basis for the repeatability.
 - Never state a verdict without a stated criterion.

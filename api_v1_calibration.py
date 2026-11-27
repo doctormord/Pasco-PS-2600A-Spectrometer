@@ -12,6 +12,10 @@ api_v1_calibration.py — /api/v1 calibration endpoints.
   POST /calibration/runs                start a calibration job (auth, 202)
   GET  /calibration/runs/{job_id}/protocol?format=pdf|csv
   POST /calibration/derivations         derive new optics from a known profile (auth, 202)
+  POST /calibration/spheres             characterise an integrating sphere as radiance
+                                        reference with the CC (auth, 202)
+  GET  /calibration/spheres/{job_id}/protocol?format=pdf|csv
+  GET  /calibration/admissibility       allowed (type, quantity, input) combinations
   POST /calibration/references          import a lamp file (auth)
   DELETE /calibration/references/{id}   remove an imported lamp (auth; not an MCP tool)
   POST /calibration/verifications       verify a profile against a reference (auth, 202)
@@ -140,7 +144,7 @@ def register(router: APIRouter, ctx: V1Context) -> None:
             job = engine.jobs.get(job_id)
         except NotFound:
             raise ApiError(404, "not_found", f"Job '{job_id}' not found.")
-        if job.kind not in ("calibration", "derivation"):
+        if job.kind not in ("calibration", "derivation", "sphere"):
             raise ApiError(404, "not_found", f"Job '{job_id}' is not a calibration job.")
         res = job.result if isinstance(job.result, dict) else {}
         paths = [p for p in (res.get("protocol") or [])
@@ -251,6 +255,50 @@ def register(router: APIRouter, ctx: V1Context) -> None:
         job = await ctx.call(engine.submit_derivation, params, owner=ctx.owner(request))
         return ctx.job_response(job)
 
+    # ── sphere characterisation (radiance reference) ──────────────────────
+    @router.post("/calibration/spheres", tags=["calibration"], dependencies=auth,
+                 status_code=202,
+                 summary="Characterise an integrating sphere as a radiance reference "
+                         "with the CC and the active absolute irradiance profile (job; "
+                         "user steps mount / cover / uncover / position / repeat via "
+                         "/jobs/{id}/continue)")
+    async def start_sphere(body: SphereRequest, request: Request):
+        params = body.model_dump()
+        if params.get("integration_ms") == "auto":
+            params["integration_ms"] = None
+        job = await ctx.call(engine.submit_sphere_characterization, params,
+                             owner=ctx.owner(request))
+        return ctx.job_response(job)
+
+    @router.get("/calibration/spheres/{job_id}/protocol", tags=["calibration"],
+                summary="Protocol file (PDF or CSV) written by a sphere job")
+    async def sphere_protocol(job_id: str, format: str = Query("pdf", pattern="^(pdf|csv)$")):
+        try:
+            job = engine.jobs.get(job_id)
+        except NotFound:
+            raise ApiError(404, "not_found", f"Job '{job_id}' not found.")
+        if job.kind != "sphere":
+            raise ApiError(404, "not_found", f"Job '{job_id}' is not a sphere job.")
+        res = job.result if isinstance(job.result, dict) else {}
+        paths = [p for p in (res.get("protocol") or [])
+                 if str(p).lower().endswith("." + format)]
+        if not paths or not os.path.isfile(paths[0]):
+            raise ApiError(404, "not_found", f"No {format} protocol for job '{job_id}'.")
+        return FileResponse(paths[0], media_type="application/pdf" if format == "pdf"
+                            else "text/csv", filename=os.path.basename(paths[0]))
+
+    @router.get("/calibration/admissibility", tags=["calibration"],
+                summary="Allowed combinations of calibration type, measurement quantity "
+                        "and input optic (with the reason for each refusal)")
+    async def admissibility():
+        import calibration_sphere as csph
+        import calibration_workflow as cwf
+        return {"matrix": calprof.admissibility_matrix(),
+                "radiance_source_hint": cwf.RADIANCE_SOURCE_HINT,
+                "sphere_source_hint": csph.SPHERE_SOURCE_HINT,
+                "quantities": list(calprof.QUANTITIES),
+                "inputs": list(calprof.INPUT_OPTICS)}
+
     # ── reference sources (lamp import / removal) ─────────────────────────
     @router.post("/calibration/references", tags=["calibration"], dependencies=auth,
                  summary="Import a calibrated lamp (LMP / CSV text) into the reference library")
@@ -271,7 +319,8 @@ def register(router: APIRouter, ctx: V1Context) -> None:
                 return rs.ReferenceLibrary().import_file(
                     path, name=body.name, serial=body.serial, unit=body.unit,
                     valid_min_nm=body.valid_min_nm, valid_max_nm=body.valid_max_nm,
-                    input_optic=body.input_optic, notes=body.notes)
+                    input_optic=body.input_optic, notes=body.notes,
+                    quantity=body.quantity)
             finally:
                 try:
                     os.remove(path)
@@ -283,6 +332,7 @@ def register(router: APIRouter, ctx: V1Context) -> None:
         except ValueError as e:
             raise ApiError(400, "bad_request", f"Import failed: {e}")
         return json_safe({"ok": True, "id": src.id, "name": src.name,
+                          "quantity": src.quantity, "unit": src.unit,
                           "valid_min_nm": src.valid_min_nm, "valid_max_nm": src.valid_max_nm})
 
     @router.delete("/calibration/references/{source_id}", tags=["calibration"],
@@ -323,11 +373,47 @@ class DerivationRequest(BaseModel):
     activate: bool = True
 
 
+class SphereSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., min_length=1, description="Name of the sphere / port")
+    serial: str = ""
+    port_radius_mm: float = Field(..., gt=0, description="Port radius r (measured at the part)")
+    edge_depth_mm: float = Field(11.0, ge=0, description="Knife-edge plane to housing top")
+    cc_ref_offset_mm: float = Field(0.0, description="CC reference plane relative to its "
+                                    "support surface (positive = farther from the port)")
+    u_radius_mm: float = Field(0.0, ge=0, description="Standard uncertainty of r")
+    u_distance_mm: float = Field(0.0, ge=0, description="Standard uncertainty of a distance")
+    cc_uncertainty_pct: Optional[float] = Field(
+        None, ge=0, description="Relative standard uncertainty of the CC calibration "
+                                "(default: sphere_cc_uncertainty_pct)")
+    notes: str = ""
+
+
+class SphereRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sphere: SphereSpec
+    heights_mm: list[float] = Field(..., min_length=3, max_length=40,
+                                    description="Distance housing top to the CC support "
+                                                "surface per position (mm), first = smallest")
+    integration_ms: Optional[Union[_PosMs, Literal["auto"]]] = Field(
+        None, description="Integration time (ms, or 'auto' = auto exposure at the first "
+                          "distance; default auto)")
+    integration_us: Optional[int] = Field(None, gt=0)
+    frames: Optional[int] = Field(None, ge=2, le=1000)
+    save_on_failed_checks: bool = Field(
+        False, description="Save although the drift or consistency check failed "
+                           "(status 'saved' with saved_checks_failed=true)")
+
+
 class ReferenceImport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(..., min_length=1)
     serial: str = ""
-    unit: str = "uW/cm2/nm"
+    unit: str = Field("uW/cm2/nm", description="Irradiance unit (uW/cm2/nm, W/m2/nm, "
+                                               "mW/m2/nm) or radiance unit "
+                                               "(uW/cm2/sr/nm, W/m2/sr/nm, mW/m2/sr/nm)")
+    quantity: Optional[Literal["irradiance", "radiance"]] = Field(
+        None, description="Measurement quantity; default from the unit")
     valid_min_nm: Optional[float] = None
     valid_max_nm: Optional[float] = None
     input_optic: str = ""

@@ -28,6 +28,7 @@ EXPECTED_TOOLS = {
     "select_profile", "calibration_status", "list_references", "start_calibration",
     "export_measurement", "create_report",
     "verify_profile", "linearity_status", "start_linearity",
+    "start_sphere_characterization",
 }
 LIMIT = 8 * 1024
 
@@ -276,8 +277,8 @@ def test_calibration_tools(conn):
     h = conn
     p = h.ok("list_profiles")
     assert p["selection"] == "None"
-    assert {"value", "label", "state", "type", "unit", "valid_range_nm", "plausible"} == \
-        set(p["items"][0])
+    assert {"value", "label", "state", "type", "quantity", "input", "unit", "valid_range_nm",
+            "plausible", "legacy_valid_range_nm"} == set(p["items"][0])
     refs = h.ok("list_references")["references"]
     assert refs and refs[0]["id"]
     cs = h.ok("calibration_status")

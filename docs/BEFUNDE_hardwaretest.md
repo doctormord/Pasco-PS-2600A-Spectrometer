@@ -1,4 +1,4 @@
-# Befundliste Hardwaretest (Stand 2026-11-26)
+# Befundliste Hardwaretest (Stand 2026-11-27, nach feature/radiance)
 
 Grundlage: Branch `future`. Erster Test: LR-2T (S/N ASQ_SPC5636146), blanke Faser M25L02 200 µm NA 0,22, Referenz HAL-CAL 1808001, relative Kalibrierung.
 
@@ -22,19 +22,26 @@ Ergebnis Verifikation (vor PR #4): korrigiertes Spektrum der HAL-CAL vs. `.lmp` 
 15. Laufzeitdaten im Benutzerdatenverzeichnis mit Migration
 
 ## Erledigt mit feature/derivation-itime – Hardwaretest ausstehend
-16. Ableitung einer Optik aus einer anderen (`DerivationWorkflow`): eigene Integrationszeit je Seite (Auto-Belichtung auf dasselbe Zielband oder fest), Dunkel vor/nach je Seite bei ihrer Integrationszeit, abschließende Wiederholung der bekannten Seite mit Driftprüfung (`calibration_derivation_drift_pct`), Quellenhinweis im Assistenten, Protokoll PDF/CSV; Desktop, `/api/v1` und Web.
-18. Sättigungsschwelle `saturation_warn_frac` (Standard 0,90) für Desktop, Web, Aussteuerungsanzeige und Kalibrierabläufe.
-19. Projektregeln als `CLAUDE.md` im Repository.
+16. Ableitung: eigene Integrationszeit je Seite, Dunkel je Seite vor/nach, Wiederholung der bekannten Optik mit Driftbewertung (calibration_derivation_drift_pct = 2 %), Quellenhinweis, Protokoll PDF/CSV
+18. Sättigungsschwelle saturation_warn_frac (0,90) für Desktop, Web, Auto-Belichtung und Kalibrierabläufe
+19. CLAUDE.md im Repository
 
-Bericht: `docs/ABSCHLUSSBERICHT_derivation.md`.
+## Erledigt mit feature/radiance – Hardwaretest ausstehend
+17. Strahldichte: Messgröße `irradiance`/`radiance` für Referenzquellen und Profile (Migration: bestehende Profile → irradiance), Eingangsoptik `objective`, Zulässigkeitsregel (absolut irradiance: CC/sphere; absolut radiance: bare/objective; relativ: alle); Kugel als Strahldichte-Referenz (≥ 3 Abstände, Ausgleichsrechnung mit Versatz d0, Konsistenz je 50-nm-Band, Drift, Unsicherheit); absolute Strahldichte-Kalibrierung; Leuchtdichte in cd/m²; Desktop, Web, `/api/v1`, MCP; Protokolle PDF/CSV. Bericht: `docs/ABSCHLUSSBERICHT_radiance.md`, Checkliste `docs/TEST_radiance.md`.
+20. Testsuite-Absturz: drei Ursachen behoben – (a) GUI-Testmodule legten eigene QApplication an und zerstörten sie (jetzt eine für die ganze Sitzung), (b) TM-30-Thread des Farbtabs lief beim Abräumen des Fensters weiter (Qt-Abbruch ohne Traceback), (c) Pythons zyklische Speicherbereinigung lief in Hintergrundthreads und zerstörte dort Qt-Objekte (jetzt nur im GUI-Thread, auch in der Anwendung). Abnahme: 5 volle Läufe + 1 Lauf in zufälliger Reihenfolge grün.
+21. Migrierte Altprofile außerhalb ihres gültigen Bereichs maskiert (NaN), Hinweis in Profilanzeige, Status und Exportkopf.
+22. `calibration_itime_match_tol_pct` (0,5 %) und `calibration_dark_bright_frac` (0,5) konfigurierbar, im Protokoll ausgewiesen.
+23. Ableitung: Status `drift_check_failed` mit Betrag, unabhängig von der Plausibilitätsprüfung.
+24. PyInstaller-Beschreibungen aus `docs/PLAN_api_mcp.md` und `docs/TEST_api_mcp.md` entfernt.
+25. CLAUDE.md: Prüfläufe und Hilfsskripte mit `PS2600A_DATA_DIR` (Temp) und `PS2600A_SKIP_MIGRATION=1`; lokale Agentendefinitionen angepasst.
 
 ## Offen
 - keine
 
 ## Später
-17. Strahldichte: Einheit W/(m²·sr·nm), Profiltyp „absolute radiance“, Ablauf „absoluter Anker“ (relatives Profil × skalarer oder spektraler Faktor aus Referenzmessung). Weg ohne Reflexionsstandard: kleine Ulbricht-Kugel als Lambert-Quelle unter dem Objektiv, L = E·(r² + d²)/(π·r²) mit E aus CC-Absolutmessung im Abstand d über dem Port (Radius r), Kontrolle bei mehreren Abständen. Voraussetzung: Kugel vorhanden.
 - Treiber für Ocean USB2000+ (älteres Ocean-Protokoll), nur falls ein solches Gerät angeschafft wird.
 
 ## Hardwaretest ausstehend
 - Checkliste `docs/TEST_hardwaretest_fix.md`: LR-2T (Linearität, danach Spektralkalibrierung neu, Verifikation), HDX (Dunkelniveau optical_black, Lux bei Absolutprofil), PASCO, Migration.
-- Ableitung (Punkt 16) am Gerät: bekannte Optik (z. B. CC) und neue Optik (blanke Faser) an von hinten beleuchtetem Opalglas; Integrationszeiten, Aussteuerung, Drift und Protokoll prüfen.
+- Ableitung blanke Faser ↔ CC bzw. Mikroskop (Punkt 16) am Gerät.
+- Strahldichte (Punkt 17) nach `docs/TEST_radiance.md`: CC-Absolutprofil, Kugel vermessen (drei Abstände), Objektiv-Kalibrierung, Plausibilität der Leuchtdichte.

@@ -31,8 +31,8 @@ def _pump(app, sec):
 
 
 def test_desktop_remote_measure_matches_gui(isolated_config):
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
+    from conftest import qt_app
+    app = qt_app()          # session-wide QApplication (never re-created)
     isolated_config._data.update(remote_port=_free_port(), demo_fullscale_ms=100.0,
                                  dark_correction=True, hot_pixel_filter=True)
     from gui_dashboard import DashboardWindow

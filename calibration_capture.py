@@ -34,7 +34,21 @@ FRAME_STANDARD = "standard"     # == fusion.FRAME_STANDARD (kept local: no impor
 
 DEFAULT_DARK_FILE = "dark_spectra.json"
 MAX_DARKS_PER_DEVICE = 24
-ITIME_REL_TOL = 0.005           # 0.5 %: dark and light count as "same t_int"
+ITIME_REL_TOL = 0.005           # 0.5 %: default of "calibration_itime_match_tol_pct"
+
+
+def itime_rel_tol() -> float:
+    """Relative tolerance for "same integration time" (config
+    calibration_itime_match_tol_pct, in %; fallback ITIME_REL_TOL)."""
+    try:
+        from app_config import Config
+        v = Config.get("calibration_itime_match_tol_pct", None)
+        if v is None:
+            return ITIME_REL_TOL
+        v = float(v)
+        return max(0.0, v) / 100.0 if np.isfinite(v) else ITIME_REL_TOL
+    except Exception:
+        return ITIME_REL_TOL
 
 
 def now_iso() -> str:
@@ -159,7 +173,7 @@ class FrameAccumulator:
     """Callable frame tap that averages N clean frames.
 
     Accepted frames: kind == "standard", ratio == 1 (no fast-preview scaling)
-    and integration_us equal to the requested one (within ITIME_REL_TOL). The
+    and integration_us equal to the requested one (within itime_rel_tol()). The
     first `skip_first` accepted frames are discarded, because a driver may still
     deliver a frame integrated (partly) under the previous exposure setting."""
 
@@ -193,7 +207,7 @@ class FrameAccumulator:
         if abs(float(ratio) - 1.0) > 1e-9:
             self._reject("scaled"); return
         t = int(integration_us)
-        if abs(t - self.integration_us) > ITIME_REL_TOL * max(self.integration_us, 1):
+        if abs(t - self.integration_us) > itime_rel_tol() * max(self.integration_us, 1):
             self._reject("itime"); return
         px = np.asarray(pixels, dtype=np.float64)
         with self._lock:
@@ -422,7 +436,7 @@ def count_rate(light: Capture, dark: Capture) -> CountRate:
                          f"have different pixel counts.")
     warnings: list[str] = []
     tl, td = int(light.integration_us), int(dark.integration_us)
-    if abs(tl - td) > ITIME_REL_TOL * max(tl, 1):
+    if abs(tl - td) > itime_rel_tol() * max(tl, 1):
         warnings.append(
             f"Dark spectrum was taken at {td/1000:.3f} ms but the light spectrum "
             f"at {tl/1000:.3f} ms — take a new dark at the same integration time.")
@@ -614,7 +628,7 @@ def save_dark(dark: Capture) -> None:
     t = int(dark.integration_us)
     keep = [d for d in darks
             if not (_same_device(d, dark.backend, dark.serial)
-                    and abs(int(d["integration_us"]) - t) <= ITIME_REL_TOL * max(t, 1))]
+                    and abs(int(d["integration_us"]) - t) <= itime_rel_tol() * max(t, 1))]
     entry = dark.to_dict()
     entry["kind"] = "dark"
     keep.append(entry)
@@ -643,7 +657,7 @@ def find_dark(backend: str, serial: str | None, integration_us: int, *,
     for d in _load_darks():
         if not _same_device(d, backend, serial):
             continue
-        if abs(int(d["integration_us"]) - t) > ITIME_REL_TOL * max(t, 1):
+        if abs(int(d["integration_us"]) - t) > itime_rel_tol() * max(t, 1):
             continue
         if pixel_count is not None and len(d.get("mean", [])) != int(pixel_count):
             continue

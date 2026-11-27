@@ -19,9 +19,7 @@ import gui_tables as gt  # noqa: E402
 UR = Qt.ItemDataRole.UserRole
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    yield QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 @pytest.fixture

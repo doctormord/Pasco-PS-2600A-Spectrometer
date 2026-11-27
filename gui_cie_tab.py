@@ -8,7 +8,9 @@ Three nested sub-tabs:
 """
 
 from __future__ import annotations
+import atexit
 import os
+import weakref
 import time
 import colorsys
 import numpy as np
@@ -118,6 +120,18 @@ TCS_DISPLAY_COLORS = [
 # ════════════════════════════════════════════════════════════
 # Helpers
 # ════════════════════════════════════════════════════════════
+def _unit_html(unit: str) -> str:
+    return (f' <span style="color:{_T().FG3};font-size:11px;font-weight:400;">'
+            f' {unit}</span>') if unit else ""
+
+
+def _relabel_card(cell: QFrame, label: str, unit: str) -> None:
+    """Change caption and unit of a card in place (same widget, no layout
+    change; the value is set by the next _set_card)."""
+    cell._lbl.setText(label.upper())
+    cell._unit_html = _unit_html(unit)
+
+
 def _make_metric_card(label: str, default_value: str = "—",
                       unit: str = "", *, value_size: int = 28,
                       min_width: int = 0) -> QFrame:
@@ -129,13 +143,13 @@ def _make_metric_card(label: str, default_value: str = "—",
     lbl = QLabel(label.upper())
     lbl.setObjectName("statLbl")
     v.addWidget(lbl)
+    cell._lbl = lbl
     val = QLabel()
     val.setTextFormat(Qt.TextFormat.RichText)
     val.setStyleSheet(
         f"color:{_T().FG1};font-family:{FONT_MONO};"
         f"font-size:{value_size}px;font-weight:600;")
-    unit_html = (f' <span style="color:{_T().FG3};font-size:11px;font-weight:400;">'
-                 f' {unit}</span>') if unit else ""
+    unit_html = _unit_html(unit)
     val.setText(f"{default_value}{unit_html}")
     v.addWidget(val)
     cell._val = val
@@ -195,12 +209,17 @@ class _OverviewPage(QWidget):
         grid.setSpacing(10)
         self.card_cct = _make_metric_card("CCT", "—", "K", value_size=34)
         self.card_lux = _make_metric_card("Illuminance", "—", "lx", value_size=34)
-        self.card_lux.setToolTip(
+        self._radiance = False
+        self._TIP_LUX = (
             "Requires absolute radiometric calibration.\n"
             "Set radiometric_calibration_factor (W/m²/nm per ADC count)\n"
             "in spectrometer_config.json to enable this readout.\n"
             "All other metrics are shape-based and do not need calibration."
         )
+        self._TIP_LUM = (
+            "Luminance of a radiance spectrum (absolute radiance profile).\n"
+            "Illuminance and foot-candles are not defined for a radiance.")
+        self.card_lux.setToolTip(self._TIP_LUX)
         self.card_duv = _make_metric_card("Duv", "—", "",   value_size=28)
         self.card_ra  = _make_metric_card("CRI Ra", "—", "", value_size=34)
         grid.addWidget(self.card_cct, 0, 0)
@@ -267,11 +286,25 @@ class _OverviewPage(QWidget):
     def apply(self, m: dict, calibrated: bool = False) -> None:
         f = lambda v, fmt="{:.0f}": fmt.format(v) if np.isfinite(v) else "—"
         _set_card(self.card_cct,  f(m["cct"]))
+        radiance = m.get("quantity") == "radiance"
+        if radiance != self._radiance:
+            # Same cards, other caption: a radiance spectrum yields luminance
+            # (cd/m²), no illuminance and no foot-candles.
+            self._radiance = radiance
+            _relabel_card(self.card_lux, "Luminance" if radiance else "Illuminance",
+                          "cd/m²" if radiance else "lx")
+            self.card_lux.setToolTip(self._TIP_LUM if radiance else self._TIP_LUX)
+            self.card_fc.setToolTip("Not defined for a radiance." if radiance else "")
         # Illuminance and foot-candles require an absolute radiometric
         # calibration factor (W/m²/nm per ADC count). Without it the number
         # is ADC-count integrals × 683 — physically meaningless. Show "—"
         # until the user sets radiometric_calibration_factor in config.
-        if calibrated and np.isfinite(m["lux"]):
+        if radiance:
+            lum = m.get("luminance", float("nan"))
+            _set_card(self.card_lux, f(lum, "{:.4g}")
+                      if calibrated and np.isfinite(lum) else "—")
+            _set_card(self.card_fc, "—")
+        elif calibrated and np.isfinite(m["lux"]):
             _set_card(self.card_lux, f(m["lux"], "{:.1f}"))
             _set_card(self.card_fc,  f(m["fc"],  "{:.2f}"))
         else:
@@ -927,6 +960,33 @@ class _Tm30Worker(QObject):
         self.done.emit(tm, cq)
 
 
+_LIVE_THREADS: list = []          # [(QThread, worker)] not yet stopped
+
+
+def _register_thread(th, worker) -> None:
+    _LIVE_THREADS.append((th, worker))
+
+
+def _stop_qthread(th) -> None:
+    """quit + wait (bounded); safe on an already stopped / deleted thread.
+    Releases the registry entry only once the thread has really stopped."""
+    try:
+        if th is not None and th.isRunning():
+            th.quit()
+            th.wait(3000)
+        stopped = th is None or not th.isRunning()
+    except RuntimeError:                       # C++ object already deleted
+        stopped = True
+    if stopped:
+        _LIVE_THREADS[:] = [e for e in _LIVE_THREADS if e[0] is not th]
+
+
+@atexit.register
+def _stop_all_threads() -> None:
+    for th, _w in list(_LIVE_THREADS):
+        _stop_qthread(th)
+
+
 class CIETab(QWidget):
     UPDATE_EVERY_N_FRAMES = 5
     TM30_THROTTLE_S = 1.2        # wall-clock throttle for TM-30 (matches the web)
@@ -937,6 +997,7 @@ class CIETab(QWidget):
         self._frame_count = 0
         self._latest = None          # (wavelengths, intensities) last frame
         self._calib = 0.0            # lux calibration factor in use
+        self._quantity = "irradiance"   # photometric quantity of the spectrum
         self._tm30_last = 0.0        # monotonic time of last TM-30 dispatch
         self.report_meta_provider = None   # set by the dashboard; () -> dict
 
@@ -981,11 +1042,24 @@ class CIETab(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_tm30_thread)
+        # The worker thread must be stopped before this widget (and with it
+        # the QThread object) is destroyed: destroying a running QThread is a
+        # fatal Qt error that aborts the process without any Python traceback
+        # (the sporadic crashes of the test suite, finding 20). aboutToQuit is
+        # not emitted when a window is closed / garbage-collected without the
+        # event loop ending, so the thread is also stopped on destruction
+        # The finalizer holds only the thread (not this widget); the registry
+        # keeps thread + worker alive until they are stopped, so a running
+        # QThread is never deleted.
+        _register_thread(self._tm30_thread, self._tm30_worker)
+        weakref.finalize(self, _stop_qthread, self._tm30_thread)
+
+    def shutdown(self) -> None:
+        """Stop the TM-30 worker thread (host window close)."""
+        self._stop_tm30_thread()
 
     def _stop_tm30_thread(self) -> None:
-        if self._tm30_thread.isRunning():
-            self._tm30_thread.quit()
-            self._tm30_thread.wait(1500)
+        _stop_qthread(self._tm30_thread)
 
     def _on_tm30_done(self, tm, cq) -> None:
         self._tm30_busy = False
@@ -1028,7 +1102,8 @@ class CIETab(QWidget):
             "color_report", fmt, export_paths.meta_from_report(meta, wl))
         try:
             cs.render_color_report(path, wl, inten, fmt=fmt,
-                                   lux_calibration=self._calib, meta=meta)
+                                   lux_calibration=self._calib, meta=meta,
+                                   quantity=self._quantity)
             self.lbl_export.setText(f"Saved {os.path.basename(path)}"
                                     + (f"  ⚠ {path_err}" if path_err else ""))
         except ImportError:
@@ -1049,7 +1124,7 @@ class CIETab(QWidget):
             "color_metrics", "csv", export_paths.meta_from_report(meta, wl))
         try:
             import csv
-            rows = cs.color_report_rows(wl, inten, self._calib)
+            rows = cs.color_report_rows(wl, inten, self._calib, self._quantity)
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 wr = csv.writer(fh)
                 wr.writerow(["Metric", "Value"])
@@ -1062,18 +1137,23 @@ class CIETab(QWidget):
     def update_measurement(self, wavelengths_nm: np.ndarray,
                            intensities: np.ndarray,
                            lux_calibration: float | None = None,
-                           metrics=_COMPUTE) -> None:
+                           metrics=_COMPUTE,
+                           quantity: str = "irradiance") -> None:
         """lux_calibration: None → use radiometric_calibration_factor from the
         config (legacy). With an ABSOLUTE calibration profile active the
         dashboard passes E(λ) in W/(m²·nm) and lux_calibration=1.0, so lux is
         computed directly from the spectral irradiance and the scalar factor is
         ignored.
 
+        quantity: 'radiance' when the spectrum is a radiance (luminance in
+        cd/m² instead of illuminance); see processing.photometric_quantity.
+
         metrics: colour metrics already computed by the shared engine
         (engine.Engine.color_metrics_for, throttled there). None = no fresh
         metrics for this frame (pages keep their values). Omitted = compute
         here (standalone use / tests)."""
         self._lux_override = lux_calibration
+        self._quantity = quantity if quantity == "radiance" else "irradiance"
         self._latest = (np.asarray(wavelengths_nm, dtype=float),
                         np.asarray(intensities, dtype=float))
         self._frame_count += 1
@@ -1118,7 +1198,7 @@ class CIETab(QWidget):
                      else float(Config.get("radiometric_calibration_factor", 0.0)))
             self._calib = calib
             m = cs.measure_all(wavelengths_nm, intensities,
-                               lux_calibration=calib)
+                               lux_calibration=calib, quantity=self._quantity)
         except Exception:
             return
         self.overview_page.apply(m, calibrated=(calib > 0.0))

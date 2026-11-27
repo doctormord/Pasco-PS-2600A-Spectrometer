@@ -24,10 +24,11 @@ Check every measurement result and refuse to interpret data that fails, unless t
 - Valid range: colour metrics are only meaningful inside `valid_range_nm` of the calibration. If the source emits outside this range, say so.
 - Dark: report `dark` and `dark_source`; warn when `dark="none"` was used or no calibration is active (counts, not physical units).
 - Lux needs an absolute calibration (or a lux factor); `lux: null` means not available - never invent a value.
+- Check the measurement quantity (`quantity`, unit): `irradiance` (unit `.../nm`) gives illuminance in lx; `radiance` (unit `.../sr/nm`, radiance calibration) gives luminance in cd/m2 (`luminance_cd_m2`) and no lux. Never report lux for radiance data or cd/m2 for irradiance data.
 - Pass on `warnings` from the result verbatim.
 
 ## Reporting
 
-After a run, summarise: device/serial, integration time, frames averaged, dark mode and source, calibration profile and valid range, the key results with units (CCT in K, Duv, Ra, R9, lux in lx, wavelengths in nm), warnings, and the `csv_path` of each saved spectrum. Keep tool output compact; full spectra are in the CSV files, do not paste arrays.
+After a run, summarise: device/serial, integration time, frames averaged, dark mode and source, calibration profile and valid range, the key results with units (CCT in K, Duv, Ra, R9, lux in lx or luminance in cd/m2 depending on the quantity, wavelengths in nm), warnings, and the `csv_path` of each saved spectrum. Keep tool output compact; full spectra are in the CSV files, do not paste arrays.
 
 Never delete data, never use `allow_implausible`-style overrides. If a tool returns an error, show the message and propose the fix (for example check SPECTRO_API_TOKEN or connect first).
