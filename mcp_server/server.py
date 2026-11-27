@@ -176,6 +176,7 @@ def _status_view(st: dict) -> dict:
         "serial": st.get("serial"), "exposure_ms": st.get("exposure_ms"),
         "auto_exposure": st.get("auto_exposure"),
         "frames_to_average": st.get("frames_to_average"), "unit": st.get("unit"),
+        "quantity": st.get("quantity"),
         "calibration": {"label": cal.get("label"), "state": cal.get("state"),
                         "type": cal.get("type"), "valid_range_nm": cal.get("valid_range_nm")},
         "control": {"owner": ctl.get("owner"), "reason": ctl.get("reason")} if ctl.get("owner")
@@ -192,11 +193,15 @@ def _profile_items(payload: dict) -> list[dict]:
 def _color_view(c: dict | None) -> dict | None:
     if not c:
         return None
+    lum = c.get("luminance")
     ri = c.get("Ri") or []
-    return {"cct": c.get("cct"), "duv": c.get("duv"), "x": c.get("x"), "y": c.get("y"),
-            "Ra": c.get("Ra"), "R9": ri[8] if len(ri) > 8 else None, "lux": c.get("lux"),
-            "peak_nm": c.get("peak_nm"), "dominant_nm": c.get("dominant_nm"),
-            "centroid_nm": c.get("centroid_nm"), "fwhm_nm": c.get("fwhm_nm")}
+    out = {"cct": c.get("cct"), "duv": c.get("duv"), "x": c.get("x"), "y": c.get("y"),
+           "Ra": c.get("Ra"), "R9": ri[8] if len(ri) > 8 else None, "lux": c.get("lux"),
+           "peak_nm": c.get("peak_nm"), "dominant_nm": c.get("dominant_nm"),
+           "centroid_nm": c.get("centroid_nm"), "fwhm_nm": c.get("fwhm_nm")}
+    if _finite(lum):                       # radiance data only
+        out["luminance_cd_m2"] = lum
+    return out
 
 
 def _thin(wl: list, vals: list, max_points: int) -> list[list[float]]:
@@ -238,7 +243,8 @@ def _measurement_view(m: dict, csv_path: str | None, csv_error: str | None = Non
         "device": {"backend": dev.get("backend"), "serial": dev.get("serial")},
         "acquisition": {k: a.get(k) for k in ("integration_ms", "frames", "peak_frac",
                                               "n_saturated", "dark", "dark_source")},
-        "unit": m.get("unit"), "valid_range_nm": m.get("valid_range_nm"),
+        "unit": m.get("unit"), "quantity": m.get("quantity"),
+        "valid_range_nm": m.get("valid_range_nm"),
         "calibration": {"label": cal.get("label"), "state": cal.get("state"),
                         "type": cal.get("type")},
         "color": _color_view(m.get("color")), "peaks": peaks,
@@ -554,7 +560,13 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
             source = {"live": True, "timestamp": s.get("timestamp")}
         pts = [(w, v) for w, v in zip(wl, vals) if _finite(w) and _finite(v)]
         out: dict = {"source": source, "unit": s.get("unit"), "unit_label": s.get("unit_label"),
+                     "quantity": s.get("quantity"),
                      "valid_range_nm": s.get("valid_range_nm"), "n": len(pts)}
+        lum = s.get("luminance_cd_m2")
+        if lum is None and s.get("quantity") == "radiance":
+            lum = (s.get("color") or {}).get("luminance")
+        if lum is not None:
+            out["luminance_cd_m2"] = lum
         if pts:
             wmax, vmax = max(pts, key=lambda p: p[1])[0], max(p[1] for p in pts)
             out["wavelength_range_nm"] = [pts[0][0], pts[-1][0]]
@@ -575,15 +587,18 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
     # ---- analysis -----------------------------------------------------------
     @tool("analyze_color",
           "Colour metrics of a stored measurement (measurement_id) or the live spectrum "
-          "(omit): CCT (K), Duv, x/y, CRI Ra and R1-R15, R9, lux (needs absolute calibration or "
-          "a lux factor), dominant / peak / centroid wavelength (nm), FWHM (nm), purity, SDCM, "
+          "(omit): CCT (K), Duv, x/y, CRI Ra and R1-R15, R9, lux (irradiance; needs absolute "
+          "calibration or a lux factor) or, for a radiance calibration (unit .../sr/nm), "
+          "luminance_cd_m2 (cd/m2; lux is then not available); quantity says which. Dominant / peak / centroid wavelength (nm), FWHM (nm), purity, SDCM, "
           "S/P ratio.", read_only=True)
     async def analyze_color(measurement_id: str | None = None) -> dict:
         res = await api.post("/analyze/color", {"measurement_id": measurement_id}
                              if measurement_id else {})
         met = {k: v for k, v in (res.get("metrics") or {}).items()
                if not (isinstance(v, list) and len(v) > 20) and k != "tcs_swatches"}
-        return {"source": res.get("source"), "unit": res.get("unit"), "metrics": met}
+        return {"source": res.get("source"), "unit": res.get("unit"),
+                "quantity": res.get("quantity"),
+                "luminance_cd_m2": res.get("luminance_cd_m2"), "metrics": met}
 
     @tool("find_peaks",
           "Peak detection in a measurement (measurement_id) or the live spectrum (omit). "
@@ -640,32 +655,45 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
         return res
 
     @tool("calibration_status",
-          "State of the active calibration: label, state, type, unit, valid_range_nm, message.",
+          "State of the active calibration: label, state, type, unit, quantity (irradiance: "
+          "unit .../nm, result in lux; radiance: unit .../sr/nm, result luminance in cd/m2), "
+          "valid_range_nm, message.",
           read_only=True)
     async def calibration_status() -> dict:
         return await api.get("/calibration/status")
 
     @tool("list_references",
           "Reference light sources (calibration lamps) available for start_calibration: id, "
-          "name, serial, unit (absolute references have an irradiance unit), valid range, "
-          "recommended input optic.", read_only=True)
+          "name, serial, unit, quantity (irradiance | radiance; a radiance reference such as a "
+          "characterised sphere has a .../sr/nm unit), valid range, recommended input optic, "
+          "short meta (sphere geometry, d0, CC profile, uncertainty).", read_only=True)
     async def list_references() -> dict:
-        return {"references": await api.get("/calibration/references")}
+        keys = ("id", "name", "serial", "unit", "quantity", "valid_min_nm", "valid_max_nm",
+                "input_optic", "builtin", "meta")
+        return {"references": [{k: r.get(k) for k in keys}
+                               for r in await api.get("/calibration/references")]}
 
     @tool("start_calibration",
           "Start a spectral calibration run as a job. kind: relative | absolute (absolute needs "
-          "an absolute reference and optics_input CC or sphere); reference_id from "
-          "list_references; optics_name: free text name of the optic; optics_input: CC (cosine "
-          "corrector) | sphere | bare (bare fibre); integration_ms: ms or 'auto'. The run "
+          "an absolute reference); reference_id from list_references (its quantity decides: "
+          "irradiance reference -> absolute irradiance profile, radiance reference -> "
+          "absolute radiance profile); optics_name: free text name of the optic; optics_input: "
+          "CC (cosine corrector) | sphere | bare (bare fibre) | objective. Admissible for "
+          "absolute: irradiance with CC or sphere; radiance with bare or objective "
+          "(source filling the field of view, e.g. the characterised sphere port); relative "
+          "is always allowed. An inadmissible combination is refused with the reason "
+          "(HTTP 422). integration_ms: ms or 'auto'. The run "
           "pauses for user steps (cover / uncover the light path): tell the user what the "
           "prompt says and call continue_job only after confirmation. Never set "
           "allow_implausible / save_on_failed_checks without explicit user consent. Follow "
-          "with job_status; the result reports status (saved / not_saved_implausible / "
-          "not_saved_checks_failed), plausibility, checks and the protocol path.")
+          "with job_status; the result reports status (saved / saved_implausible / "
+          "not_saved_implausible / not_saved_checks_failed; a derivation reports "
+          "drift_check_failed when the source drift check failed), plausibility, checks and "
+          "the protocol path.")
     async def start_calibration(
             reference_id: str, optics_name: str,
             kind: Literal["relative", "absolute"] = "relative",
-            optics_input: Literal["CC", "sphere", "bare"] = "CC",
+            optics_input: Literal["CC", "sphere", "bare", "objective"] = "CC",
             integration_ms: float | Literal["auto"] = "auto",
             allow_implausible: bool = False, save_on_failed_checks: bool = False) -> dict:
         body = {"kind": kind, "reference_id": reference_id,
@@ -680,6 +708,45 @@ def build_server(client: SpectroClient | None = None) -> MCPServer:
                                 "the light path / cover the lamp, uncover = release it) and call "
                                 "continue_job only after they confirm. Poll job_status until "
                                 "done, then report status, plausibility and the protocol path."}
+
+    @tool("start_sphere_characterization",
+          "Characterise an integrating sphere as a RADIANCE reference as a job. Prerequisite: "
+          "the active calibration is an absolute irradiance profile with a cosine corrector "
+          "(refused with the reason otherwise, HTTP 422). The CC is placed on the sphere port at "
+          "heights_mm (distance housing top -> CC support surface, at least 3, smallest "
+          "first); sphere_name, port_radius_mm (measured at the part) are required; "
+          "edge_depth_mm default 11.0 (knife edge to housing top), cc_ref_offset_mm default 0, "
+          "u_radius_mm / u_distance_mm / cc_uncertainty_pct for the uncertainty. The job pauses "
+          "for user steps (action mount, cover, uncover, position per height, repeat, cover): "
+          "tell the user what the prompt says (set the CC to that height, keep the lamp "
+          "unchanged) and call continue_job only after confirmation. Never set "
+          "save_on_failed_checks without explicit user consent. The result reports status "
+          "(saved | not_saved_checks_failed; saved with saved_checks_failed=true when saved "
+          "although the checks failed), source_id (a reference source with quantity radiance "
+          "for start_calibration), d0_mm, d0_plausible, method, consistency, drift, uncertainty, "
+          "valid_range_nm, warnings and the protocol path.")
+    async def start_sphere_characterization(
+            sphere_name: str, port_radius_mm: float, heights_mm: list[float],
+            serial: str = "", edge_depth_mm: float = 11.0, cc_ref_offset_mm: float = 0.0,
+            u_radius_mm: float = 0.0, u_distance_mm: float = 0.0,
+            cc_uncertainty_pct: float | None = None,
+            integration_ms: float | Literal["auto"] = "auto",
+            save_on_failed_checks: bool = False) -> dict:
+        sphere = {"name": sphere_name, "serial": serial, "port_radius_mm": port_radius_mm,
+                  "edge_depth_mm": edge_depth_mm, "cc_ref_offset_mm": cc_ref_offset_mm,
+                  "u_radius_mm": u_radius_mm, "u_distance_mm": u_distance_mm}
+        if cc_uncertainty_pct is not None:
+            sphere["cc_uncertainty_pct"] = cc_uncertainty_pct
+        body = {"sphere": sphere, "heights_mm": heights_mm, "integration_ms": integration_ms,
+                "save_on_failed_checks": save_on_failed_checks}
+        res = await api.post("/calibration/spheres", body)
+        job = await job_wait(res["job"]["id"], 3.0)
+        return {"job": _job_view(job),
+                "instructions": "Sphere characterisation is a multi-step job. Whenever status "
+                                "is waiting_for_user, relay the prompt to the user and call "
+                                "continue_job only after they confirm. Poll job_status until "
+                                "done, then report status, d0, consistency, drift, uncertainty "
+                                "and the source_id."}
 
     @tool("verify_profile",
           "Verify a saved calibration profile: the reference source is measured with the "

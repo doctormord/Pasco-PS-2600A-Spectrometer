@@ -185,6 +185,7 @@ class FrameEvent:
     display_unit: str | None = None
     display_mode: str | None = None
     exposure: dict | None = None         # drive level in ADC (processing.exposure_level)
+    quantity: str = "irradiance"         # photometric quantity of `unit` (lx vs. cd/m²)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1089,6 +1090,9 @@ class Engine:
     def calibration_status(self) -> dict:
         st = json_safe(dict(self.calib.status))
         st["display_unit"] = self.current_unit
+        st.setdefault("quantity", processing.unit_quantity(self.current_unit)
+                      if processing.is_absolute_unit(self.current_unit) else "irradiance")
+        st["photometric_quantity"] = processing.photometric_quantity(self.current_unit)
         st["linearity"] = json_safe(dict(self.linearity_info or {}))
         return st
 
@@ -1261,8 +1265,9 @@ class Engine:
                                         wavelengths=wl, **kwargs), kwargs
 
     def lux_calibration(self, unit: str) -> float | None:
-        """Lux factor the photometry uses: 1.0 for an absolute profile
-        (E(λ) in W/(m²·nm)), else the configured radiometric factor."""
+        """Photometric factor: 1.0 for an absolute profile (E(λ) in W/(m²·nm)
+        → lux, or L(λ) in W/(m²·sr·nm) → cd/m²), else the configured
+        radiometric factor (irradiance, lux)."""
         if processing.is_absolute_unit(unit):
             return 1.0
         try:
@@ -1276,7 +1281,8 @@ class Engine:
         spd, lux_cal = processing.photometric_inputs(values, unit)
         if lux_cal is None:
             lux_cal = self.lux_calibration(unit)
-        return cs.measure_all(np.asarray(wl, float), spd, lux_calibration=lux_cal)
+        return cs.measure_all(np.asarray(wl, float), spd, lux_calibration=lux_cal,
+                              quantity=processing.photometric_quantity(unit))
 
     def _fused_emit(self, pixels, ob_mean: float, integration_us: int) -> None:
         """Fusion output sink → process → notify listeners."""
@@ -1415,7 +1421,8 @@ class Engine:
                 heatmap_column=None if col is None else col.copy(),
                 heatmap_time=ptime,
                 display=np.array(dvals, float), display_unit=dunit,
-                display_mode=mode, exposure=exposure)
+                display_mode=mode, exposure=exposure,
+                quantity=processing.photometric_quantity(self.current_unit))
             self.last_frame = ev
         if notify:
             self._emit("frame", ev)
@@ -1481,6 +1488,7 @@ class Engine:
             "irradiance_unit": cfg.get("irradiance_unit", "uW/cm2/nm"),
             "unit": self.current_unit,
             "unit_label": processing.unit_label(self.current_unit),
+            "quantity": processing.photometric_quantity(self.current_unit),
             "fps": round(float(self.fps), 2),
             "ob_mean": round(float(self.latest_ob_mean), 3),
             "supports_ob": bool(self.supports_ob),
@@ -1589,6 +1597,8 @@ class Engine:
         if dunit:
             rows.append(("Display unit", processing.unit_label(dunit)))
         rows.append(("Unit", unit))
+        if self.calib.active_v2 and processing.is_absolute_unit(unit):
+            rows.append(("Quantity", processing.unit_quantity(unit)))
         if self.calib.active_v2:
             vr = st.get("valid_range_nm")
             if vr:
@@ -1789,6 +1799,7 @@ class Engine:
                             "valid_segments_nm": st.get("valid_segments_nm"),
                             "implausible": bool(st.get("implausible", False))},
             "unit": unit, "unit_label": processing.unit_label(unit),
+            "quantity": processing.photometric_quantity(unit),
             "valid_range_nm": st.get("valid_range_nm"),
             "wavelengths": np.asarray(cap.wl, float),
             "values": np.asarray(out["pixels"], float),
@@ -2167,15 +2178,23 @@ class Engine:
             ref = rs.ReferenceLibrary().get(str(reference_id))
             if ref is None:
                 return None
+            # unscaled only for the SAME measurement quantity (irradiance
+            # reference on an irradiance display, radiance on radiance);
+            # otherwise the curve is scaled onto the display like a relative one
+            q = processing.unit_quantity(ref.unit)
+            self._overlay_ref_quantity = {str(reference_id): q}
             try:
                 e = (ref.on_axis(wl, unit=display_unit)
                      if processing.is_absolute_unit(display_unit)
-                     and processing.is_absolute_unit(ref.unit) else ref.on_axis(wl))
+                     and q == processing.unit_quantity(display_unit) else ref.on_axis(wl))
             except Exception:                                    # noqa: BLE001
                 e = ref.on_axis(wl)
+                self._overlay_ref_quantity = {str(reference_id): None}
             self._overlay_cache = {key: e}
         e = np.asarray(e, float)
-        if processing.is_absolute_unit(display_unit):
+        ref_q = getattr(self, "_overlay_ref_quantity", {}).get(str(reference_id))
+        if (processing.is_absolute_unit(display_unit)
+                and ref_q == processing.unit_quantity(display_unit)):
             return e
         v = np.asarray(display_values, float)
         m = np.isfinite(v) & np.isfinite(e) & (e > 0)
@@ -2447,6 +2466,152 @@ class Engine:
         except Exception as e:                                   # noqa: BLE001
             return [], f"Protocol not written: {e}"
 
+    def submit_sphere_characterization(self, params: dict, *, owner: str) -> Job:
+        """Characterise an integrating sphere as a radiance reference with the
+        CC and the active absolute irradiance profile (calibration_sphere).
+        User steps (waiting_for_user, action): mount (CC at the port, smallest
+        distance) -> integration time -> cover -> dark before -> uncover -> one
+        'position' step per height -> 'repeat' (first distance again) -> cover
+        -> dark after -> compute -> save -> protocol (PDF + CSV).
+
+        Parameters: heights_mm (list, at least the configured minimum),
+        integration_ms / integration_us (None / "auto" = auto exposure at the
+        first distance), frames, sphere {name, serial, port_radius_mm,
+        edge_depth_mm (11.0), cc_ref_offset_mm (0), u_radius_mm, u_distance_mm,
+        cc_uncertainty_pct, notes}, save_on_failed_checks."""
+        import calibration_sphere as cs_
+        b = self._require_backend()
+        p = dict(params or {})
+        sc_cfg = cs_.SphereConfig.from_config()
+        if p.get("frames"):
+            sc_cfg.n_frames = max(2, int(p["frames"]))
+        try:
+            heights = [float(h) for h in (p.get("heights_mm") or [])]
+        except (TypeError, ValueError):
+            raise Unprocessable("heights_mm must be a list of numbers (mm).")
+        if len(heights) < sc_cfg.min_positions:
+            raise Unprocessable(f"At least {sc_cfg.min_positions} distances (heights_mm) "
+                                f"are needed.")
+        if len({round(h, 6) for h in heights}) != len(heights):
+            raise Unprocessable("The distances (heights_mm) must all differ.")
+        try:
+            sc = cs_.SphereCharacterization(b, self.device_name, cfg=sc_cfg,
+                                            sphere=dict(p.get("sphere") or {}))
+            for h in heights:
+                if h < -sc.sphere["edge_depth_mm"]:
+                    raise ValueError("The CC cannot lie below the knife-edge plane.")
+        except ValueError as e:
+            raise Unprocessable(str(e))
+        if p.get("integration_us") is not None:
+            t_us = max(1, int(round(float(p["integration_us"]))))
+        elif p.get("integration_ms") in (None, "auto"):
+            t_us = None
+        else:
+            t_us = max(1, int(round(float(p["integration_ms"]) * 1000.0)))
+        n = len(heights)
+
+        def run(ctx: JobContext):
+            res: dict = {"status": "failed", "protocol": [],
+                         "source_hint": cs_.SPHERE_SOURCE_HINT,
+                         "quantity": "radiance", "source_id": None}
+            try:
+                ctx.wait_for_user(
+                    f"Mount the cosine corrector on the sphere port at the smallest "
+                    f"distance (height {heights[0]:g} mm above the housing top). "
+                    + cs_.SPHERE_SOURCE_HINT + " Then continue.", action="mount")
+                ctx.progress(0.05, "integration time", step="integration")
+                info = sc.set_integration(t_us, auto=t_us is None)
+                res["integration_us"] = int(info["integration_us"])
+                if sc.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the port. The dark "
+                                      "spectrum is captured next.", action="cover")
+                ctx.check()
+                ctx.progress(0.1, "dark spectrum (before)", step="dark_before")
+                sc.capture_dark("before")
+                self.calib.invalidate_darks()
+                if sc.needs_user_cover:
+                    ctx.wait_for_user("Release the light path / uncover the port. The "
+                                      "first distance is captured next.", action="uncover")
+                ctx.check()
+                for i, h in enumerate(heights):
+                    ctx.wait_for_user(f"Set the cosine corrector to the height {h:g} mm "
+                                      f"(position {i + 1} of {n}), then continue.",
+                                      action="position")
+                    ctx.progress(0.15 + 0.5 * i / n, f"position {i + 1}/{n} ({h:g} mm)",
+                                 step="position")
+                    sc.capture_position(h)
+                ctx.wait_for_user(f"Set the cosine corrector back to the first height "
+                                  f"({heights[0]:g} mm) for the repeat (source drift), "
+                                  f"then continue.", action="repeat")
+                ctx.progress(0.7, "repeat of the first distance", step="repeat")
+                sc.capture_repeat()
+                if sc.needs_user_cover:
+                    ctx.wait_for_user("Block the light path / cover the port again. The "
+                                      "dark spectrum AFTER the measurements is taken "
+                                      "next.", action="cover")
+                ctx.check()
+                ctx.progress(0.78, "dark spectrum (after)", step="dark_after")
+                sc.capture_dark("after")
+                self.calib.invalidate_darks()
+                ctx.progress(0.85, "computing", step="compute")
+                try:
+                    r = sc.compute()
+                except (ValueError, RuntimeError) as e:
+                    res["error"] = str(e)
+                    return res
+                res.update(d0_mm=json_safe(r["d0_mm"]),
+                           d0_plausible=bool(r["d0_plausible"]), method=r["method"],
+                           consistency=json_safe({
+                               "pass": r["consistency_pass"],
+                               "max_pct": r["consistency_max_pct"],
+                               "overall": r["overall"],
+                               "bands": [{k: v for k, v in bd.items()
+                                          if not isinstance(v, (list, np.ndarray))}
+                                         for bd in r["bands"]]}),
+                           drift=json_safe(sc.drift),
+                           uncertainty=json_safe(r["uncertainty"]),
+                           valid_range_nm=json_safe(r["valid_range_nm"]),
+                           checks=json_safe(sc.checks))
+                ctx.progress(0.92, "saving", step="save")
+                if not sc.checks_passed and not p.get("save_on_failed_checks"):
+                    res["status"] = "not_saved_checks_failed"
+                    res["failed_checks"] = sc.failed_checks()
+                    return res
+                src = sc.save(allow_failed_checks=True)
+                res["source_id"] = src.id
+                res["status"] = "saved"
+                if not sc.checks_passed:
+                    res["saved_checks_failed"] = True
+                    res["failed_checks"] = sc.failed_checks()
+                self._overlay_cache = {}
+                return res
+            finally:
+                res["warnings"] = list(sc.warnings)
+                if sc.result is not None or res.get("error"):
+                    try:
+                        ctx.progress(0.96, "writing the protocol", step="protocol")
+                    except JobCancelled:
+                        pass
+                    res["protocol"], res["protocol_message"] = \
+                        self._write_sphere_protocol(sc)
+                ctx.job.result = res
+        return self.jobs.submit("sphere", run, p, owner)
+
+    def _write_sphere_protocol(self, sc) -> tuple[list[str], str]:
+        try:
+            import calibration_report as crp
+            import export_paths
+            if not hasattr(crp, "write_sphere_protocol"):
+                return [], "Protocol not written: sphere protocol not available."
+            rec = sc.record()
+            d, note = export_paths.calibration_protocol_dir()
+            base = crp.default_sphere_basename(rec)
+            paths = crp.write_sphere_protocol(rec, os.path.join(d, base + ".pdf"),
+                                              os.path.join(d, base + ".csv"))
+            return list(paths or []), note or ""
+        except Exception as e:                                   # noqa: BLE001
+            return [], f"Protocol not written: {e}"
+
     def _write_protocol(self, wf) -> tuple[list[str], str]:
         try:
             import calibration_report as crp
@@ -2491,6 +2656,8 @@ def measurement_to_csv(rec: dict) -> str:
             ("Calibration profile", cal.get("label")),
             ("Profile id", cal.get("profile_id") or ""), ("Profile type", cal.get("type") or ""),
             ("Unit", rec["unit"])]
+    if processing.is_absolute_unit(rec["unit"]):
+        meta.append(("Quantity", processing.unit_quantity(rec["unit"])))
     vr = rec.get("valid_range_nm")
     if vr:
         meta.append(("Valid range (nm)", f"{float(vr[0]):.1f}-{float(vr[1]):.1f}"))

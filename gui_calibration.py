@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 import calibration_capture as cc
 import calibration_profiles as calprof
+import calibration_sphere as csph
 import calibration_workflow as cw
 import reference_sources as rs
 import wavelength_calibration as wlcal
@@ -248,6 +249,12 @@ class CalibrationDialog(QDialog):
             except Exception as e:
                 print(f"[calib] on_calibration_profiles_changed failed: {e}")
         for t in (self.tab_wizard, self.tab_profiles):
+            t.refresh()
+
+    def notify_references_changed(self) -> None:
+        """The reference library changed (e.g. a sphere characterisation was
+        saved): refresh the lamps tab and the wizard's reference list."""
+        for t in (self.tab_lamps, self.tab_wizard):
             t.refresh()
 
     def notify_scope_reference_changed(self) -> None:
@@ -961,6 +968,13 @@ _DERIV_KEYS = ["selection"] + [k for k, _ in cw.DERIVATION_STEPS] + ["protocol"]
 _DERIV_STEPS = (["Selection"] + [label for _, label in cw.DERIVATION_STEPS]
                 + ["Protocol"])
 _DERIV_IX = {k: i for i, k in enumerate(_DERIV_KEYS)}
+_SPHERE_KEYS = ["selection"] + [k for k, _ in csph.SPHERE_STEPS] + ["protocol"]
+_SPHERE_STEPS = (["Selection"] + [label for _, label in csph.SPHERE_STEPS]
+                 + ["Protocol"])
+_SPHERE_IX = {k: i for i, k in enumerate(_SPHERE_KEYS)}
+_MODE_STEPS = (_LAMP_STEPS, _DERIV_STEPS, _SPHERE_STEPS)
+_SPHERE_COLORS = ((120, 180, 255), (120, 200, 120), (200, 200, 120),
+                  (220, 120, 200), (120, 220, 220), (230, 150, 90))
 _STATE_TEXT = {"waiting": "waiting", "running": "running", "ok": "OK",
                "warning": "warning", "error": "ERROR", "failed": "FAILED"}
 # Leading symbol: the state stays recognisable without colour.
@@ -1005,6 +1019,9 @@ class _SpectralWizardTab(QWidget):
         self._runner = None
         self._wf = None
         self._dw = None
+        self._sc = None
+        self._refs_changed = False          # library changed during the run
+        self._type_reason = ""
         self._resumed = False
         self._demo_restore = None            # (backend, previous spectrum name)
         self._step_names: list[str] = []
@@ -1042,7 +1059,8 @@ class _SpectralWizardTab(QWidget):
 
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(["Calibrate against a reference lamp",
-                                "Derive from other optics"])
+                                "Derive from other optics",
+                                "Characterise a sphere (radiance reference)"])
         self.cmb_mode.setToolTip("Calibration mode")
         self.cmb_mode.currentIndexChanged.connect(self._mode_changed)
         lv.addWidget(self.cmb_mode)
@@ -1050,6 +1068,7 @@ class _SpectralWizardTab(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_lamp_form())
         self.stack.addWidget(self._build_deriv_form())
+        self.stack.addWidget(self._build_sphere_form())
         lv.addWidget(self.stack)
 
         g = QGridLayout()
@@ -1209,7 +1228,8 @@ class _SpectralWizardTab(QWidget):
         self.edit_notes = QLineEdit(); self.edit_notes.setPlaceholderText("Notes")
         f.addRow("Notes:", self.edit_notes)
         self.cmb_input = QComboBox(); self.cmb_input.addItems(list(calprof.INPUT_OPTICS))
-        self.cmb_input.setToolTip("Input optic: cosine corrector, bare fibre or sphere")
+        self.cmb_input.setToolTip("Input optic: cosine corrector, bare fibre, sphere "
+                                  "or objective")
         self.cmb_input.currentIndexChanged.connect(self._input_changed)
         self.cmb_type = QComboBox()
         self.cmb_type.addItems([calprof.TYPE_RELATIVE, calprof.TYPE_ABSOLUTE])
@@ -1223,7 +1243,7 @@ class _SpectralWizardTab(QWidget):
         f.addRow("Reference:", self.cmb_ref)
         # Space for the source notes is reserved permanently, so showing /
         # hiding a warning never moves the rest of the dialog. Full width.
-        self.lbl_ref_info = FixedTextPane(3)
+        self.lbl_ref_info = FixedTextPane(5)
         f.addRow(self.lbl_ref_info)
         return w
 
@@ -1272,6 +1292,57 @@ class _SpectralWizardTab(QWidget):
         f.addRow("Integration (new):", row)
         return w
 
+    def _build_sphere_form(self) -> QWidget:
+        w, f = self._form()
+        hint = QLabel("Radiance of an integrating-sphere port from the irradiance of "
+                      "the CC at several distances: L = E · (r² + d²) / (π · r²). "
+                      "The result is stored as a radiance reference source.")
+        hint.setWordWrap(True)
+        f.addRow(hint)
+        self.lbl_sphere_hint = QLabel(f"<b>{csph.SPHERE_SOURCE_HINT}</b>")
+        self.lbl_sphere_hint.setWordWrap(True)
+        self.lbl_sphere_hint.setTextFormat(Qt.TextFormat.RichText)
+        f.addRow(self.lbl_sphere_hint)
+        self.lbl_sphere_cc = ElidedLabel("")
+        f.addRow("CC profile:", self.lbl_sphere_cc)
+        self.edit_sph_name = QLineEdit()
+        self.edit_sph_name.setPlaceholderText("Name of the sphere")
+        f.addRow("Name:", self.edit_sph_name)
+        self.edit_sph_serial = QLineEdit()
+        self.edit_sph_serial.setPlaceholderText("Identifier / serial number")
+        f.addRow("Identifier:", self.edit_sph_serial)
+
+        def mm_spin(lo, hi, val, dec, tip, suffix=" mm"):
+            sp = QDoubleSpinBox()
+            sp.setRange(lo, hi); sp.setDecimals(dec); sp.setValue(val)
+            sp.setSuffix(suffix); sp.setToolTip(tip)
+            return sp
+        self.spn_sph_r = mm_spin(0.0, 500.0, 0.0, 3,
+                                 "Port radius r (knife-edge aperture), measured at the part")
+        f.addRow("Port radius r:", self.spn_sph_r)
+        self.spn_sph_edge = mm_spin(0.0, 200.0, csph.DEFAULT_EDGE_DEPTH_MM, 2,
+                                    "Distance knife-edge plane → top surface of the housing")
+        f.addRow("Knife edge → housing top:", self.spn_sph_edge)
+        self.spn_sph_cc = mm_spin(-50.0, 50.0, 0.0, 2,
+                                  "CC reference plane relative to its support surface "
+                                  "(positive = farther from the port)")
+        f.addRow("CC reference plane:", self.spn_sph_cc)
+        self.spn_sph_ur = mm_spin(0.0, 50.0, 0.05, 3, "Standard uncertainty u(r)")
+        f.addRow("u(r):", self.spn_sph_ur)
+        self.spn_sph_ud = mm_spin(0.0, 50.0, 0.10, 3, "Standard uncertainty u(d) of each distance")
+        f.addRow("u(d):", self.spn_sph_ud)
+        self.spn_sph_ucc = mm_spin(0.0, 100.0, csph.SphereConfig.from_config()
+                                   .cc_uncertainty_pct, 1,
+                                   "Relative standard uncertainty of the CC calibration (k = 1)",
+                                   suffix=" %")
+        f.addRow("u(CC):", self.spn_sph_ucc)
+        self.edit_sph_notes = QLineEdit()
+        self.edit_sph_notes.setPlaceholderText("Notes")
+        f.addRow("Notes:", self.edit_sph_notes)
+        self.cmb_itime_sph, self.spn_ms_sph, row = self._itime_row("sphere")
+        f.addRow("Integration:", row)
+        return w
+
     # ── refresh / small slots ────────────────────────────────────────────
     def _device(self):
         be = self.dlg._backend()
@@ -1304,6 +1375,7 @@ class _SpectralWizardTab(QWidget):
         self.cmb_ref.clear()
         for s in srcs:
             label = f"{s.name} ({s.serial})" if s.serial else s.name
+            label += f" · {cw.reference_quantity(s)} · {rs.unit_label(s.unit)}"
             self.cmb_ref.addItem(label, s.id)
             self.cmb_ref.setItemData(self.cmb_ref.count() - 1, label,
                                      Qt.ItemDataRole.ToolTipRole)
@@ -1325,6 +1397,21 @@ class _SpectralWizardTab(QWidget):
         if i >= 0:
             self.cmb_known.setCurrentIndex(i)
         self._input_changed()
+        self._refresh_sphere_prereq(name, be)
+
+    def _refresh_sphere_prereq(self, name, be) -> None:
+        """One line: the CC profile the sphere characterisation will use, or
+        why there is none (fixed field, no layout change)."""
+        try:
+            if be is None:
+                raise ValueError("No device connected.")
+            p = csph.cc_profile_for(be, name)
+            txt = (f"{(p.get('optics') or {}).get('name', '?')} · "
+                   f"{calprof.profile_label(p)}")
+        except Exception as e:                                # noqa: BLE001
+            txt = str(e)
+        self.lbl_sphere_cc.setText(txt)
+        self.lbl_sphere_cc.setToolTip(txt)
 
     def _optics_picked(self, _i):
         name, be, serial = self._device()
@@ -1343,11 +1430,16 @@ class _SpectralWizardTab(QWidget):
         self._ref_changed()
 
     def _sync_type_enabled(self, src):
-        """Absolute only with a defined entrance area (input != bare) AND a
-        reference with an absolute irradiance unit."""
-        bare = self.cmb_input.currentText() == "bare"
+        """Absolute only if calprof.admissible(absolute, quantity of the
+        reference, input optic) allows it AND the reference has an absolute
+        unit. The reason for a refusal is shown in lbl_ref_info."""
+        quantity = (cw.reference_quantity(src) if src is not None
+                    else calprof.QUANTITY_IRRADIANCE)
         rel_ref = src is not None and not calprof.is_absolute_reference_unit(src.unit)
-        allow_abs = not bare and not rel_ref
+        ok, why = calprof.admissible(calprof.TYPE_ABSOLUTE, quantity,
+                                     self.cmb_input.currentText())
+        allow_abs = ok and not rel_ref
+        self._type_reason = "" if (ok or rel_ref) else why
         item = self.cmb_type.model().item(1)
         if item is not None:
             item.setEnabled(allow_abs)
@@ -1368,7 +1460,9 @@ class _SpectralWizardTab(QWidget):
         if src is None:
             self.lbl_ref_info.setText("")
             return
-        lines = [f"Unit: {src.unit} · valid {_fmt_range(src.valid_min_nm, src.valid_max_nm)}"
+        quantity = cw.reference_quantity(src)
+        lines = [f"Quantity: {quantity} · unit: {rs.unit_label(src.unit)} · valid "
+                 f"{_fmt_range(src.valid_min_nm, src.valid_max_nm)}"
                  f" · intended optic: {src.input_optic or 'not specified'}"]
         if getattr(src, "builtin", False):
             if self._backend_is_demo() and src.id in rs.DEMO_SPECTRUM_FOR_SOURCE:
@@ -1383,6 +1477,11 @@ class _SpectralWizardTab(QWidget):
         if src.input_optic and src.input_optic != inp:
             lines.append(_span(_T().WARN, f"<b>Warning:</b> source specified for input "
                                f"optic '{src.input_optic}', selected: '{inp}'."))
+        if self._type_reason:
+            lines.append(_span(_T().WARN, f"<b>Type absolute not available:</b> "
+                                          f"{self._type_reason}"))
+        if quantity == calprof.QUANTITY_RADIANCE:
+            lines.append(cw.RADIANCE_SOURCE_HINT)
         self.lbl_ref_info.setText("<br>".join(lines))
 
     def _itime_mode_changed(self, *_):
@@ -1394,7 +1493,7 @@ class _SpectralWizardTab(QWidget):
         self.stack.setCurrentIndex(i)
         for wdg in (self.lbl_itime_cap, self.cmb_itime, self.spn_ms):
             wdg.setVisible(i == 0)               # derivation: one time per optics
-        self._set_steps(_LAMP_STEPS if i == 0 else _DERIV_STEPS)
+        self._set_steps(_MODE_STEPS[i])
 
     # ── step list ────────────────────────────────────────────────────────
     def _set_steps(self, names):
@@ -1510,6 +1609,9 @@ class _SpectralWizardTab(QWidget):
         self.btn_cancel.setEnabled(False)
         self.cmb_mode.setEnabled(True)
         self._set_protocol_display()
+        if self._refs_changed:                  # reference library changed in the run
+            self._refs_changed = False
+            self.dlg.notify_references_changed()
 
     def start(self):
         if self.running:
@@ -1520,7 +1622,8 @@ class _SpectralWizardTab(QWidget):
                                 "Connect and start a device first.")
             return
         self.refresh()
-        self._set_steps(_LAMP_STEPS if self.cmb_mode.currentIndex() == 0 else _DERIV_STEPS)
+        mode = self.cmb_mode.currentIndex()
+        self._set_steps(_MODE_STEPS[mode])
         self.lbl_result.setText("")
         self.lbl_itime.setText("")
         self._reset_plots()
@@ -1529,8 +1632,9 @@ class _SpectralWizardTab(QWidget):
         def fixed_us(cmb, spn):
             return None if cmb.currentIndex() == 0 else int(round(spn.value() * 1000.0))
         us = fixed_us(self.cmb_itime, self.spn_ms)
+        err_title = "Selection incomplete"
         try:
-            if self.cmb_mode.currentIndex() == 0:
+            if mode == 0:
                 src = rs.ReferenceLibrary().get(self.cmb_ref.currentData() or "")
                 if src is None:
                     raise ValueError("Select a reference source.")
@@ -1546,6 +1650,23 @@ class _SpectralWizardTab(QWidget):
                     self._wf.warnings.append(
                         f"Demo backend: simulated source set to '{demo}' "
                         f"(matching reference '{src.name}') for this run.")
+            elif mode == 2:
+                err_title = "Sphere characterisation"
+                scfg = csph.SphereConfig.from_config()
+                scfg.n_frames = int(self.spn_frames.value())
+                self._sc = csph.SphereCharacterization(
+                    be, name, cfg=scfg, sphere={
+                        "name": self.edit_sph_name.text().strip(),
+                        "serial": self.edit_sph_serial.text().strip(),
+                        "port_radius_mm": self.spn_sph_r.value(),
+                        "edge_depth_mm": self.spn_sph_edge.value(),
+                        "cc_ref_offset_mm": self.spn_sph_cc.value(),
+                        "u_radius_mm": self.spn_sph_ur.value(),
+                        "u_distance_mm": self.spn_sph_ud.value(),
+                        "cc_uncertainty_pct": self.spn_sph_ucc.value(),
+                        "notes": self.edit_sph_notes.text().strip()})
+                gen = self._gen_sphere(self._sc, fixed_us(self.cmb_itime_sph,
+                                                          self.spn_ms_sph))
             else:
                 pid = self.cmb_known.currentData()
                 if not pid:
@@ -1560,7 +1681,7 @@ class _SpectralWizardTab(QWidget):
                     self._dw, fixed_us(self.cmb_itime_known, self.spn_ms_known),
                     fixed_us(self.cmb_itime_new, self.spn_ms_new))
         except (ValueError, KeyError) as e:
-            QMessageBox.warning(self, "Selection incomplete", str(e))
+            QMessageBox.warning(self, err_title, str(e))
             return
         self._begin(gen)
 
@@ -1867,7 +1988,7 @@ class _SpectralWizardTab(QWidget):
             extra.append(_span(t.WARN, "<br>".join(other)))
         self.lbl_result.setText(self._result_text(res, wf.plausibility, extra))
 
-    def _write_protocol(self, wf, derivation: bool = False):
+    def _write_protocol(self, wf, derivation: bool = False, sphere: bool = False):
         """Generator fragment: the record is built here (GUI thread), the PDF /
         CSV are written in the worker thread (matplotlib is slow)."""
         try:
@@ -1879,11 +2000,19 @@ class _SpectralWizardTab(QWidget):
             return
         try:
             import export_paths
+            if sphere and not hasattr(crp, "write_sphere_protocol"):
+                self.protocol_message = "Protocol not written: no sphere protocol available."
+                self._set_protocol_display()
+                return
             rec = wf.record()
             d, note = export_paths.calibration_protocol_dir()
-            base = (crp.default_derivation_basename(rec) if derivation
-                    else crp.default_protocol_basename(rec))
-            write = crp.write_derivation_protocol if derivation else crp.write_protocol
+            if sphere:
+                base, write = crp.default_sphere_basename(rec), crp.write_sphere_protocol
+            else:
+                base = (crp.default_derivation_basename(rec) if derivation
+                        else crp.default_protocol_basename(rec))
+                write = (crp.write_derivation_protocol if derivation
+                         else crp.write_protocol)
             pdf, csv_ = os.path.join(d, base + ".pdf"), os.path.join(d, base + ".csv")
             self.lbl_status.setText("Writing the protocol…")
             paths = yield (lambda: write(rec, pdf, csv_))
@@ -2207,12 +2336,209 @@ class _SpectralWizardTab(QWidget):
         self.lbl_result.setText(self._result_text(res, dw.plausibility, extra))
 
 
+    # sphere --------------------------------------------------------------
+    def _ask_height(self, index: int, previous: float | None, min_mm: float) -> float | None:
+        """Height housing top → CC support surface of the next position in mm
+        (None = cancelled). Separate hook so tests can answer it."""
+        val, ok = QInputDialog.getDouble(
+            self, f"Position {index + 1}",
+            "Place the CC on the sphere port at the next distance.\n\n"
+            "Distance housing top → CC support surface [mm]:",
+            0.0 if previous is None else previous + 5.0, min_mm, 500.0, 2)
+        return float(val) if ok else None
+
+    def _gen_sphere(self, sc, us):
+        I = _SPHERE_IX                                         # noqa: N806
+        step = 0
+        n_min = sc.cfg.min_positions
+
+        def begin(key):
+            nonlocal step
+            step = I[key]
+            self._checkpoint()
+            self._state(step, "running")
+
+        try:
+            sp = sc.sphere
+            self._state(0, "ok", f"{sp['name']} · Ø {sp['port_diameter_mm']:.2f} mm · "
+                                 f"CC profile {sc.cc_profile.get('id')}")
+            begin("mount")
+            self._deriv_prompt(
+                "Sphere port",
+                f"{csph.SPHERE_SOURCE_HINT}\n\n"
+                "Place the CC on the sphere port at the FIRST (smallest) distance "
+                "and keep the light path open. The integration time is set next.")
+            self._state(step, "ok")
+            begin("integration")
+            self.lbl_status.setText("Setting the integration time (first distance)…")
+            info = yield (lambda: sc.set_integration(us, auto=us is None))
+            txt = f"{info['integration_us'] / 1000:.3f} ms, " + (
+                "auto exposure" if info["auto"] else "fixed")
+            if info.get("peak_frac") is not None:
+                txt += f", {100 * info['peak_frac']:.0f} % FS"
+            self.lbl_itime.setText(f"t_int = {info['integration_us'] / 1000:.3f} ms")
+            self._state(step, "ok" if info.get("converged", True) else "warning", txt)
+            begin("dark")
+            self._deriv_cover(sc, "before")
+            self.lbl_status.setText("Capturing the dark spectrum (before)…")
+            d = yield (lambda: sc.capture_dark("before"))
+            self._state(step, "ok", f"{d.integration_us / 1000:.3f} ms, "
+                                    f"peak {d.peak_counts:.0f} counts")
+            self._deriv_uncover(sc, "first light spectrum")
+            # one position per distance
+            begin("position")
+            heights: list[float] = []
+            min_mm = -float(sp["edge_depth_mm"])
+            while True:
+                self._checkpoint()
+                h = self._ask_height(len(heights), heights[-1] if heights else None, min_mm)
+                if h is None:
+                    raise _Abort("cancelled at the position prompt")
+                self.lbl_status.setText(f"Capturing the irradiance at {h:.2f} mm…")
+                try:
+                    r = yield (lambda h=h: sc.capture_position(h))
+                except ValueError as e:                 # e.g. distance measured twice
+                    QMessageBox.warning(self, "Position", str(e))
+                    continue
+                heights.append(h)
+                self._state(step, "running", f"{len(heights)} position(s), last "
+                            f"d = {r['d_mm']:.2f} mm, {100 * r['peak_frac']:.0f} % FS")
+                if len(heights) >= n_min and not _ask(
+                        self, "Further position?",
+                        f"{len(heights)} distances measured (at least {n_min} are "
+                        "needed).\n\nMeasure a further distance?"):
+                    break
+            self._state(step, "ok", f"{len(heights)} positions: "
+                                    + ", ".join(f"{x:g}" for x in heights) + " mm")
+            begin("repeat")
+            self._deriv_prompt(
+                "First distance again",
+                f"Set the CC to the first distance ({heights[0]:g} mm) again, same "
+                "position. It is measured once more to detect source drift.")
+            self.lbl_status.setText("Capturing the repeat of the first distance…")
+            yield sc.capture_repeat
+            self._state(step, "ok")
+            begin("dark_after")
+            self._deriv_cover(sc, "after")
+            self.lbl_status.setText("Capturing the dark spectrum (after)…")
+            d = yield (lambda: sc.capture_dark("after"))
+            self._state(step, "ok", f"{d.integration_us / 1000:.3f} ms, "
+                                    f"peak {d.peak_counts:.0f} counts")
+            begin("compute")
+            self.lbl_status.setText("Computing L…")
+            try:
+                res = yield sc.compute
+            except (ValueError, RuntimeError) as e:       # no valid pixel / too few distances
+                self._state(step, "failed", str(e))
+                self._state(I["save"], "failed", "not saved")
+                self.last_status = "failed"
+                self.lbl_result.setText(_span(_T().DANGER, f"<b>FAILED</b>: {e}"))
+                yield from self._write_protocol(sc, sphere=True)
+                self.lbl_status.setText("Sphere characterisation failed, nothing saved.")
+                return
+            self._show_sphere_result(sc, res)
+            dr = sc.drift
+            if dr and dr.get("p95_pct") is not None:
+                self._state(I["repeat"], "ok" if dr["pass"] else "warning",
+                            f"drift {dr['p95_pct']:.2f} % (limit {dr['limit_pct']:.2f} %)")
+            failed = sc.failed_checks()
+            segs = res["valid_range_nm"]
+            if failed:
+                self._state(step, "failed", "check failed: " + ", ".join(failed))
+            else:
+                self._state(step, "ok", f"valid {segs[0]:.0f}–{segs[1]:.0f} nm")
+            # save
+            step = I["save"]
+            self._checkpoint()
+            if failed and not _ask(
+                    self, "Checks failed",
+                    "The following checks failed:\n"
+                    + "\n".join(f"• {c}" for c in failed)
+                    + "\n\nSave the reference source anyway?"):
+                self._state(step, "warning", "not saved (checks failed)")
+                self.last_status = "not_saved"
+                yield from self._write_protocol(sc, sphere=True)
+                self.lbl_status.setText("Not saved.")
+                return
+            self._state(step, "running")
+            src = yield (lambda: sc.save(allow_failed_checks=bool(failed)))
+            self._refs_changed = True
+            self._show_sphere_result(sc, res)
+            yield from self._write_protocol(sc, sphere=True)
+            self._state(step, "warning" if failed else "ok",
+                        f"'{src.name}' saved ({rs.unit_label(src.unit)})"
+                        + (" — checks failed" if failed else ""))
+            self._state(I["protocol"], "ok" if self.protocol_paths else "warning",
+                        "written" if self.protocol_paths else "not written")
+            self.last_status = "saved"
+            self.lbl_status.setText(f"Saved reference source '{src.name}'.")
+        except Exception as e:                                # noqa: BLE001
+            self._fail_msg(step, e)
+
+    def _sphere_lines(self, sc, res) -> list[str]:
+        """d0, method, consistency, drift, uncertainty, valid range."""
+        t = _T()
+        ok_txt = lambda ok: (_span(t.OK, "passed") if ok                 # noqa: E731
+                             else _span(t.DANGER, "NOT passed"))
+        ov, unc = res["overall"], res["uncertainty"]
+        out = [f"Offset d0 = {res['d0_mm']:+.3f} mm (limit ±{res['d0_max_mm']:.2f} mm) — "
+               + (_span(t.OK, "plausible") if res["d0_plausible"]
+                  else _span(t.DANGER, "NOT plausible")),
+               "Method: " + ("fit with common offset d0" if res["method"] == "fit"
+                             else "mean of L over the distances (nominal geometry)")]
+        worst = max(res["bands"], key=lambda b: b["spread_pct"], default=None)
+        cons = (f"Consistency over {len(sc.positions)} distances: "
+                f"{ov['spread_pct']:.2f} % (limit {res['consistency_max_pct']:.2f} %) — "
+                + ok_txt(res["consistency_pass"]))
+        if worst is not None:
+            cons += (f" · worst band {worst['lo']:.0f}–{worst['hi']:.0f} nm: "
+                     f"{worst['spread_pct']:.2f} %")
+        out.append(cons)
+        dr = sc.drift
+        if dr and dr.get("p95_pct") is not None:
+            mean = dr.get("mean_pct")
+            out.append(f"Drift (repeat of the first distance): p95 {dr['p95_pct']:.2f} %"
+                       + (f", mean {mean:+.2f} %" if mean is not None else "")
+                       + f", limit {dr['limit_pct']:.2f} % — " + ok_txt(dr["pass"]))
+        else:
+            out.append("Drift: not checked")
+        out.append(f"Uncertainty U (k = 2): median {unc['U_rel_median_pct_k2']:.1f} % "
+                   f"(max {2 * unc['u_rel_max_pct']:.1f} %)")
+        lo, hi = res["valid_range_nm"]
+        out.append(f"Valid range: {lo:.0f}–{hi:.0f} nm · unit "
+                   f"{rs.unit_label(rs.UNIT_UW_CM2_SR_NM)}")
+        return out
+
+    def _show_sphere_result(self, sc, res):
+        wl, valid = res["wl"], res["valid"]
+        segs = calprof.valid_segments(wl, valid, 0.0)
+        unit = rs.unit_label(rs.UNIT_UW_CM2_SR_NM)
+        self.plot_in.clear()
+        self.plot_in.setLabel("left", f"L_i [{unit}]")
+        for i, pos in enumerate(sc.positions):
+            self.plot_in.plot(wl, res["L_i"][i], connect="finite",
+                              name=f"L_i, d = {pos['d_mm']:.1f} mm",
+                              pen=pg.mkPen(_SPHERE_COLORS[i % len(_SPHERE_COLORS)], width=1))
+        _shade_masked(self.plot_in, wl, segs)
+        self.plot_in.autoRange()
+        self.plot_out.clear()
+        self.plot_out.setLabel("left", f"L [{unit}]")
+        self.plot_out.plot(wl, res["L_smoothed"], name="L", connect="finite",
+                           pen=pg.mkPen((255, 170, 60), width=2))
+        _shade_masked(self.plot_out, wl, segs)
+        self.plot_out.autoRange()
+        extra = self._sphere_lines(sc, res)
+        if sc.warnings:
+            extra.append(_span(_T().WARN, "<br>".join(sc.warnings)))
+        self.lbl_result.setText("<br>".join(extra))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  PROFILES TAB
 # ══════════════════════════════════════════════════════════════════════════
 
 class _ProfilesTab(QWidget):
-    COLS = ["Profile", "Status", "Valid range", "Unit", "Created"]
+    COLS = ["Profile", "Status", "Valid range", "Unit", "Quantity", "Created"]
 
     def __init__(self, dlg):
         super().__init__()
@@ -2272,13 +2598,14 @@ class _ProfilesTab(QWidget):
                   if p.get("apply") == calprof.APPLY_LEGACY_GAIN else None)
             if lr:
                 state += f" · legacy, masked outside {lr[0]:.0f}–{lr[1]:.0f} nm"
-            cells = [label, state, rng, str(p.get("unit", "")),
+            quantity = calprof.profile_quantity(p)
+            cells = [label, state, rng, str(p.get("unit", "")), quantity,
                      created[:16].replace("T", " ")]
             tip = "\n".join(x for x in (label, st["message"],
                                           f"Valid: {calprof.format_segments(segs, 20)}"
                                           if segs else "") if x)
             rows.append({"cells": cells,
-                         "sort": [label.lower(), state, (vr[0] or 0.0), cells[3], created],
+                         "sort": [label.lower(), state, (vr[0] or 0.0), cells[3], quantity, created],
                          "tooltip": tip,
                          "data": {0: {Qt.ItemDataRole.UserRole: p["id"]}}})
         gtab.fill_table(self.table, rows)
@@ -2399,7 +2726,13 @@ class _LampImportDialog(QDialog):
                         f"(data {self.dmin:.0f}–{self.dmax:.0f} nm)"))
         self.edit_name = QLineEdit(os.path.splitext(os.path.basename(path))[0])
         self.edit_serial = QLineEdit()
-        self.cmb_unit = QComboBox(); self.cmb_unit.addItems(list(rs.KNOWN_UNITS))
+        self.cmb_unit = QComboBox()
+        for u in rs.KNOWN_UNITS:
+            self.cmb_unit.addItem(rs.unit_label(u), u)
+        self.cmb_unit.setToolTip("Unit of the file. The measurement quantity "
+                                 "(irradiance / radiance) follows from the unit.")
+        self.lbl_quantity = QLabel()
+        self.cmb_unit.currentIndexChanged.connect(self._unit_changed)
         self.spn_lo = QDoubleSpinBox(); self.spn_hi = QDoubleSpinBox()
         for s, val in ((self.spn_lo, self.dmin), (self.spn_hi, self.dmax)):
             s.setRange(0.0, 20000.0); s.setDecimals(1); s.setSuffix(" nm"); s.setValue(val)
@@ -2408,6 +2741,8 @@ class _LampImportDialog(QDialog):
         f.addRow("Name:", self.edit_name)
         f.addRow("Serial number:", self.edit_serial)
         f.addRow("Unit:", self.cmb_unit)
+        f.addRow("Quantity:", self.lbl_quantity)
+        self._unit_changed()
         f.addRow("Valid from:", self.spn_lo)
         f.addRow("Valid to:", self.spn_hi)
         hint = QLabel("Take the validity limits from the certificate "
@@ -2421,17 +2756,21 @@ class _LampImportDialog(QDialog):
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         f.addRow(bb)
 
+    def _unit_changed(self, *_):
+        q = rs.quantity_of_unit(self.cmb_unit.currentData())
+        self.lbl_quantity.setText(q if q else "none (relative values)")
+
     def values(self) -> dict:
         return dict(name=self.edit_name.text().strip(),
                     serial=self.edit_serial.text().strip(),
-                    unit=self.cmb_unit.currentText(),
+                    unit=self.cmb_unit.currentData(),
                     valid_min_nm=self.spn_lo.value(), valid_max_nm=self.spn_hi.value(),
                     input_optic=self.cmb_optic.currentText(),
                     notes=self.edit_notes.text().strip())
 
 
 class _LampsTab(QWidget):
-    COLS = ["Name", "Serial", "Unit", "Valid range", "Optic", "Built-in"]
+    COLS = ["Name", "Serial", "Unit", "Valid range", "Optic", "Built-in", "Quantity"]
 
     def __init__(self, dlg):
         super().__init__()
@@ -2474,11 +2813,44 @@ class _LampsTab(QWidget):
         rows = []
         for s in srcs:
             cells = [s.name, s.serial, s.unit, _fmt_range(s.valid_min_nm, s.valid_max_nm),
-                     s.input_optic or "—", "yes" if s.builtin else ""]
-            rows.append({"cells": cells,
+                     s.input_optic or "—", "yes" if s.builtin else "",
+                     cw.reference_quantity(s)]
+            rows.append({"cells": cells, "tooltip": self._source_tip(s),
                          "data": {0: {Qt.ItemDataRole.UserRole: s.id,
                                       Qt.ItemDataRole.UserRole + 1: bool(s.builtin)}}})
         gtab.fill_table(self.table, rows)
+
+    @staticmethod
+    def _source_tip(s) -> str:
+        """Unit / quantity and, for a sphere characterisation, its geometry,
+        CC profile and quality figures."""
+        lines = [f"{s.name}" + (f" ({s.serial})" if s.serial else ""),
+                 f"Quantity: {cw.reference_quantity(s)} · unit: {rs.unit_label(s.unit)}"]
+        meta = getattr(s, "meta", None) or {}
+        g = meta.get("geometry") or {}
+        if g:
+            lines.append(
+                f"Sphere port: r = {g.get('port_radius_mm', float('nan')):g} mm "
+                f"(u {g.get('u_radius_mm', 0):g} mm), knife edge → housing top "
+                f"{g.get('edge_depth_mm', float('nan')):g} mm, CC reference plane "
+                f"{g.get('cc_ref_offset_mm', 0):g} mm")
+            hs = g.get("heights_mm") or []
+            if hs:
+                lines.append("Heights: " + ", ".join(f"{h:g}" for h in hs)
+                             + f" mm · d0 {g.get('d0_mm', 0.0):+.3f} mm · "
+                               f"method {g.get('method', '?')}")
+        k = meta.get("cc_profile") or {}
+        if k:
+            lines.append(f"CC profile: {k.get('optics') or '?'} "
+                         f"(id {k.get('id')} v{k.get('version')})")
+        if meta.get("consistency_pct") is not None:
+            lines.append(f"Consistency over the distances: {meta['consistency_pct']:.2f} %")
+        unc = meta.get("uncertainty") or {}
+        if unc.get("U_rel_median_pct_k2") is not None:
+            lines.append(f"Uncertainty U (k = 2): median {unc['U_rel_median_pct_k2']:.1f} %")
+        if meta.get("date"):
+            lines.append(f"Characterised: {meta['date']}")
+        return "\n".join(lines)
 
     def selected(self):
         sid = gtab.selected_row_data(self.table)
@@ -2497,7 +2869,8 @@ class _LampsTab(QWidget):
             return
         if s is None:
             return
-        self.plot.setLabel("left", f"Irradiance ({s.unit})")
+        self.plot.setLabel("left", f"{cw.reference_quantity(s).capitalize()} "
+                                   f"({rs.unit_label(s.unit)})")
         self.plot.plot(s.wl, s.values, pen=pg.mkPen((255, 170, 60), width=2))
         for lo, hi in ((float(s.wl[0]) - 1.0, s.valid_min_nm),
                        (s.valid_max_nm, float(s.wl[-1]) + 1.0)):

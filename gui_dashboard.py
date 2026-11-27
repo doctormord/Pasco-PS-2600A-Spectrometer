@@ -1466,13 +1466,15 @@ class DashboardWindow(QMainWindow):
         self.combo_irradiance_unit.setCurrentIndex(
             max(0, self.combo_irradiance_unit.findData(Config.get("irradiance_unit", "uW/cm2/nm"))))
         self.combo_irradiance_unit.setToolTip(
-            "Output unit of ABSOLUTE calibration profiles (spectral irradiance).")
+            "Output unit of ABSOLUTE calibration profiles: the prefix (µW/cm², "
+            "W/m², mW/m²). A radiance profile uses the same prefix per steradian "
+            "(e.g. µW/(cm²·sr·nm)).")
         self.combo_irradiance_unit.currentIndexChanged.connect(
             lambda _i: self._cfg({"irradiance_unit": self.combo_irradiance_unit.currentData()}))
 
         _sec_processing = self._collapsible("Processing", [
             ("Display unit",          None,  self.combo_display_unit),
-            ("Irradiance unit",       None,  self.combo_irradiance_unit),
+            ("Absolute unit",         None,  self.combo_irradiance_unit),
             ("Dark correction",       None,  self.button_dark_correct),
             ("Dark mode",             None,  self.combo_dark_mode),
             ("Stored dark",           None,  self.button_capture_dark),
@@ -2815,6 +2817,11 @@ class DashboardWindow(QMainWindow):
                 txt = ""
             else:
                 txt = st.get("label", "")
+                if (self.calib_runtime.active_v2
+                        and processing.is_absolute_unit(st.get("unit", ""))
+                        and st.get("quantity")):
+                    txt += (f"\nabsolute {st['quantity']} · "
+                            f"{processing.unit_label(st['unit'])}")
                 if st.get("valid_segments_nm"):
                     txt += f"\nvalid {calprof.format_segments(st['valid_segments_nm'], 3)}"
                 elif st.get("valid_range_nm"):
@@ -3584,7 +3591,8 @@ class DashboardWindow(QMainWindow):
         self.cie_tab.update_measurement(
             self.active_wavelengths, spd,
             lux_cal if lux_cal is not None else ev.lux_calibration,
-            metrics=ev.color if ev.color_fresh else None)
+            metrics=ev.color if ev.color_fresh else None,
+            quantity=processing.photometric_quantity(unit))
         self.filter_tab.update_measurement(self.active_wavelengths, disp)
 
     def _update_peaks(self, peaks=None) -> None:

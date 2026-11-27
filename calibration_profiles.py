@@ -409,8 +409,77 @@ def compute_response_table(
 
 TYPE_RELATIVE = "relative"
 TYPE_ABSOLUTE = "absolute"
-INPUT_OPTICS = ("CC", "bare", "sphere")
+# Input optics: CC = cosine corrector, sphere = integrating sphere as collector,
+# bare = bare fibre, objective = microscope objective / imaging optic.
+INPUT_OPTICS = ("CC", "bare", "sphere", "objective")
 INPUT_UNKNOWN = "unknown"
+
+# Measurement quantity of a profile (and of its reference source). Absolute
+# profiles convert counts/s into this quantity; relative profiles keep it as
+# information. Profiles stored before the quantity existed are irradiance.
+QUANTITY_IRRADIANCE = "irradiance"
+QUANTITY_RADIANCE = "radiance"
+QUANTITIES = (QUANTITY_IRRADIANCE, QUANTITY_RADIANCE)
+
+# Admissible input optics per (type, quantity). Absolute irradiance needs a
+# defined entrance area with cosine response (CC, or a sphere as collector);
+# absolute radiance needs an optic with a defined field of view and solid
+# angle (bare fibre, objective) in front of an extended source; relative
+# profiles are allowed with every input optic.
+ABSOLUTE_INPUTS = {QUANTITY_IRRADIANCE: ("CC", "sphere"),
+                   QUANTITY_RADIANCE: ("bare", "objective")}
+
+
+def admissible(kind: str, quantity: str, input_optic: str) -> tuple[bool, str]:
+    """(ok, reason) for a calibration of this type / quantity with this input
+    optic. The ONE rule set used by the wizard, the derivation, the API, the
+    web UI, MCP and the profile store."""
+    if kind not in (TYPE_RELATIVE, TYPE_ABSOLUTE):
+        return False, f"unknown calibration type '{kind}'"
+    if quantity not in QUANTITIES:
+        return False, (f"unknown measurement quantity '{quantity}' "
+                       f"(allowed: {', '.join(QUANTITIES)})")
+    if input_optic not in INPUT_OPTICS:
+        return False, f"input optic must be one of {', '.join(INPUT_OPTICS)}"
+    if kind == TYPE_RELATIVE:
+        return True, ""
+    allowed = ABSOLUTE_INPUTS[quantity]
+    if input_optic not in allowed:
+        if quantity == QUANTITY_IRRADIANCE:
+            return False, ("Absolute irradiance needs a cosine corrector or a sphere "
+                           "as collector (input CC or sphere); with "
+                           f"'{input_optic}' use type relative, or quantity radiance "
+                           "for a bare fibre / objective.")
+        return False, ("Absolute radiance needs an optic with a defined field of view "
+                       "(input bare or objective) in front of an extended source; "
+                       f"with '{input_optic}' use quantity irradiance.")
+    return True, ""
+
+
+def admissibility_matrix() -> list[dict]:
+    """All (type, quantity, input) combinations with their verdict — for the
+    API / web UI / MCP (one source)."""
+    out = []
+    for kind in (TYPE_RELATIVE, TYPE_ABSOLUTE):
+        for q in QUANTITIES:
+            for inp in INPUT_OPTICS:
+                ok, why = admissible(kind, q, inp)
+                out.append({"type": kind, "quantity": q, "input": inp,
+                            "allowed": ok, "reason": why})
+    return out
+
+
+def profile_quantity(p: dict) -> str:
+    """Measurement quantity of a stored profile (old profiles: irradiance)."""
+    q = (p or {}).get("quantity")
+    if q in QUANTITIES:
+        return q
+    try:
+        from reference_sources import quantity_of_unit
+        q = quantity_of_unit(((p or {}).get("reference") or {}).get("unit", ""))
+    except Exception:                                           # noqa: BLE001
+        q = None
+    return q or QUANTITY_IRRADIANCE
 UNIT_RELATIVE = "relative"
 UNIT_COUNTS = "counts"
 UNIT_COUNTS_PER_S = "counts/s"
@@ -1018,6 +1087,7 @@ def migrate_legacy_entry(device: str, name: str, entry: dict) -> dict:
         "valid_range_nm": [lo, hi],
         "table": table,
         "unit": UNIT_RELATIVE,
+        "quantity": QUANTITY_IRRADIANCE,
         "acquisition": {},
         "checks": {},
         "created": entry.get("created", ""),
@@ -1035,6 +1105,9 @@ def migrate_registry(raw) -> dict:
         return {"schema": SCHEMA_VERSION, "profiles": []}
     if isinstance(raw, dict) and raw.get("schema") == SCHEMA_VERSION:
         raw.setdefault("profiles", [])
+        for p in raw["profiles"]:
+            if isinstance(p, dict) and p.get("quantity") not in QUANTITIES:
+                p["quantity"] = profile_quantity(p)
         return raw
     profiles = []
     for device, entries in (raw or {}).items():
@@ -1257,6 +1330,8 @@ def profile_label(p: dict) -> str:
     """Dropdown text: name · type · version · date."""
     o = (p.get("optics") or {}).get("name") or "?"
     t = p.get("type", TYPE_RELATIVE)
+    if t == TYPE_ABSOLUTE:
+        t = f"{t} {profile_quantity(p)}"
     date = str(p.get("created", ""))[:10]
     tag = " · legacy" if p.get("apply") == APPLY_LEGACY_GAIN else ""
     if is_implausible(p):
@@ -1273,26 +1348,33 @@ def is_implausible(p: dict) -> bool:
     return pl.get("pass") is False
 
 
-def is_absolute_reference_unit(unit: str) -> bool:
+def is_absolute_reference_unit(unit: str, quantity: str | None = None) -> bool:
+    """True for an absolute unit (of the given quantity, if one is given)."""
     try:
-        from reference_sources import KNOWN_UNITS, UNIT_RELATIVE
+        from reference_sources import quantity_of_unit
     except Exception:
         return bool(unit) and unit != "relative"
-    return unit in KNOWN_UNITS and unit != UNIT_RELATIVE
+    q = quantity_of_unit(unit)
+    return q is not None and (quantity is None or q == quantity)
 
 
 def _validate_profile(p: dict) -> None:
     t = p.get("type")
     if t not in (TYPE_RELATIVE, TYPE_ABSOLUTE):
         raise ValueError(f"invalid profile type '{t}'")
+    q = p.get("quantity") or QUANTITY_IRRADIANCE
+    if q not in QUANTITIES:
+        raise ValueError(f"invalid measurement quantity '{q}'")
     inp = (p.get("optics") or {}).get("input")
-    if t == TYPE_ABSOLUTE and inp not in ("CC", "sphere"):
-        raise ValueError("Absolute profiles need an input optic with a defined "
-                         "entrance area (CC or sphere); 'bare' is always relative.")
+    if t == TYPE_ABSOLUTE:
+        ok, why = admissible(t, q, inp)
+        if not ok:
+            raise ValueError(why)
     if t == TYPE_ABSOLUTE and not is_absolute_reference_unit(
-            (p.get("reference") or {}).get("unit", "")):
-        raise ValueError("Absolute profiles need a reference source with an "
-                         "absolute irradiance unit (e.g. uW/cm2/nm).")
+            (p.get("reference") or {}).get("unit", ""), q):
+        raise ValueError(f"Absolute {q} profiles need a reference source with an "
+                         f"absolute {q} unit (e.g. "
+                         f"{'uW/cm2/sr/nm' if q == QUANTITY_RADIANCE else 'uW/cm2/nm'}).")
     if not (p.get("optics") or {}).get("name"):
         raise ValueError("Optics configuration needs a name.")
     if not (p.get("device") or {}).get("backend"):
@@ -1304,16 +1386,26 @@ def _validate_profile(p: dict) -> None:
 def new_profile(*, kind: str, backend: str, serial: str | None, optics: dict,
                 reference: dict, wl_fingerprint: str, result: dict,
                 acquisition: dict, checks: dict, ref_unit: str = "",
-                plausibility: dict | None = None) -> dict:
+                plausibility: dict | None = None,
+                quantity: str | None = None) -> dict:
     """Assemble a schema-2 profile from a compute_calibration() result.
 
     plausibility: broadband_check() output (+ "override": True when the user
-    saved a failed result explicitly); stored so the profile stays flagged."""
+    saved a failed result explicitly); stored so the profile stays flagged.
+    quantity: measurement quantity (default: from the reference unit, else
+    irradiance)."""
     unit = (UNIT_RELATIVE if kind == TYPE_RELATIVE
             else f"{ref_unit or reference.get('unit', '')} per count/s")
+    if quantity is None:
+        try:
+            from reference_sources import quantity_of_unit
+            quantity = quantity_of_unit(ref_unit or reference.get("unit", ""))
+        except Exception:                                       # noqa: BLE001
+            quantity = None
     out = {
         "schema": SCHEMA_VERSION,
         "type": kind,
+        "quantity": quantity or QUANTITY_IRRADIANCE,
         "device": {"backend": backend, "serial": serial},
         "optics": {"name": optics.get("name", ""),
                    "input": optics.get("input", INPUT_UNKNOWN),
@@ -1616,12 +1708,34 @@ def selection_label(selection: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 def irradiance_unit_factor(profile_unit: str, out_unit: str) -> float:
-    """Scale from a profile's E-unit to the requested display unit."""
-    from reference_sources import convert_irradiance
+    """Scale from a profile's unit (E or L per count/s) to the requested
+    display unit of the SAME quantity."""
+    from reference_sources import convert_units
     src = (profile_unit or "").replace(" per count/s", "").strip()
     if not src or src == out_unit:
         return 1.0
-    return float(convert_irradiance(np.array([1.0]), src, out_unit)[0])
+    return float(convert_units(np.array([1.0]), src, out_unit)[0])
+
+
+# The display unit setting ("irradiance_unit") selects the prefix; for a
+# radiance profile the radiance unit with the same prefix is used.
+_RADIANCE_FOR_IRRADIANCE_UNIT = {"uW/cm2/nm": "uW/cm2/sr/nm", "W/m2/nm": "W/m2/sr/nm",
+                                 "mW/m2/nm": "mW/m2/sr/nm"}
+
+
+def output_unit_for(quantity: str, irradiance_unit: str = "uW/cm2/nm") -> str:
+    """Display / API unit of an absolute profile of this quantity, given the
+    configured irradiance unit (its prefix is kept for radiance)."""
+    from reference_sources import RADIANCE_UNITS, IRRADIANCE_UNITS
+    u = irradiance_unit or "uW/cm2/nm"
+    if quantity == QUANTITY_RADIANCE:
+        if u in RADIANCE_UNITS:
+            return u
+        return _RADIANCE_FOR_IRRADIANCE_UNIT.get(u, "uW/cm2/sr/nm")
+    if u in IRRADIANCE_UNITS:
+        return u
+    inv = {v: k for k, v in _RADIANCE_FOR_IRRADIANCE_UNIT.items()}
+    return inv.get(u, "uW/cm2/nm")
 
 
 class CalibrationApplier:
@@ -1634,6 +1748,7 @@ class CalibrationApplier:
         self.profile = profile
         self.profile_id = profile.get("id")
         self.type = profile.get("type", TYPE_RELATIVE)
+        self.quantity = profile_quantity(profile)
         wl = np.asarray(wl, float)
         twl, tv = profile_arrays(profile)
         if twl.size < 2:
@@ -1652,8 +1767,9 @@ class CalibrationApplier:
         nearest = np.where(np.abs(wl - twl[idx - 1]) <= np.abs(twl[idx] - wl), idx - 1, idx)
         valid = (wl >= lo) & (wl <= hi) & good[nearest] & np.isfinite(val) & (val > 0)
         if self.type == TYPE_ABSOLUTE:
-            self.unit = out_irradiance_unit
-            scale = irradiance_unit_factor(profile.get("unit", ""), out_irradiance_unit)
+            # out unit of the profile's quantity (prefix of the setting kept)
+            self.unit = output_unit_for(self.quantity, out_irradiance_unit)
+            scale = irradiance_unit_factor(profile.get("unit", ""), self.unit)
             factor = val * scale
         else:
             self.unit = UNIT_RELATIVE
@@ -1794,6 +1910,7 @@ class CalibrationRuntime:
             try:
                 self.applier = CalibrationApplier(p, self.wl, out_u)
                 st["unit"] = self.applier.unit
+                st["quantity"] = self.applier.quantity
                 st["valid_range_nm"] = list(self.applier.valid_range_nm)
                 if p.get("valid_segments_nm"):
                     st["valid_segments_nm"] = [list(map(float, x))

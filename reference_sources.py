@@ -1,7 +1,14 @@
-"""Reference sources (calibrated lamps): parsers, library, interpolation.
+"""Reference sources (calibrated lamps, characterised spheres): parsers,
+library, interpolation.
 
 Device independent; no Qt. A reference source is data: wavelength grid plus
-spectral irradiance values with unit, validity range and intended input optic.
+spectral values with measurement quantity, unit, validity range and intended
+input optic.
+
+Measurement quantities (own property of sources and profiles):
+    irradiance  E(λ)  W/(m²·nm), mW/(m²·nm), µW/(cm²·nm)
+    radiance    L(λ)  W/(m²·sr·nm), mW/(m²·sr·nm), µW/(cm²·sr·nm)
+Units convert only within the same quantity; 'relative' only to 'relative'.
 """
 from __future__ import annotations
 
@@ -17,22 +24,69 @@ import numpy as np
 UNIT_UW_CM2_NM = "uW/cm2/nm"
 UNIT_W_M2_NM = "W/m2/nm"
 UNIT_MW_M2_NM = "mW/m2/nm"
+UNIT_UW_CM2_SR_NM = "uW/cm2/sr/nm"
+UNIT_W_M2_SR_NM = "W/m2/sr/nm"
+UNIT_MW_M2_SR_NM = "mW/m2/sr/nm"
 UNIT_RELATIVE = "relative"
-KNOWN_UNITS = (UNIT_UW_CM2_NM, UNIT_W_M2_NM, UNIT_MW_M2_NM, UNIT_RELATIVE)
 
-INPUT_OPTICS = ("CC", "bare", "sphere")
+QUANTITY_IRRADIANCE = "irradiance"
+QUANTITY_RADIANCE = "radiance"
+QUANTITIES = (QUANTITY_IRRADIANCE, QUANTITY_RADIANCE)
 
-# factor to W/(m^2*nm)
-_TO_W_M2_NM = {UNIT_UW_CM2_NM: 0.01, UNIT_W_M2_NM: 1.0, UNIT_MW_M2_NM: 1e-3}
+IRRADIANCE_UNITS = (UNIT_UW_CM2_NM, UNIT_W_M2_NM, UNIT_MW_M2_NM)
+RADIANCE_UNITS = (UNIT_UW_CM2_SR_NM, UNIT_W_M2_SR_NM, UNIT_MW_M2_SR_NM)
+KNOWN_UNITS = IRRADIANCE_UNITS + RADIANCE_UNITS + (UNIT_RELATIVE,)
 
-DEMO_SOURCE_ID = "demo-cal-3000k"
-# Demo backend: the simulated spectrum that physically matches each built-in
-# demo reference source (the calibration wizard switches to it for the run).
-DEMO_SPECTRUM_FOR_SOURCE = {DEMO_SOURCE_ID: "cal_lamp"}
+# default (display / storage) unit per quantity
+DEFAULT_UNIT = {QUANTITY_IRRADIANCE: UNIT_UW_CM2_NM, QUANTITY_RADIANCE: UNIT_UW_CM2_SR_NM}
+# SI unit per quantity (photometry)
+SI_UNIT = {QUANTITY_IRRADIANCE: UNIT_W_M2_NM, QUANTITY_RADIANCE: UNIT_W_M2_SR_NM}
+# human-readable unit labels
+UNIT_LABELS = {UNIT_UW_CM2_NM: "µW/(cm²·nm)", UNIT_W_M2_NM: "W/(m²·nm)",
+               UNIT_MW_M2_NM: "mW/(m²·nm)", UNIT_UW_CM2_SR_NM: "µW/(cm²·sr·nm)",
+               UNIT_W_M2_SR_NM: "W/(m²·sr·nm)", UNIT_MW_M2_SR_NM: "mW/(m²·sr·nm)",
+               UNIT_RELATIVE: "relative"}
+
+# Input optics. CC = cosine corrector, sphere = integrating sphere as collector,
+# bare = bare fibre, objective = microscope objective / imaging optic.
+INPUT_OPTICS = ("CC", "bare", "sphere", "objective")
+
+# factor to the SI unit of the quantity: W/(m²·nm) resp. W/(m²·sr·nm)
+_TO_SI = {UNIT_UW_CM2_NM: 0.01, UNIT_W_M2_NM: 1.0, UNIT_MW_M2_NM: 1e-3,
+          UNIT_UW_CM2_SR_NM: 0.01, UNIT_W_M2_SR_NM: 1.0, UNIT_MW_M2_SR_NM: 1e-3}
+# backward-compatible name (irradiance units only)
+_TO_W_M2_NM = {u: _TO_SI[u] for u in IRRADIANCE_UNITS}
 
 
-def convert_irradiance(values, from_unit: str, to_unit: str) -> np.ndarray:
-    """Convert spectral irradiance between units. 'relative' only to 'relative'."""
+def quantity_of_unit(unit: str) -> str | None:
+    """'irradiance' / 'radiance' for an absolute unit, None for 'relative' or
+    an unknown unit."""
+    if unit in IRRADIANCE_UNITS:
+        return QUANTITY_IRRADIANCE
+    if unit in RADIANCE_UNITS:
+        return QUANTITY_RADIANCE
+    return None
+
+
+def is_absolute_unit(unit: str) -> bool:
+    return quantity_of_unit(unit) is not None
+
+
+def unit_label(unit: str) -> str:
+    return UNIT_LABELS.get(unit, unit or "")
+
+
+def to_si_factor(unit: str) -> float:
+    """Factor from an absolute unit to the SI unit of its quantity."""
+    if unit not in _TO_SI:
+        raise ValueError(f"'{unit}' is not an absolute unit")
+    return _TO_SI[unit]
+
+
+def convert_units(values, from_unit: str, to_unit: str) -> np.ndarray:
+    """Convert spectral values between units of the SAME quantity
+    (irradiance <-> irradiance, radiance <-> radiance). 'relative' only to
+    'relative'; irradiance <-> radiance is refused (needs a geometry)."""
     for u in (from_unit, to_unit):
         if u not in KNOWN_UNITS:
             raise ValueError(f"Unknown unit '{u}' (known: {', '.join(KNOWN_UNITS)})")
@@ -42,7 +96,21 @@ def convert_irradiance(values, from_unit: str, to_unit: str) -> np.ndarray:
     if UNIT_RELATIVE in (from_unit, to_unit):
         raise ValueError(f"Cannot convert between '{from_unit}' and '{to_unit}': "
                          "relative values have no absolute scale")
-    return arr * (_TO_W_M2_NM[from_unit] / _TO_W_M2_NM[to_unit])
+    qf, qt = quantity_of_unit(from_unit), quantity_of_unit(to_unit)
+    if qf != qt:
+        raise ValueError(f"Cannot convert {qf} ('{from_unit}') to {qt} ('{to_unit}'): "
+                         "different measurement quantities")
+    return arr * (_TO_SI[from_unit] / _TO_SI[to_unit])
+
+DEMO_SOURCE_ID = "demo-cal-3000k"
+# Demo backend: the simulated spectrum that physically matches each built-in
+# demo reference source (the calibration wizard switches to it for the run).
+DEMO_SPECTRUM_FOR_SOURCE = {DEMO_SOURCE_ID: "cal_lamp"}
+
+
+def convert_irradiance(values, from_unit: str, to_unit: str) -> np.ndarray:
+    """Backward-compatible name of convert_units (same-quantity conversion)."""
+    return convert_units(values, from_unit, to_unit)
 
 
 # ---------------------------------------------------------------- parsing
@@ -190,11 +258,28 @@ class ReferenceSource:
     values: np.ndarray
     notes: str = ""
     builtin: bool = False
+    quantity: str = QUANTITY_IRRADIANCE
+    # free metadata (e.g. sphere characterisation: geometry, date, device,
+    # CC profile id/version, uncertainty summary)
+    meta: dict = field(default_factory=dict)
+    # optional per-point standard uncertainty (same unit as values)
+    uncertainty: np.ndarray | None = None
+
+    def __post_init__(self):
+        q = quantity_of_unit(self.unit)
+        if not self.quantity:
+            self.quantity = q or QUANTITY_IRRADIANCE
+        if self.quantity not in QUANTITIES:
+            raise ValueError(f"Reference '{self.id}': unknown quantity '{self.quantity}' "
+                             f"(allowed: {', '.join(QUANTITIES)})")
+        if q is not None and q != self.quantity:
+            raise ValueError(f"Reference '{self.id}': unit '{self.unit}' is a {q} unit, "
+                             f"but the quantity is '{self.quantity}'")
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "id": self.id, "name": self.name, "serial": self.serial,
-            "unit": self.unit,
+            "unit": self.unit, "quantity": self.quantity,
             "valid_min_nm": float(self.valid_min_nm),
             "valid_max_nm": float(self.valid_max_nm),
             "input_optic": self.input_optic, "source_file": self.source_file,
@@ -202,6 +287,11 @@ class ReferenceSource:
             "wl": [float(x) for x in self.wl],
             "values": [float(x) for x in self.values],
         }
+        if self.meta:
+            out["meta"] = dict(self.meta)
+        if self.uncertainty is not None:
+            out["uncertainty"] = [float(x) for x in self.uncertainty]
+        return out
 
     @classmethod
     def from_dict(cls, d) -> "ReferenceSource":
@@ -216,6 +306,13 @@ class ReferenceSource:
                 wl=np.asarray(d["wl"], dtype=float),
                 values=np.asarray(d["values"], dtype=float),
                 notes=str(d.get("notes", "")), builtin=bool(d.get("builtin", False)),
+                # records written before the quantity existed: from the unit;
+                # 'relative' sources default to irradiance
+                quantity=str(d.get("quantity") or quantity_of_unit(str(d.get("unit", "")))
+                             or QUANTITY_IRRADIANCE),
+                meta=dict(d.get("meta") or {}),
+                uncertainty=(None if d.get("uncertainty") is None
+                             else np.asarray(d["uncertainty"], dtype=float)),
             )
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"Invalid reference source record: {e!r}") from e
@@ -223,13 +320,23 @@ class ReferenceSource:
             raise ValueError(f"Reference '{src.id}': unknown unit '{src.unit}'")
         if src.wl.shape != src.values.shape or src.wl.size < 2:
             raise ValueError(f"Reference '{src.id}': wl/values mismatch or < 2 points")
+        if src.uncertainty is not None and src.uncertainty.shape != src.wl.shape:
+            raise ValueError(f"Reference '{src.id}': uncertainty/wl mismatch")
         return src
+
+    @property
+    def is_absolute(self) -> bool:
+        return self.unit != UNIT_RELATIVE
+
+    @property
+    def unit_text(self) -> str:
+        return unit_label(self.unit)
 
     def on_axis(self, axis_nm, unit: str | None = None) -> np.ndarray:
         out = interpolate_to_axis(self.wl, self.values, axis_nm,
                                   self.valid_min_nm, self.valid_max_nm)
         if unit is not None and unit != self.unit:
-            out = convert_irradiance(out, self.unit, unit)
+            out = convert_units(out, self.unit, unit)
         return out
 
     @property
@@ -306,11 +413,19 @@ class ReferenceLibrary:
     def import_file(self, path: str, *, name: str, serial: str,
                     unit: str = UNIT_UW_CM2_NM,
                     valid_min_nm: float | None = None, valid_max_nm: float | None = None,
-                    input_optic: str = "", notes: str = "") -> ReferenceSource:
+                    input_optic: str = "", notes: str = "",
+                    quantity: str | None = None) -> ReferenceSource:
         if not str(name).strip():
             raise ValueError("Name must not be empty")
         if unit not in KNOWN_UNITS:
             raise ValueError(f"Unknown unit '{unit}' (known: {', '.join(KNOWN_UNITS)})")
+        q = quantity_of_unit(unit)
+        if not quantity:
+            quantity = q or QUANTITY_IRRADIANCE
+        if quantity not in QUANTITIES:
+            raise ValueError(f"Unknown quantity '{quantity}' (allowed: {', '.join(QUANTITIES)})")
+        if q is not None and q != quantity:
+            raise ValueError(f"Unit '{unit}' is a {q} unit, not {quantity}")
         if input_optic and input_optic not in INPUT_OPTICS:
             raise ValueError(f"Unknown input optic '{input_optic}' "
                              f"(allowed: {', '.join(INPUT_OPTICS)} or empty)")
@@ -327,7 +442,7 @@ class ReferenceLibrary:
             id=_slug(name, serial), name=str(name).strip(), serial=str(serial).strip(),
             unit=unit, valid_min_nm=vmin, valid_max_nm=vmax, input_optic=input_optic,
             source_file=os.path.basename(path), imported=_now_iso(),
-            wl=wl, values=values, notes=notes)
+            wl=wl, values=values, notes=notes, quantity=quantity)
         return self.add(src)
 
     def remove(self, source_id: str) -> bool:

@@ -61,4 +61,5 @@ def test_mcp_server_import_qt_free():
 
 def test_core_calibration_modules_qt_free():
     _run("import calibration_linearity\nimport calibration_workflow\n"
-         "import calibration_capture\nimport processing")
+         "import calibration_capture\nimport processing\n"
+         "import calibration_sphere\nimport reference_sources\nimport color_science")

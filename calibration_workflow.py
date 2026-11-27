@@ -3,9 +3,12 @@ calibration_workflow.py — The calibration wizard's fixed sequence, Qt-free.
 
 Identical for every backend and every optics configuration (plan §4, Phase 2):
 
-  1. choose device, optics configuration (name + input CC/bare/sphere),
-     reference source from the library, type relative/absolute
-     (absolute only with a defined entrance area, i.e. input != bare)
+  1. choose device, optics configuration (name + input CC/bare/sphere/
+     objective), reference source from the library, type relative/absolute.
+     The measurement quantity follows from the reference source (irradiance
+     or radiance); calibration_profiles.admissible() decides which input
+     optics are allowed (absolute irradiance: CC/sphere; absolute radiance:
+     bare/objective; relative: all).
   2. wavelength-calibration check (fingerprint)
   3. integration time: auto exposure to the target band (70–85 % FS), then fixed
   4. dark spectra BEFORE — at t_int AND at ~t_int/2, in one covered phase
@@ -219,8 +222,24 @@ def wavelength_check(backend, backend_name: str, optics_name: str = "",
     return out
 
 
+# Text shown by the desktop wizard and the web dialog / API job for a
+# radiance calibration (one source).
+RADIANCE_SOURCE_HINT = (
+    "Radiance: the source must fill the field of view of the optics completely "
+    "and uniformly — e.g. the sphere port under the objective, focused on the "
+    "port plane; a bare fibre close above the port, its acceptance cone inside "
+    "the port.")
+
+
+def reference_quantity(reference) -> str:
+    """Measurement quantity of a library source (irradiance by default)."""
+    q = getattr(reference, "quantity", None)
+    return q if q in cp.QUANTITIES else cp.QUANTITY_IRRADIANCE
+
+
 class CalibrationWorkflow:
-    """State of one wizard run (relative or absolute, against a library lamp)."""
+    """State of one wizard run (relative or absolute, against a library lamp
+    or a characterised radiance source)."""
 
     def __init__(self, backend, backend_name: str, *, kind: str, optics: dict,
                  reference, cfg: WorkflowConfig | None = None):
@@ -229,19 +248,21 @@ class CalibrationWorkflow:
         inp = optics.get("input", "")
         if inp not in cp.INPUT_OPTICS:
             raise ValueError(f"input optic must be one of {cp.INPUT_OPTICS}")
-        if kind == cp.TYPE_ABSOLUTE and inp == "bare":
-            raise ValueError("Absolute calibration needs a defined entrance area "
-                             "(CC or sphere); a bare fibre is always relative.")
+        quantity = reference_quantity(reference)
+        ok, why = cp.admissible(kind, quantity, inp)
+        if not ok:
+            raise ValueError(why)
         if not optics.get("name"):
             raise ValueError("Name the optics configuration.")
         if kind == cp.TYPE_ABSOLUTE and not cp.is_absolute_reference_unit(
-                getattr(reference, "unit", "")):
+                getattr(reference, "unit", ""), quantity):
             raise ValueError(f"Absolute calibration needs a reference source with an "
-                             f"absolute irradiance unit; '{reference.name}' is "
+                             f"absolute {quantity} unit; '{reference.name}' is "
                              f"'{reference.unit}'. Use type 'relative'.")
         self.backend = backend
         self.backend_name = backend_name
         self.kind = kind
+        self.quantity = quantity
         self.optics = {"name": optics["name"], "input": inp,
                        "notes": optics.get("notes", "")}
         self.reference = reference                     # reference_sources.ReferenceSource
@@ -616,7 +637,8 @@ class CalibrationWorkflow:
         p = cp.new_profile(kind=self.kind, backend=self.backend_name, serial=serial,
                            optics=self.optics, reference=reference, wl_fingerprint=fp,
                            result=self.result, acquisition=acq, checks=checks,
-                           ref_unit=ref.unit, plausibility=stored_pl)
+                           ref_unit=ref.unit, plausibility=stored_pl,
+                           quantity=self.quantity)
         saved = [cp.add_profile(p)]
         if self.kind == cp.TYPE_ABSOLUTE:
             S, valid = cp.relative_from_absolute(self.result["K"], self.result["valid"])
@@ -625,7 +647,7 @@ class CalibrationWorkflow:
                                serial=serial, optics=self.optics, reference=reference,
                                wl_fingerprint=fp, result=rel, acquisition=acq,
                                checks=checks, ref_unit=ref.unit,
-                               plausibility=stored_pl)
+                               plausibility=stored_pl, quantity=self.quantity)
             q["derived_from"] = {"id": saved[0]["id"], "how": "relative_from_absolute"}
             saved.append(cp.add_profile(q))
         self.saved = saved
@@ -675,11 +697,15 @@ class CalibrationWorkflow:
             "started": self.started,
             "finished": cc.now_iso(),
             "type": self.kind,
+            "quantity": self.quantity,
+            "source_hint": (RADIANCE_SOURCE_HINT if self.quantity == cp.QUANTITY_RADIANCE
+                            else ""),
             "device": {"backend": self.backend_name,
                        "serial": getattr(self.backend, "serial", None)},
             "optics": dict(self.optics),
             "reference": {"id": ref.id, "name": ref.name, "serial": ref.serial,
-                          "unit": ref.unit, "valid_min_nm": ref.valid_min_nm,
+                          "unit": ref.unit, "quantity": self.quantity,
+                          "valid_min_nm": ref.valid_min_nm,
                           "valid_max_nm": ref.valid_max_nm,
                           "source_file": ref.source_file},
             "wl_fingerprint": None if not self.wl_check else self.wl_check["fingerprint"],
@@ -1290,7 +1316,8 @@ class DerivationWorkflow:
                            wl_fingerprint=self.wl_fp,
                            result=self.result, acquisition=self._acquisition(),
                            checks=self._profile_checks(),
-                           plausibility=_stored_plausibility(self.plausibility, override))
+                           plausibility=_stored_plausibility(self.plausibility, override),
+                           quantity=cp.profile_quantity(k))
         p["derived_from"] = {"id": k["id"], "how": "ratio C_new/C_known",
                              "known_optics": (k.get("optics") or {}).get("name"),
                              "known_version": k.get("version")}
@@ -1356,8 +1383,10 @@ class DerivationWorkflow:
             "device": {"backend": self.backend_name,
                        "serial": getattr(self.backend, "serial", None)},
             "optics": dict(self.optics),
+            "quantity": cp.profile_quantity(k),
             "known_profile": {"id": k.get("id"), "version": k.get("version"),
                               "type": k.get("type"),
+                              "quantity": cp.profile_quantity(k),
                               "optics": dict(k.get("optics") or {}),
                               "reference": dict(k.get("reference") or {})},
             "source_hint": DERIVATION_SOURCE_HINT,

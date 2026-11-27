@@ -282,7 +282,8 @@ class SpectrumInput(_M):
 
 
 class ColorRequest(SpectrumInput):
-    lux_calibration: Optional[float] = Field(None, description="Override the lux factor")
+    lux_calibration: Optional[float] = Field(None, description="Override the lux factor "
+                                             "(irradiance) / cd-per-m2 factor (radiance)")
 
 
 class PeaksRequest(SpectrumInput):
@@ -314,7 +315,7 @@ class CopyProfileRequest(_M):
 
 class OpticsSpec(_M):
     name: str = Field(..., min_length=1)
-    input: Literal["CC", "sphere", "bare"]
+    input: Literal["CC", "sphere", "bare", "objective"]
     notes: str = ""
 
 

@@ -27,7 +27,7 @@ allowed-tools: mcp__plugin_ps2600-spectrometer_spectrometer__* Read Write
 - Duv: for white light usually within +/-0.006; beyond +/-0.02 the CCT is not meaningful.
 - Ra: 0-100; typical LED 70-98. R9 can be strongly negative for LEDs with weak deep red.
 - x, y: inside the spectrum locus; white light near the Planckian locus (y about 0.33-0.41 for 3000-6500 K).
-- Illuminance (lux) is only available with an absolute calibration or a configured `radiometric_calibration_factor`. `lux: null` means not available. Never estimate lux from counts.
+- Illuminance (lux) is only available with an absolute calibration or a configured `radiometric_calibration_factor`. `lux: null` means not available. Never estimate lux from counts. With a radiance calibration (`quantity: radiance`, unit `.../sr/nm`) the photometric result is luminance in cd/m2 (`luminance_cd_m2`) and lux is not available.
 - Compare peak wavelengths with the expected emitter (blue LED pump about 440-460 nm, phosphor broad band 500-650 nm).
 
-State results with units: CCT in K, Duv dimensionless, wavelengths in nm, lux in lx.
+State results with units: CCT in K, Duv dimensionless, wavelengths in nm, lux in lx or luminance in cd/m2.

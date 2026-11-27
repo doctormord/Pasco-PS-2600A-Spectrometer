@@ -28,6 +28,7 @@ EXPECTED_TOOLS = {
     "select_profile", "calibration_status", "list_references", "start_calibration",
     "export_measurement", "create_report",
     "verify_profile", "linearity_status", "start_linearity",
+    "start_sphere_characterization",
 }
 LIMIT = 8 * 1024
 

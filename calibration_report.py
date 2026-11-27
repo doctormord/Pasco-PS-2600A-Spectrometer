@@ -180,7 +180,9 @@ def _metadata(record: dict) -> list[tuple[str, str]]:
         ("valid_range_nm", "" if not vr else " - ".join(_num(x, "{:.1f}") for x in vr)),
         ("gain_span", gs_s), ("n_valid", _num(r.get("n_valid"), "{:.0f}")),
         ("unit", r.get("unit") or ""),
-        ("stability_pct", _num(chk.get("stability_pct"), "{:.3f}")),
+        ("quantity", r.get("quantity") or ""),
+        ("source_hint", r.get("source_hint") or ""),
+        ("stability_pct",_num(chk.get("stability_pct"), "{:.3f}")),
         ("stability_threshold_pct", _num(chk.get("stability_threshold_pct"), "{:.3f}")),
         ("stability_delay_s", _num(chk.get("stability_delay_s"), "{:.3g}")),
         ("stability_pass", _yesno(chk.get("stability_pass"), "")),
@@ -565,6 +567,19 @@ def _style_axes(ax, xlabel=None, ylabel=None, color=None):
 # ══════════════════════════════════════════════════════════════════════════
 #  Calibration protocol PDF
 # ══════════════════════════════════════════════════════════════════════════
+def _type_text(kind, quantity) -> str:
+    """'absolute radiance' / 'absolute irradiance' / plain type."""
+    kind = str(kind or "")
+    if kind == "absolute" and quantity in ("radiance", "irradiance"):
+        return f"absolute {quantity}"
+    return kind
+
+
+def _unit_text(unit) -> str:
+    import reference_sources as rs
+    return rs.unit_label(str(unit or ""))
+
+
 def _status(v, ok="passed", bad="FAILED", none="n/a"):
     if v is None:
         return (none, DARK)
@@ -616,7 +631,8 @@ def write_protocol_pdf(record: dict, path: str) -> str:
         lin_extra = f" (id {li['id']}" + (f", {li['created']}" if li.get("created") else "") + ")"
     doc.kv([("Started", meta["started"]), ("Finished", meta["finished"]),
             ("Device", meta["device"]), ("Serial", meta["serial"] or "-"),
-            ("Type", meta["type"]), ("Unit", meta["unit"]),
+            ("Type", _type_text(meta["type"], meta["quantity"])),
+            ("Unit", _unit_text(meta["unit"])),
             ("Optics", f"{meta['optics_name']} ({meta['optics_input']})"),
             ("Reference", f"{meta['reference_name']} (S/N {meta['reference_serial'] or '-'})"),
             ("Ref. unit / range", f"{meta['reference_unit']}  "
@@ -634,7 +650,9 @@ def write_protocol_pdf(record: dict, path: str) -> str:
             ("Ref. file", meta["reference_source_file"] or "-"),
             ("Valid segments", (meta["valid_segments_nm"] + " nm") if meta["valid_segments_nm"] else "-"),
             ("WL fingerprint", meta["wl_fingerprint"] or "-"),
-            ("Limits", _limit_text(record))], ncols=1)
+            ("Limits", _limit_text(record))]
+           + ([("Source note", meta["source_hint"])]
+              if meta["quantity"] == "radiance" and meta["source_hint"] else []), ncols=1)
 
     # plot 1
     doc.heading("Calibration spectrum and reference")
@@ -1122,6 +1140,7 @@ def _deriv_metadata(record: dict) -> list[tuple[str, str]]:
          ("known_optics_input", _g(kp, "optics", "input", default="")),
          ("known_reference_name", _g(kp, "reference", "name", default="")),
          ("type", r.get("type") or ""),
+         ("quantity", r.get("quantity") or ""),
          ("source_hint", r.get("source_hint") or "")]
     for s, _label in _DERIV_SIDES:
         sd = sides.get(s) or {}
@@ -1272,7 +1291,8 @@ def write_derivation_pdf(record: dict, path: str) -> str:
             ("New optics", f"{meta['new_optics_name']} ({meta['new_optics_input']})"),
             ("Known profile", f"{meta['known_profile_id'] or '-'} v{meta['known_profile_version'] or '-'}"),
             ("Known optics", f"{meta['known_optics_name']} ({meta['known_optics_input']})"),
-            ("Type / unit", f"{meta['type']} / {meta['unit']}"),
+            ("Type / unit", f"{_type_text(meta['type'], meta['quantity'])} / "
+                            f"{_unit_text(meta['unit'])}"),
             ("Averages N", meta["averages_N"]), ("NL correction", meta["nl_correction"]),
             ("Valid range", f"{meta['valid_range_nm']} nm" if meta["valid_range_nm"] else "-"),
             ("Gain span (hint)", meta["gain_span"] or "-"),
@@ -1422,4 +1442,325 @@ def write_derivation_protocol(record: dict, pdf_path: str | None = None,
         out.append(write_derivation_csv(record, csv_path))
     if pdf_path:
         out.append(write_derivation_pdf(record, pdf_path))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Sphere characterisation protocol (radiance reference)
+# ══════════════════════════════════════════════════════════════════════════
+def default_sphere_basename(record: dict) -> str:
+    record = record or {}
+    parts = ["sphere", _slug(_g(record, "sphere", "name"), "sphere"),
+             _slug(_g(record, "device", "serial"), "noserial"), _stamp(record)]
+    return re.sub(r"[^A-Za-z0-9_-]", "", "_".join(parts))
+
+
+def _sphere_limit_rows(r: dict) -> list[tuple[str, str]]:
+    """All configurable limits of the run (record["settings"]) with their values."""
+    st = (r or {}).get("settings") or {}
+    out = []
+    for k, v in st.items():
+        if isinstance(v, (list, tuple)):
+            out.append((k, " - ".join(_num(x, "{:.4g}") for x in v)))
+        else:
+            out.append((k, _num(v, "{:.6g}")))
+    return out
+
+
+def _range_text(x) -> str:
+    return "" if not x else " - ".join(_num(v, "{:.1f}") for v in x)
+
+
+def _sphere_metadata(record: dict) -> list[tuple[str, str]]:
+    r = record or {}
+    sp, cp_ = r.get("sphere") or {}, r.get("cc_profile") or {}
+    acq, dr, ov = r.get("acquisition") or {}, r.get("drift") or {}, r.get("overall") or {}
+    un, src = r.get("uncertainty") or {}, r.get("source") or {}
+    m = [("started", r.get("started") or ""), ("finished", r.get("finished") or ""),
+         ("device", _g(r, "device", "backend", default="")),
+         ("serial", _g(r, "device", "serial", default="")),
+         ("sphere_name", sp.get("name") or ""), ("sphere_serial", sp.get("serial") or ""),
+         ("port_radius_mm", _num(sp.get("port_radius_mm"), "{:.4g}")),
+         ("port_diameter_mm", _num(sp.get("port_diameter_mm"), "{:.4g}")),
+         ("edge_depth_mm", _num(sp.get("edge_depth_mm"), "{:.4g}")),
+         ("cc_ref_offset_mm", _num(sp.get("cc_ref_offset_mm"), "{:.4g}")),
+         ("u_radius_mm", _num(sp.get("u_radius_mm"), "{:.4g}")),
+         ("u_distance_mm", _num(sp.get("u_distance_mm"), "{:.4g}")),
+         ("u_cc_pct", _num(sp.get("cc_uncertainty_pct"), "{:.4g}")),
+         ("sphere_notes", sp.get("notes") or ""),
+         ("cc_profile_id", cp_.get("id") or ""),
+         ("cc_profile_version", _num(cp_.get("version"), "{:.0f}")),
+         ("cc_optics_name", _g(cp_, "optics", "name", default="")),
+         ("cc_optics_input", _g(cp_, "optics", "input", default="")),
+         ("cc_reference_name", _g(cp_, "reference", "name", default="")),
+         ("cc_valid_range_nm", _range_text(cp_.get("valid_range_nm"))),
+         ("quantity", r.get("quantity") or ""),
+         ("unit", r.get("unit") or ""), ("irradiance_unit", r.get("irradiance_unit") or ""),
+         ("source_hint", r.get("source_hint") or ""),
+         ("formula", r.get("formula") or ""),
+         ("t_int_us", _num(acq.get("integration_us"), "{:.0f}")),
+         ("averages_N", _num(acq.get("averages"), "{:.0f}")),
+         ("dark_sequence", acq.get("dark_sequence") or ""),
+         ("nl_correction", _nl_text(acq)),
+         ("wl_fingerprint", r.get("wl_fingerprint") or ""),
+         ("valid_range_nm", _range_text(r.get("valid_range_nm"))),
+         ("method", r.get("method") or ""),
+         ("d0_mm", _num(r.get("d0_mm"), "{:+.4f}")),
+         ("d0_plausible", _yesno(r.get("d0_plausible"), "")),
+         ("d0_max_mm", _num(r.get("d0_max_mm"), "{:.4g}")),
+         ("consistency_spread_pct", _num(ov.get("spread_pct"), "{:.4g}")),
+         ("consistency_spread_nominal_pct", _num(ov.get("spread_nominal_pct"), "{:.4g}")),
+         ("consistency_max_pct", _num(r.get("consistency_max_pct"), "{:.4g}")),
+         ("consistency_pass", _yesno(r.get("consistency_pass"), "")),
+         ("fit_rms_pct", _num(ov.get("fit_rms_pct"), "{:.4g}")),
+         ("drift_pct_p95", _num(dr.get("p95_pct"), "{:.3f}")),
+         ("drift_pct_mean", _num(dr.get("mean_pct"), "{:+.3f}")),
+         ("drift_limit_pct", _num(dr.get("limit_pct"), "{:.3f}")),
+         ("drift_pass", _yesno(dr.get("pass"), "")),
+         ("drift_seconds", _num(dr.get("seconds"), "{:.1f}"))]
+    for key in ("u_rel_r_pct", "u_rel_d_pct", "u_rel_spread_median_pct", "u_rel_drift_pct",
+                "u_rel_cc_pct", "u_rel_median_pct", "u_rel_max_pct", "U_rel_median_pct_k2"):
+        m.append((key, _num(un.get(key), "{:.4g}")))
+    for i, p in enumerate(r.get("positions") or [], 1):
+        m.append((f"position_{i}",
+                  f"height_mm={_num(p.get('height_mm'), '{:.4g}')} "
+                  f"d_mm={_num(p.get('d_mm'), '{:.4f}')} "
+                  f"d_eff_mm={_num(p.get('d_eff_mm'), '{:.4f}')} "
+                  f"peak_pct_fs={_pct(p.get('peak_frac'), '{:.1f}')} "
+                  f"captured={p.get('captured') or ''}"))
+    for i, b in enumerate(r.get("bands") or [], 1):
+        m.append((f"band_{i}",
+                  f"{_num(b.get('lo'), '{:.0f}')}-{_num(b.get('hi'), '{:.0f}')} nm "
+                  f"n={_num(b.get('n'), '{:.0f}')} "
+                  f"spread_pct={_num(b.get('spread_pct'), '{:.3f}')} "
+                  f"spread_nominal_pct={_num(b.get('spread_nominal_pct'), '{:.3f}')} "
+                  f"d0_mm={_num(b.get('d0_mm'), '{:+.3f}')} "
+                  f"u_rel_pct={_num(b.get('u_rel_pct'), '{:.3f}')} "
+                  f"pass={_yesno(b.get('pass'), 'n/a')}"))
+    m += _sphere_limit_rows(r)
+    if src:
+        m += [("result_source_id", src.get("id") or ""),
+              ("result_source_name", src.get("name") or ""),
+              ("result_source_unit", src.get("unit") or ""),
+              ("result_source_quantity", src.get("quantity") or ""),
+              ("result_source_valid_min_nm", _num(src.get("valid_min_nm"), "{:.1f}")),
+              ("result_source_valid_max_nm", _num(src.get("valid_max_nm"), "{:.1f}"))]
+    for i, w in enumerate(r.get("warnings") or [], 1):
+        m.append((f"warning_{i}", str(w)))
+    return m
+
+
+def write_sphere_csv(record: dict, path: str) -> str:
+    sp = _spectra(record)
+    wl = sp.get("wl") or []
+    E, Li = sp.get("E") or [], sp.get("L_i") or []
+    lines = ["# sphere characterisation protocol"]
+    for k, v in _sphere_metadata(record):
+        lines.append(f"# {k};{_csv_clean(v)}")
+    cols = ["wavelength_nm"] + [f"E_{i}_uW_cm2_nm" for i in range(1, len(E) + 1)]
+    cols += ["E_repeat_uW_cm2_nm"] + [f"L_{i}_uW_cm2_sr_nm" for i in range(1, len(Li) + 1)]
+    cols += ["L_fit", "L_mean", "L_used", "spread_pct", "u_rel_pct", "valid"]
+    lines.append(";".join(cols))
+
+    def at(a, i):
+        return a[i] if a is not None and i < len(a) else None
+    for i in range(len(wl)):
+        row = [_dcell(wl[i])] + [_dcell(at(e, i)) for e in E]
+        row.append(_dcell(at(sp.get("E_repeat"), i)))
+        row += [_dcell(at(x, i)) for x in Li]
+        row += [_dcell(at(sp.get("L_fit"), i)), _dcell(at(sp.get("L_mean"), i)),
+                _dcell(at(sp.get("L_smoothed"), i)), _dcell(at(sp.get("spread_pct"), i)),
+                _dcell(at(sp.get("u_rel_pct"), i)), _dcell(at(sp.get("valid"), i))]
+        lines.append(";".join(row))
+    return _write_lines(path, lines)
+
+
+def write_sphere_pdf(record: dict, path: str) -> str:
+    import numpy as np
+
+    record = record or {}
+    sp = _spectra(record)
+    wl = np.array([np.nan if v is None else float(v) for v in (sp.get("wl") or [])], float)
+    n = len(wl)
+    meta = dict(_sphere_metadata(record))
+    unit_l = _unit_text(record.get("unit"))
+    e_unit_l = _unit_text(record.get("irradiance_unit"))
+    sph, cpr = record.get("sphere") or {}, record.get("cc_profile") or {}
+    dr, ov = record.get("drift") or {}, record.get("overall") or {}
+    un, src = record.get("uncertainty") or {}, record.get("source") or {}
+    pos = record.get("positions") or []
+    E = [_arr(np, e, n) for e in (sp.get("E") or [])]
+    Li = [_arr(np, x, n) for x in (sp.get("L_i") or [])]
+    Er, Lu = _arr(np, sp.get("E_repeat"), n), _arr(np, sp.get("L_smoothed"), n)
+    if not np.isfinite(Lu).any():
+        Lu = _arr(np, sp.get("L"), n)
+    spread, urel = _arr(np, sp.get("spread_pct"), n), _arr(np, sp.get("u_rel_pct"), n)
+    vr = record.get("valid_range_nm")
+    cmap = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#17becf", "#e377c2"]
+
+    def lab(i):
+        p = pos[i] if i < len(pos) else {}
+        return f"{i + 1}: h = {_num(p.get('height_mm'), '{:.4g}', '?')} mm"
+
+    doc = _Doc("Sphere characterisation protocol")
+    doc.title_block("Sphere characterisation (radiance reference)")
+    t_ms = None if not meta["t_int_us"] else float(meta["t_int_us"]) / 1000
+    doc.kv([("Started", meta["started"]), ("Finished", meta["finished"]),
+            ("Device", meta["device"]), ("Serial", meta["serial"] or "-"),
+            ("Quantity / unit", f"{record.get('quantity') or '-'} / {unit_l or '-'}"),
+            ("Irradiance unit", e_unit_l or "-"),
+            ("Integration time", _num(t_ms, "{:.4g} ms", "-")),
+            ("Averages N", meta["averages_N"]), ("NL correction", meta["nl_correction"]),
+            ("Dark sequence", meta["dark_sequence"] or "-"),
+            ("Valid range", f"{meta['valid_range_nm']} nm" if meta["valid_range_nm"] else "-"),
+            ("WL fingerprint", meta["wl_fingerprint"] or "-")])
+
+    doc.heading("Sphere and geometry")
+    doc.kv([("Sphere", meta["sphere_name"] or "-"),
+            ("Identifier", meta["sphere_serial"] or "-"),
+            ("Port radius", _num(sph.get("port_radius_mm"), "{:.4g} mm", "-")),
+            ("Port diameter", _num(sph.get("port_diameter_mm"), "{:.4g} mm", "-")),
+            ("Knife-edge to housing top", _num(sph.get("edge_depth_mm"), "{:.4g} mm", "-")),
+            ("CC reference plane", _num(sph.get("cc_ref_offset_mm"),
+                                        "{:+.4g} mm (rel. housing top)", "-")),
+            ("u(r)", _num(sph.get("u_radius_mm"), "{:.4g} mm", "-")),
+            ("u(d)", _num(sph.get("u_distance_mm"), "{:.4g} mm", "-")),
+            ("u(CC)", _num(sph.get("cc_uncertainty_pct"), "{:.4g} %", "-")),
+            ("Notes", sph.get("notes") or "-")])
+    doc.heading("CC profile")
+    doc.kv([("Profile", f"{cpr.get('id') or '-'} v{meta['cc_profile_version'] or '-'}"),
+            ("Optics", f"{meta['cc_optics_name'] or '-'} ({meta['cc_optics_input'] or '-'})"),
+            ("Reference", meta["cc_reference_name"] or "-"),
+            ("Valid range", f"{meta['cc_valid_range_nm']} nm" if meta["cc_valid_range_nm"] else "-")])
+    doc.heading("Model")
+    doc.para(record.get("formula") or "-")
+    if record.get("source_hint"):
+        doc.para(str(record["source_hint"]))
+
+    doc.heading("Positions")
+    rows = []
+    for i, p in enumerate(pos, 1):
+        rows.append([str(i), _num(p.get("height_mm"), "{:.4g}", "-"),
+                     _num(p.get("d_mm"), "{:.4f}", "-"), _num(p.get("d_eff_mm"), "{:.4f}", "-"),
+                     _pct(p.get("peak_frac"), "{:.1f} % FS") or "-", p.get("captured") or "-"])
+    doc.table(["#", "Height (mm)", "d (mm)", "d_eff (mm)", "Level", "Captured"], rows,
+              [0.5, 1.2, 1.2, 1.2, 1.2, 3.2])
+
+    doc.heading("Fit and consistency")
+    doc.kv([("Offset d0", _num(record.get("d0_mm"), "{:+.3f} mm", "n/a")),
+            ("d0 plausible", _yesno(record.get("d0_plausible"))),
+            ("Limit |d0|", _num(record.get("d0_max_mm"), "{:.4g} mm", "n/a")),
+            ("Method", {"fit": "fit (d0 applied)", "mean": "mean over distances (nominal)"}
+             .get(record.get("method"), record.get("method") or "n/a")),
+            ("Spread overall", _num(ov.get("spread_pct"), "{:.3f} %", "n/a")),
+            ("Spread, nominal geometry", _num(ov.get("spread_nominal_pct"), "{:.3f} %", "n/a")),
+            ("Limit spread", _num(record.get("consistency_max_pct"), "{:.4g} %", "n/a")),
+            ("Consistency", _status(record.get("consistency_pass"))[0])])
+    brows, bfill = [], []
+    for b in record.get("bands") or []:
+        ok = b.get("pass")
+        brows.append([f"{_num(b.get('lo'), '{:.0f}', '?')}-{_num(b.get('hi'), '{:.0f}', '?')} nm",
+                      _num(b.get("n"), "{:.0f}", "-"), _num(b.get("spread_pct"), "{:.3f}", "-"),
+                      _num(b.get("spread_nominal_pct"), "{:.3f}", "-"),
+                      _num(b.get("d0_mm"), "{:+.3f}", "-"), _num(b.get("u_rel_pct"), "{:.3f}", "-"),
+                      _status(ok)])
+        bfill.append(WARN_FILL if ok is False else None)
+    if brows:
+        doc.table(["Band", "Pixels", "Spread (%)", "Spread nominal (%)", "d0 (mm)",
+                   "u_rel (%)", "Result"], brows, [1.8, 0.9, 1.1, 1.5, 1.1, 1.1, 1.1],
+                  row_fill=bfill)
+
+    doc.heading("Source drift (repeat of the first distance)")
+    if dr:
+        doc.table(["Drift (p95)", "Mean", "Limit", "Result", "Duration"],
+                  [[_num(dr.get("p95_pct"), "{:.2f} %", "n/a"),
+                    _num(dr.get("mean_pct"), "{:+.2f} %", "n/a"),
+                    _num(dr.get("limit_pct"), "{:.2f} %", "n/a"), _status(dr.get("pass")),
+                    _num(dr.get("seconds"), "{:.0f} s", "n/a")]], [1.4, 1.2, 1.2, 1.2, 1.2],
+                  row_fill=[WARN_FILL if dr.get("pass") is False else None])
+    else:
+        doc.para("Source drift was not checked (no repeat of the first distance).", 7.5, RED)
+
+    doc.heading("Uncertainty budget (relative, k = 1)")
+    urows = [["Port radius u(r)", _num(un.get("u_rel_r_pct"), "{:.3f}", "-")],
+             ["Distance u(d)", _num(un.get("u_rel_d_pct"), "{:.3f}", "-")],
+             ["Spread over the distances (median)",
+              _num(un.get("u_rel_spread_median_pct"), "{:.3f}", "-")],
+             ["Source drift", _num(un.get("u_rel_drift_pct"), "{:.3f}", "-")],
+             ["CC calibration", _num(un.get("u_rel_cc_pct"), "{:.3f}", "-")],
+             ["Combined, median", _num(un.get("u_rel_median_pct"), "{:.3f}", "-")],
+             ["Combined, maximum", _num(un.get("u_rel_max_pct"), "{:.3f}", "-")],
+             ["Expanded U, median (k = 2)", _num(un.get("U_rel_median_pct_k2"), "{:.3f}", "-")]]
+    doc.table(["Component", "Value (%)"], urows, [4, 1.5])
+
+    doc.heading("Limits")
+    doc.table(["Setting", "Value"], [[k, v or "-"] for k, v in _sphere_limit_rows(record)],
+              [3, 2])
+
+    doc.heading("Result source")
+    if src:
+        doc.kv([("ID", src.get("id") or "-"), ("Name", src.get("name") or "-"),
+                ("Unit", _unit_text(src.get("unit")) or "-"),
+                ("Quantity", src.get("quantity") or "-"),
+                ("Valid range", f"{_num(src.get('valid_min_nm'), '{:.1f}', '-')} - "
+                                f"{_num(src.get('valid_max_nm'), '{:.1f}', '-')} nm")])
+    else:
+        doc.para("Not saved as a reference source.")
+
+    def shade(ax):
+        if n and vr and len(vr) == 2 and None not in vr:
+            ax.axvspan(np.nanmin(wl), vr[0], color=GREY, alpha=0.6, lw=0)
+            ax.axvspan(vr[1], np.nanmax(wl), color=GREY, alpha=0.6, lw=0)
+
+    doc.heading(f"Irradiance E per distance ({e_unit_l})")
+    a1 = doc.plot(115)
+    if n and any(np.isfinite(e).any() for e in E):
+        shade(a1)
+        for i, e in enumerate(E):
+            a1.plot(wl, e, color=cmap[i % len(cmap)], lw=1.1, label=lab(i))
+        if np.isfinite(Er).any():
+            a1.plot(wl, Er, color=DARK, lw=0.8, ls="--", label="repeat of 1")
+        a1.legend(fontsize=7, loc="upper right")
+        _style_axes(a1, "wavelength (nm)", f"E ({e_unit_l})")
+    else:
+        doc.nodata(a1)
+
+    doc.heading(f"Radiance per distance L_i and used L ({unit_l})")
+    a2 = doc.plot(115)
+    if n and (any(np.isfinite(x).any() for x in Li) or np.isfinite(Lu).any()):
+        shade(a2)
+        for i, x in enumerate(Li):
+            a2.plot(wl, x, color=cmap[i % len(cmap)], lw=0.8, alpha=0.8, label=f"L_{lab(i)}")
+        a2.plot(wl, Lu, color="black", lw=1.4, label="L (used)")
+        a2.legend(fontsize=7, loc="upper right")
+        _style_axes(a2, "wavelength (nm)", f"L ({unit_l})")
+    else:
+        doc.nodata(a2)
+
+    doc.heading("Relative spread and combined uncertainty (%)")
+    a3 = doc.plot(95)
+    if n and (np.isfinite(spread).any() or np.isfinite(urel).any()):
+        shade(a3)
+        a3.plot(wl, spread, color=BLUE, lw=1.1, label="spread over the distances")
+        a3.plot(wl, urel, color=ORANGE, lw=1.1, label="u_rel (k = 1)")
+        lim = record.get("consistency_max_pct")
+        if lim is not None:
+            a3.axhline(float(lim), color=RED, ls="--", lw=0.8, label="spread limit")
+        a3.legend(fontsize=7, loc="upper right")
+        _style_axes(a3, "wavelength (nm)", "%")
+    else:
+        doc.nodata(a3)
+
+    doc.heading("Warnings")
+    doc.bullets([str(w) for w in (record.get("warnings") or [])])
+    return doc.save(path)
+
+
+def write_sphere_protocol(record: dict, pdf_path: str | None = None,
+                          csv_path: str | None = None) -> list[str]:
+    out = []
+    if csv_path:
+        out.append(write_sphere_csv(record, csv_path))
+    if pdf_path:
+        out.append(write_sphere_pdf(record, pdf_path))
     return out

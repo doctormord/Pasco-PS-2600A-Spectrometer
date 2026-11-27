@@ -165,7 +165,42 @@ known optics, [`cover`, `uncover`] (dark after, known optics); `cover` /
 masked pixels), `checks`, `plausibility`, `warnings`, `profile_ids` and the
 protocol paths (`GET /calibration/runs/{job}/protocol?format=pdf|csv`). Status:
 `saved`, `saved_implausible`, `not_saved_implausible`,
-`not_saved_checks_failed`.
+`not_saved_checks_failed`, `drift_check_failed` (derivation: the source-drift
+check failed and nothing was saved).
+
+**Measurement quantity (irradiance / radiance).** Every profile and reference
+source has a quantity: `irradiance` (unit `.../nm`, the colour tab shows
+illuminance in lx and fc) or `radiance` (unit `.../sr/nm`, the colour tab shows
+luminance in cd/m^2; lux and fc are not available). The frame message, `GET
+/status`, `GET /calibration/status`, `GET /spectrum/latest`, measurements and
+`POST /analyze/color` carry `quantity`; radiance data also `luminance_cd_m2`
+(`metrics.luminance`). The measurement CSV header has a `Quantity` row for
+absolute profiles. `GET /calibration/admissibility` lists the allowed
+combinations of type, quantity and input optic (`CC`, `sphere`, `bare`,
+`objective`) with the reason for each refusal: absolute irradiance needs `CC` or
+`sphere`, absolute radiance needs `bare` or `objective`, relative is always
+allowed. `POST /calibration/runs` and `/calibration/derivations` answer 422 with
+that reason for an inadmissible combination; the dialog disables such types. The
+quantity of a run follows the reference source (`GET /calibration/references`
+lists `quantity`, `unit_label` and a short `meta`; `POST /calibration/references`
+accepts a radiance unit or the optional `quantity`).
+
+*Characterise sphere* (`POST /api/v1/calibration/spheres`): an integrating sphere
+becomes a radiance reference source, measured with the CC and the active absolute
+irradiance profile (without one the request is answered 422 with the reason).
+Parameters: `sphere` (`name`, `serial`, `port_radius_mm`, `edge_depth_mm`
+default 11.0, `cc_ref_offset_mm` default 0, `u_radius_mm`, `u_distance_mm`,
+`cc_uncertainty_pct`), `heights_mm` (at least 3, smallest first), `integration_ms`
+(number or `"auto"`), `frames`, `save_on_failed_checks`. User steps via
+`POST /jobs/{id}/continue`: `mount`, [`cover`, `uncover`], one `position` per
+height, `repeat` (first distance again), [`cover`]; `cover` / `uncover` only on
+devices without a shutter. The result contains `status` (`saved`,
+`not_saved_checks_failed`; with `save_on_failed_checks` `saved` plus
+`saved_checks_failed`), `source_id` (usable as `reference_id` of an absolute
+radiance run with input `bare` or `objective`), `d0_mm`, `d0_plausible`,
+`method`, `consistency` (overall, bands), `drift`, `uncertainty`,
+`valid_range_nm`, `warnings` and the protocol paths
+(`GET /calibration/spheres/{job}/protocol?format=pdf|csv`).
 
 **Saturation warning**: the exposure bar (desktop and web) and the calibration
 runs use one threshold, the config key `saturation_warn_frac` (fraction of full
@@ -223,7 +258,7 @@ Interactive documentation (OpenAPI / Swagger UI): **`/docs`** (schema:
 | data | `GET /spectrum/latest`, `GET /measurements`, `GET /measurements/{id}` (+ `/export`), `GET /export/filename` | no |
 | analysis | `POST /analyze/color`, `/analyze/peaks`, `/analyze/filter`, `/analyze/tm30` | no |
 | reports | `POST /reports` (color / filter / measurement; pdf / png / csv) | no |
-| calibration | profiles (list, select, copy, import, export), `GET /calibration/status`, references, darks, `POST /calibration/runs`, `POST /calibration/derivations`, `GET /calibration/runs/{job}/protocol` | select / copy / import / runs |
+| calibration | profiles (list, select, copy, import, export), `GET /calibration/status`, references, darks, `POST /calibration/runs`, `POST /calibration/derivations`, `POST /calibration/spheres`, `GET /calibration/admissibility`, `GET /calibration/runs/{job}/protocol`, `GET /calibration/spheres/{job}/protocol` | select / copy / import / runs |
 | verification | `POST /calibration/verifications`, `GET /calibration/verification`, `GET /calibration/reference-overlay` | POST |
 | linearity | `GET /calibration/linearity`, `POST /calibration/linearity/runs`, `POST /calibration/linearity/select`, `GET /calibration/linearity/runs/{job}/protocol` | POST |
 | wavelength | `/wavelength/lamps`, `/session`, `/capture`, `/match`, `/pairs`, `/fit`, `/save` | steering calls |

@@ -247,6 +247,7 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
         "intensities": intens,
         "unit": unit,
         "unit_label": processing.unit_label(unit),
+        "quantity": getattr(ev, "quantity", None) or processing.photometric_quantity(unit),
         "calibration": calib_status,
         "valid_range_nm": calib_status.get("valid_range_nm"),
         "valid_segments_nm": calib_status.get("valid_segments_nm"),
@@ -548,11 +549,14 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
         except (KeyError, TypeError, ValueError):
             raise HTTPException(400, "expected numeric wavelengths and intensities arrays")
         lux_cal = float(payload.get("lux_calibration", 0.0) or 0.0)
+        quantity = "radiance" if payload.get("quantity") == "radiance" else "irradiance"
         if fmt == "csv":
-            return _csv_response(cs.color_report_rows(wl, inten, lux_cal), "color_report.csv")
+            return _csv_response(cs.color_report_rows(wl, inten, lux_cal, quantity=quantity),
+                                 "color_report.csv")
         buf = io.BytesIO()
         try:
             cs.render_color_report(buf, wl, inten, fmt=fmt, lux_calibration=lux_cal,
+                                   quantity=quantity,
                                    meta=engine.report_meta(
                                        peak_adc=float(np.max(inten)) if inten.size else None))
         except ImportError:
@@ -899,8 +903,23 @@ def reference_list() -> list[dict]:
     import reference_sources as rs
     return json_safe([{"id": s.id, "name": s.name, "serial": s.serial, "unit": s.unit,
                        "valid_min_nm": s.valid_min_nm, "valid_max_nm": s.valid_max_nm,
-                       "input_optic": s.input_optic, "builtin": bool(s.builtin)}
+                       "input_optic": s.input_optic, "builtin": bool(s.builtin),
+                       "quantity": s.quantity, "unit_label": rs.unit_label(s.unit),
+                       "meta": _reference_meta_summary(s)}
                       for s in rs.ReferenceLibrary().list()])
+
+
+def _reference_meta_summary(s) -> dict:
+    """Short form of ReferenceSource.meta for lists (no arrays)."""
+    m = s.meta or {}
+    g = m.get("geometry") or {}
+    out = {"kind": m.get("kind"), "date": m.get("date"),
+           "port_radius_mm": g.get("port_radius_mm"), "d0_mm": g.get("d0_mm"),
+           "cc_profile_id": (m.get("cc_profile") or {}).get("id"),
+           "consistency_pct": m.get("consistency_pct"),
+           "u_rel_median_pct": (m.get("uncertainty") or {}).get("u_rel_median_pct"),
+           "has_uncertainty": s.uncertainty is not None}
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def heatmap_csv(engine: Engine) -> str:
