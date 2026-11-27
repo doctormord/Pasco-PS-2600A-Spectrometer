@@ -10,6 +10,7 @@ Diese Regeln gelten für jede Änderung in diesem Repository, unabhängig vom je
 ## Daten
 - Echte Laufzeitdaten liegen im Benutzerdatenverzeichnis (Windows `%APPDATA%\PS-2600A\`). Sie dürfen bei Entwicklung, Tests und Prüfläufen **nie** gelesen oder verändert werden.
 - Jeder Testlauf, Demo-Durchlauf oder Start der Anwendung zu Prüfzwecken – auch durch Subagenten – erfolgt mit `PS2600A_DATA_DIR` auf ein temporäres Verzeichnis.
+- Prüfläufe und Hilfsskripte (auch von Subagenten) laufen immer mit `PS2600A_DATA_DIR` auf ein Temp-Verzeichnis **und** `PS2600A_SKIP_MIGRATION=1`; sonst kopiert die einmalige Migration Altdateien aus dem Programmordner in das Temp-Verzeichnis.
 - Exportformate (CSV-Köpfe, Spalten) sind eine Schnittstelle. Änderungen daran im Abschlussbericht ausdrücklich aufführen.
 
 ## Architektur

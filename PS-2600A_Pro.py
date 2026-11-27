@@ -47,6 +47,12 @@ def main(argv=None) -> int:
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Python's cyclic garbage collector runs in whichever thread allocates
+    # (device / fusion / server threads). Collecting Qt objects there destroys
+    # them outside the GUI thread and crashes sporadically. Automatic GC is
+    # disabled and done on a timer in the GUI thread instead.
+    from pyqtgraph.util.garbage_collector import GarbageCollector
+    _gc = GarbageCollector(interval=1.0)                       # noqa: F841
     dashboard = DashboardWindow()
     dashboard.show()
     code = app.exec()

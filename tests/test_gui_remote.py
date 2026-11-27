@@ -13,9 +13,7 @@ import gui_remote
 from gui_remote import RemotePanel
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 @pytest.fixture

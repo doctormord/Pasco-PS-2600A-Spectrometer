@@ -18,9 +18,7 @@ import reference_sources as rs  # noqa: E402
 from test_gui_calibration import FakeDashboard  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 @pytest.fixture

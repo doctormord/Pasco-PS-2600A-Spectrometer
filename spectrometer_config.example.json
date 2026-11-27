@@ -5,6 +5,8 @@
   "calibration_cause_min_pct": 0.3,
   "calibration_dark_drift_warn_pct": 0.5,
   "calibration_derivation_drift_pct": 2.0,
+  "calibration_itime_match_tol_pct": 0.5,
+  "calibration_dark_bright_frac": 0.5,
   "saturation_warn_frac": 0.9,
   "calibration_dialog_geometry": null,
   "calibration_fingerprint_overrides": {},

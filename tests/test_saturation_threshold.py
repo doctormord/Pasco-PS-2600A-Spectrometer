@@ -80,12 +80,7 @@ def _web_state(isolated_config, pct):
     return ex["state"], ex["warn_pct_fs"]
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    pytest.importorskip("PyQt6")
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 def _desktop_state(pct):

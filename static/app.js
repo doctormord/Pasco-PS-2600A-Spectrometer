@@ -2184,6 +2184,11 @@ const Cal = (() => {
       txt += ' ⚠ Saved although the plausibility check failed.';
       if (el.className.indexOf('wl_changed') < 0) el.className += ' wl_changed';
     }
+    if (st.legacy_note) {
+      // the note is already part of st.message; only the warning colour is added
+      if (txt.indexOf(st.legacy_note) < 0) txt += ' ' + st.legacy_note;
+      if (el.className.indexOf('wl_changed') < 0) el.className += ' wl_changed';
+    }
     if (st.dark_source === 'stored') txt += ' Dark: stored (this t_int).';
     else if (st.dark_source === 'stored_model') txt += ' Dark: per-pixel model b+r·t.';
     if (st.dark_warning) {
@@ -3306,6 +3311,7 @@ const CalRun = (() => {
     saved_implausible: ['warn', 'Saved, but flagged as implausible (not activated)'],
     not_saved_implausible: ['bad', 'Not saved: the plausibility check failed'],
     not_saved_checks_failed: ['bad', 'Not saved: the stability / integration-time checks failed'],
+    drift_check_failed: ['bad', 'Drift check failed'],
     failed: ['bad', 'Failed'],
   };
 
@@ -3435,6 +3441,14 @@ const CalRun = (() => {
       cls = t[0]; title = t[1];
       if (res.status === 'saved' && res.activated) title += ' and activated';
       if (res.status === 'saved' && !res.activated) title += ' (not activated)';
+      if (res.status === 'drift_check_failed') {
+        // the drift is the primary cause: shown instead of "not plausible"
+        const ds = res.drift_status || {};
+        title = ds.message || (res.drift && isFinite(res.drift.p95_pct)
+          ? `Drift check failed: ${Number(res.drift.p95_pct).toFixed(2)} % (limit ${Number(res.drift.threshold_pct).toFixed(2)} %)`
+          : 'Drift check failed');
+        extra.push('<div class="kv">Not saved. Run again with “Save although the drift check failed” to store it anyway.</div>');
+      }
       if (res.error) extra.push(`<div>${esc(res.error)}</div>`);
       if (res.status === 'not_saved_implausible') {
         extra.push('<div class="kv">Run again with “Save even if implausible” to store it flagged.</div>');

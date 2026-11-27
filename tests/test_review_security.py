@@ -132,8 +132,8 @@ def test_gui_revoke_releases_remote_lease(isolated_config):
     pytest.importorskip("PyQt6")
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])     # keep a reference
+    from conftest import qt_app
+    app = qt_app()          # session-wide QApplication (never re-created)
     from gui_remote import RemotePanel
     e = Engine()
     p = RemotePanel(e)

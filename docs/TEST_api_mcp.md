@@ -5,7 +5,7 @@ Checkliste zum Abhaken für den Hardwaretest nach der Umstellung auf den gemeins
 Der Test ist für jedes Gerät gleich. Das Demo-Backend wird immer geprüft; PASCO PS-2600A, LR-2T und HDX nur, soweit vorhanden.
 
 Eintragen bei jedem Schritt: Datum, Gerät/Seriennummer, Auffälligkeiten (Spalte "Notiz" bzw. Zeile darunter).
-Aufbau der Abschnitte: 0 Vorbereitung, A Desktop-Bedienung, B Remote-Zugriff in der App, C Web-Oberfläche, D REST-API, E Headless und PyInstaller, F MCP und Claude, G Abschluss.
+Aufbau der Abschnitte: 0 Vorbereitung, A Desktop-Bedienung, B Remote-Zugriff in der App, C Web-Oberfläche, D REST-API, E Headless, F MCP und Claude, G Abschluss.
 
 ## 0. Vorbereitung
 
@@ -20,9 +20,8 @@ Aufbau der Abschnitte: 0 Vorbereitung, A Desktop-Bedienung, B Remote-Zugriff in 
 - [ ] Abhängigkeiten installiert (Ergebnis von `pip list` für diese Pakete notiert): ______
   - [ ] `pip install -r requirements.txt` (enthält fastapi, uvicorn, websockets, pydantic, httpx)
   - [ ] Für Abschnitt F zusätzlich: `pip install "mcp>=2.3"` (Python 3.10 oder neuer)
-  - [ ] Optional für E: `pyinstaller`
 - [ ] Zweiter Rechner oder Smartphone/Tablet im selben Netz für den LAN-Test bereit (Abschnitte B, C, D)
-- [ ] Firewall (Windows Defender): beim ersten LAN-Start fragt Windows nach Netzwerkzugriff für Python bzw. die EXE; für das private Netz zulassen, nicht für öffentliche Netze. Alternativ Regel für TCP-Port 8000 (eingehend, nur privates Profil)
+- [ ] Firewall (Windows Defender): beim ersten LAN-Start fragt Windows nach Netzwerkzugriff für Python; für das private Netz zulassen, nicht für öffentliche Netze. Alternativ Regel für TCP-Port 8000 (eingehend, nur privates Profil)
 - [ ] Hardware: Gerät(e) per Datenkabel angeschlossen; kein anderes Programm hält das Gerät (nur ein Prozess pro Gerät)
 - [ ] Ordner für Exporte, Screenshots und Protokolle angelegt: ______
 
@@ -224,7 +223,7 @@ Je Zeile prüfen, dass die Funktion im Web wie im Desktop arbeitet und dieselben
 - [ ] `/analyze/color` liefert CCT/Duv/CRI wie der Color-Tab (Abweichung ______)
 - [ ] Legacy-Endpunkte (`/api/status`, `/api/config`, `/ws/stream`) funktionieren weiter (Web-Oberfläche läuft)
 
-## E. Headless und PyInstaller
+## E. Headless
 
 - [ ] `python PS-2600A_Pro.py --headless --backend "Demo (virtual)"`: Banner mit URL, `/docs`-URL und Token (bei Token-Pflicht); Web-Oberfläche läuft
 - [ ] `--lan --port 8123`: Banner zeigt LAN-IP und Hinweis auf unverschlüsseltes HTTP; Zugriff vom zweiten Gerät nur mit Token
@@ -234,9 +233,6 @@ Je Zeile prüfen, dass die Funktion im Web wie im Desktop arbeitet und dieselben
 - [ ] Optional: virtuelles Environment **ohne** PyQt6/pyqtgraph (nur numpy, scipy, fastapi, uvicorn, websockets, pydantic): `--headless` startet und misst mit Demo
 - [ ] Strg+C beendet den Server sauber, das Gerät wird freigegeben (danach Desktop-App öffnet das Gerät)
 - [ ] Desktop-App und Headless-Server gleichzeitig am selben Gerät: zweiter Start meldet einen Fehler bzw. kann das Gerät nicht öffnen (erwartet: ein Prozess pro Gerät): ______
-- [ ] PyInstaller: `pyinstaller PS-2600A_Pro.spec` läuft ohne Fehler; Hidden Imports (uvicorn, api_v1-Gruppen) reichen: ______
-- [ ] `PS-2600A_Pro.exe` startet die GUI; Remote access einschalten funktioniert (Web-Oberfläche und `/docs` erreichbar)
-- [ ] `PS-2600A_Pro.exe --headless`: Server läuft (`/api/v1/status` erreichbar). **Hinweis:** `console=False` im Spec, daher sind Banner und Token nicht sichtbar; Token aus `spectrometer_config.json` (`remote_token`) bzw. vorher aus der GUI lesen. Beenden im Task-Manager
 
 ## F. MCP-Server und Claude
 
@@ -305,7 +301,6 @@ Voraussetzung: Server läuft (App mit Remote access oder headless, Demo-Backend 
 | D REST-API (Client, curl, 401/409) | | | [ ] |
 | D Messung identisch zur GUI | | Abweichung: | [ ] |
 | E Headless (Quelle, Demo, Gerät) | | | [ ] |
-| E PyInstaller-EXE | | | [ ] |
 | F1 Einrichtung (Plugin, Marketplace, Claude-App) | | | [ ] |
 | F2 Werkzeuge | | | [ ] |
 | F3 Agents und Skills | | | [ ] |
@@ -325,7 +320,6 @@ Voraussetzung: Server läuft (App mit Remote access oder headless, Demo-Backend 
 - Pro Gerät genau ein Prozess: Desktop-App und eigenständiger Headless-Server können dasselbe Gerät nicht gleichzeitig öffnen.
 - Lesende Endpunkte (Status, Spektrum, Messungen, Auswertung, Berichte) verlangen keinen Token; nur steuernde Aufrufe sind geschützt.
 - Löschende Operationen (Profile, Dunkelspektren) gibt es weder in der API noch als MCP-Werkzeug; Lampen aus der Referenzbibliothek lassen sich über die REST-API entfernen, nicht über MCP.
-- Das PyInstaller-Paket ist ein Fensterprogramm (`console=False`); Ausgaben des Headless-Modus sind dort nicht sichtbar.
 - Antworten der MCP-Werkzeuge sind auf 8 KB begrenzt; vollständige Spektren liegen als Datei in `SPECTRO_DATA_DIR`.
 - Das Demo-Backend ersetzt keinen Hardwaretest (Dunkelverschluss simuliert).
 - Die Legacy-Antwortkorrektur (P-15) ist im Web bewusst nicht angeboten.

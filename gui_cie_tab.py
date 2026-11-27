@@ -8,7 +8,9 @@ Three nested sub-tabs:
 """
 
 from __future__ import annotations
+import atexit
 import os
+import weakref
 import time
 import colorsys
 import numpy as np
@@ -927,6 +929,33 @@ class _Tm30Worker(QObject):
         self.done.emit(tm, cq)
 
 
+_LIVE_THREADS: list = []          # [(QThread, worker)] not yet stopped
+
+
+def _register_thread(th, worker) -> None:
+    _LIVE_THREADS.append((th, worker))
+
+
+def _stop_qthread(th) -> None:
+    """quit + wait (bounded); safe on an already stopped / deleted thread.
+    Releases the registry entry only once the thread has really stopped."""
+    try:
+        if th is not None and th.isRunning():
+            th.quit()
+            th.wait(3000)
+        stopped = th is None or not th.isRunning()
+    except RuntimeError:                       # C++ object already deleted
+        stopped = True
+    if stopped:
+        _LIVE_THREADS[:] = [e for e in _LIVE_THREADS if e[0] is not th]
+
+
+@atexit.register
+def _stop_all_threads() -> None:
+    for th, _w in list(_LIVE_THREADS):
+        _stop_qthread(th)
+
+
 class CIETab(QWidget):
     UPDATE_EVERY_N_FRAMES = 5
     TM30_THROTTLE_S = 1.2        # wall-clock throttle for TM-30 (matches the web)
@@ -981,11 +1010,24 @@ class CIETab(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_tm30_thread)
+        # The worker thread must be stopped before this widget (and with it
+        # the QThread object) is destroyed: destroying a running QThread is a
+        # fatal Qt error that aborts the process without any Python traceback
+        # (the sporadic crashes of the test suite, finding 20). aboutToQuit is
+        # not emitted when a window is closed / garbage-collected without the
+        # event loop ending, so the thread is also stopped on destruction.
+        # The finalizer holds only the thread (not this widget); the registry
+        # keeps thread + worker alive until they are stopped, so a running
+        # QThread is never deleted.
+        _register_thread(self._tm30_thread, self._tm30_worker)
+        weakref.finalize(self, _stop_qthread, self._tm30_thread)
+
+    def shutdown(self) -> None:
+        """Stop the TM-30 worker thread (host window close)."""
+        self._stop_tm30_thread()
 
     def _stop_tm30_thread(self) -> None:
-        if self._tm30_thread.isRunning():
-            self._tm30_thread.quit()
-            self._tm30_thread.wait(1500)
+        _stop_qthread(self._tm30_thread)
 
     def _on_tm30_done(self, tm, cq) -> None:
         self._tm30_busy = False

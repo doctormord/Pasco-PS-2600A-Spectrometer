@@ -2833,7 +2833,7 @@ class DashboardWindow(QMainWindow):
             color = {"wl_changed": T().WARN, "nl_changed": T().WARN,
                      "other_device": T().WARN,
                      "missing": T().WARN, "error": T().WARN}.get(st.get("state"))
-            if st.get("dark_warning") or st.get("implausible"):
+            if st.get("dark_warning") or st.get("implausible") or st.get("legacy_note"):
                 color = T().WARN
             self.label_calib_status.setStyleSheet(
                 f"color: {color}; font-size: 10px;" if color else "font-size: 10px;")
@@ -3696,6 +3696,8 @@ class DashboardWindow(QMainWindow):
             "x_max_nm":         int(self.spinbox_x_max.value()),
         })
         self._stop_autosave()
+        if hasattr(self, "cie_tab"):
+            self.cie_tab.shutdown()          # stop the TM-30 worker thread
         if hasattr(self, "remote_panel"):
             try:
                 self.remote_panel.shutdown()

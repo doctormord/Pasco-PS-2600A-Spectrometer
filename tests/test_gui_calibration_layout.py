@@ -21,9 +21,7 @@ import gui_theme as gt  # noqa: E402
 from test_gui_calibration import FakeDashboard, BACKEND  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 @pytest.fixture

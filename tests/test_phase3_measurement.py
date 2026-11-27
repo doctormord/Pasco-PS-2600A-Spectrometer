@@ -101,8 +101,8 @@ def test_lux_from_absolute_profile_plausible(demo, isolated_config):
 def test_desktop_and_web_identical(demo, isolated_config, monkeypatch):
     pytest.importorskip("PyQt6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
+    from conftest import qt_app
+    app = qt_app()          # session-wide QApplication (never re-created)
 
     _absolute_profile(demo)
     isolated_config._data.update({"dark_correction": True, "dark_mode": "stored",

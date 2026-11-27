@@ -2036,7 +2036,11 @@ class _SpectralWizardTab(QWidget):
                 return
             self._show_deriv_result(dw, res)
             self._deriv_check_states(dw)
-            if dw.plausible:
+            ds = dw.drift_status() if dw.drift_failed else None
+            if ds:
+                # drift is the primary status, shown before "not plausible"
+                self._state(step, "failed", ds["message"])
+            elif dw.plausible:
                 self._state(step, "ok",
                             f"valid {calprof.format_segments(res.get('segments_nm'), 3)}")
             else:
@@ -2046,8 +2050,18 @@ class _SpectralWizardTab(QWidget):
             step = I["save"]
             self._checkpoint()
             activate = True
+            if ds and not _ask(self, "Drift check failed",
+                               ds["message"] + "\n\nThe source drifted between the "
+                               "measurements; the result is not reliable.\n"
+                               "Save the profile anyway?"):
+                self._state(step, "failed", "not saved (" + ds["message"] + ")")
+                self.last_status = "drift_check_failed"
+                yield from self._write_protocol(dw, derivation=True)
+                self.lbl_status.setText(ds["message"] + " — no profile saved.")
+                return
             if not dw.plausible:
-                other = self._deriv_failed_checks(dw)
+                other = [c for c in self._deriv_failed_checks(dw)
+                         if not (ds and c == "Source drift")]
                 if not self._confirm_implausible(dw.plausibility["failures"], other):
                     self._state(step, "failed", "not saved (plausibility check failed)")
                     self.last_status = "failed"
@@ -2184,6 +2198,9 @@ class _SpectralWizardTab(QWidget):
         self.plot_out.autoRange()
         t = _T()
         extra = self._deriv_lines(dw)
+        ds = dw.drift_status() if dw.drift_failed else None
+        if ds:
+            extra.insert(0, _span(t.DANGER, f"<b>{ds['message']}</b>"))
         other = [w for w in dw.warnings if not w.startswith("Plausibility check failed")]
         if other:
             extra.append(_span(t.WARN, "<br>".join(other)))
@@ -2251,6 +2268,10 @@ class _ProfilesTab(QWidget):
             rng = calprof.format_segments(segs, 2) if segs else _fmt_range(*vr)
             created = str(p.get("created", ""))
             state = st["state"] + (" · not plausible" if calprof.is_implausible(p) else "")
+            lr = (calprof.legacy_valid_range(p)
+                  if p.get("apply") == calprof.APPLY_LEGACY_GAIN else None)
+            if lr:
+                state += f" · legacy, masked outside {lr[0]:.0f}–{lr[1]:.0f} nm"
             cells = [label, state, rng, str(p.get("unit", "")),
                      created[:16].replace("T", " ")]
             tip = "\n".join(x for x in (label, st["message"],

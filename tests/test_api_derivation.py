@@ -155,7 +155,7 @@ def test_real_drift_is_reported_and_nothing_is_saved(c):
     jid, j, seen, _ = _run(c, _body(known), back_scale=0.9)
     res = j["result"]
     assert j["status"] == "done", j
-    assert res["status"] in ("not_saved_checks_failed", "not_saved_implausible"), res
+    assert res["status"] == "drift_check_failed", res
     assert res["profile_ids"] == [] and "activated" not in res
     assert res["drift"]["pass"] is False and res["checks"]["drift_pass"] is False
     assert res["drift"]["n_fail_pixels"] > 0

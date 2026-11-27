@@ -23,9 +23,7 @@ BACKEND = "Demo (virtual)"
 Std = QMessageBox.StandardButton
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    yield QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 class _Combo:

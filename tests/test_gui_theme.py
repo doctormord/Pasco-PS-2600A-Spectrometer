@@ -21,9 +21,7 @@ import gui_theme as gt  # noqa: E402
 PALETTES = [gt.DarkPalette, gt.LightPalette]
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 @pytest.fixture

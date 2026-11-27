@@ -114,6 +114,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Dark before/after each light capture: warn when the dark level changed
     # by more than this share of the net peak signal (%) (and > 3 σ).
     "calibration_dark_drift_warn_pct": 0.5,
+    # Dark and light count as "same integration time" within this tolerance (%).
+    "calibration_itime_match_tol_pct": 0.5,
+    # "Dark unusually bright" warning: dark peak fraction > this factor times
+    # the light peak fraction (light probably not blocked during the dark).
+    "calibration_dark_bright_frac": 0.5,
     # Derivation of an optics configuration from a known one: the known optics
     # is measured again at the end; a source drift (p95 over the tested
     # pixels, %) above this fails the drift check, failing pixels are masked.

@@ -1576,6 +1576,8 @@ class Engine:
         else:
             rows.append(("Calibration profile", st.get("label") if self.calib.legacy_gain
                          is not None else "None"))
+            if st.get("legacy_note"):
+                rows.append(("Profile note", st["legacy_note"]))
         if self.calib.legacy_gain is not None:
             # legacy gain path only: the old switch is reported when it is in effect
             rows.append(("Response compensation", "on (legacy gain table)"))
@@ -2387,8 +2389,14 @@ class Engine:
                 res["checks"] = json_safe(dw.checks)
                 res["drift"] = (json_safe({k: v for k, v in dw.drift.items()
                                            if k != "per_pixel_pct"}) if dw.drift else None)
+                ds = dw.drift_status()
+                res["drift_status"] = json_safe(ds)
                 ctx.progress(0.92, "saving", step="save")
                 activate = bool(p.get("activate", True))
+                if dw.drift_failed and not p.get("save_on_failed_checks"):
+                    # drift is the primary cause: reported before plausibility
+                    res["status"] = "drift_check_failed"
+                    return res
                 if not dw.plausible:
                     if not p.get("allow_implausible"):
                         res["status"] = "not_saved_implausible"

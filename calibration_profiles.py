@@ -1544,6 +1544,22 @@ def resolve_table(device: str, selection: str, device_default_table=None):
     return get_profile_table(device, selection)
 
 
+def legacy_valid_range(p: dict, table=None):
+    """(lo, hi) nm of a migrated legacy profile; None bounds = table edge."""
+    try:
+        if table is None:
+            table = get_profile_table((p.get("device") or {}).get("backend"), p["id"])
+        t = np.asarray(table, dtype=float)
+        twl = t[:, 0]
+        tmin, tmax = float(np.nanmin(twl)), float(np.nanmax(twl))
+    except Exception:
+        return None
+    lo, hi = p.get("valid_range_nm") or [None, None]
+    lo = tmin if lo is None else float(lo)
+    hi = tmax if hi is None else float(hi)
+    return lo, hi
+
+
 def build_gain_for_selection(wl, device: str, selection: str,
                              device_default_table=None, max_gain: float = 10.0):
     """Legacy multiplicative gain for desktop + web. Returns (gain,
@@ -1558,8 +1574,17 @@ def build_gain_for_selection(wl, device: str, selection: str,
         return np.ones(len(wl)), selection
     try:
         mg = float((p or {}).get("legacy_meta", {}).get("max_gain", max_gain))
-        return build_response_gain(wl, np.asarray(table, dtype=float),
-                                   max_gain=mg), selection
+        gain = build_response_gain(wl, np.asarray(table, dtype=float),
+                                   max_gain=mg)
+        if p is not None and p.get("apply") == APPLY_LEGACY_GAIN:
+            # migrated legacy profile: no calibration outside the valid range
+            # (masked as NaN, never silently gain 1). "Device default" is not
+            # a migrated profile and stays unchanged.
+            rng = legacy_valid_range(p, table)
+            if rng is not None:
+                gain = np.where((wl >= rng[0]) & (wl <= rng[1]),
+                                gain, np.nan)
+        return gain, selection
     except Exception as e:
         print(f"[calib] gain build failed for '{selection}': {e}")
         return np.ones(len(wl)), SEL_NONE
@@ -1753,6 +1778,13 @@ class CalibrationRuntime:
         if p.get("apply") == APPLY_LEGACY_GAIN:
             gain, _ = build_gain_for_selection(self.wl, self.backend_name, p["id"])
             self.legacy_gain = gain
+            rng = legacy_valid_range(p)
+            if rng is not None:
+                note = (f"Migrated legacy profile: no calibration outside "
+                        f"{rng[0]:.0f}–{rng[1]:.0f} nm (masked).")
+                st["legacy_note"] = note
+                st["valid_range_nm"] = [rng[0], rng[1]]
+                st["message"] = ((st.get("message") or "") + " " + note).strip()
         else:
             try:
                 from app_config import Config

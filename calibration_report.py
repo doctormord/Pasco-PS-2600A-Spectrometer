@@ -224,6 +224,7 @@ def _metadata(record: dict) -> list[tuple[str, str]]:
           ("linearity_created", lin.get("created") or ""),
           ("linearity_state", lin.get("state") or ""),
           ("dark_sequence", acq.get("dark_sequence") or "")]
+    m += _limit_rows(r)
     for i, d in enumerate(r.get("dark_drift") or [], 1):
         m.append((f"dark_drift_{i}",
                   f"t_int_us={_num(d.get('integration_us'), '{:.0f}')} "
@@ -632,7 +633,8 @@ def write_protocol_pdf(record: dict, path: str) -> str:
     doc.kv([("Optics notes", meta["optics_notes"] or "-"),
             ("Ref. file", meta["reference_source_file"] or "-"),
             ("Valid segments", (meta["valid_segments_nm"] + " nm") if meta["valid_segments_nm"] else "-"),
-            ("WL fingerprint", meta["wl_fingerprint"] or "-")], ncols=1)
+            ("WL fingerprint", meta["wl_fingerprint"] or "-"),
+            ("Limits", _limit_text(record))], ncols=1)
 
     # plot 1
     doc.heading("Calibration spectrum and reference")
@@ -1084,6 +1086,19 @@ def _exposure_text(side: dict) -> str:
     return txt
 
 
+def _limit_rows(r: dict) -> list[tuple[str, str]]:
+    """Configurable test limits of the run (from record["settings"])."""
+    st = (r or {}).get("settings") or {}
+    return [("itime_match_tol_pct", _num(st.get("itime_match_tol_pct"), "{:.3g}")),
+            ("dark_bright_frac", _num(st.get("dark_bright_frac"), "{:.3g}"))]
+
+
+def _limit_text(r: dict) -> str:
+    st = (r or {}).get("settings") or {}
+    return (f"same integration time within {_num(st.get('itime_match_tol_pct'), '{:.3g}', 'n/a')} %; "
+            f"dark unusually bright above {_num(st.get('dark_bright_frac'), '{:.3g}', 'n/a')} x light level")
+
+
 def _deriv_metadata(record: dict) -> list[tuple[str, str]]:
     r = record or {}
     acq, chk = r.get("acquisition") or {}, r.get("checks") or {}
@@ -1142,6 +1157,9 @@ def _deriv_metadata(record: dict) -> list[tuple[str, str]]:
           ("gain_span", gs_s), ("n_valid", _num(r.get("n_valid"), "{:.0f}")),
           ("unit", r.get("unit") or ""),
           ("wl_fingerprint", r.get("wl_fingerprint") or "")]
+    m += _limit_rows(r)
+    if r.get("drift_status"):
+        m.append(("drift_status", str(r["drift_status"].get("message") or "")))
     for key in ("itime_match_known", "itime_match_new",
                 "linearity_consistent", "broadband_pass"):
         if chk.get(key) is not None:
@@ -1261,7 +1279,8 @@ def write_derivation_pdf(record: dict, path: str) -> str:
             ("Valid pixels", meta["n_valid"] or "-")])
     doc.kv([("New optics notes", meta["new_optics_notes"] or "-"),
             ("Valid segments", (meta["valid_segments_nm"] + " nm") if meta["valid_segments_nm"] else "-"),
-            ("WL fingerprint", meta["wl_fingerprint"] or "-")], ncols=1)
+            ("WL fingerprint", meta["wl_fingerprint"] or "-"),
+            ("Limits", _limit_text(record))], ncols=1)
     doc.heading("Source")
     doc.para(meta["source_hint"] or "-")
 
@@ -1348,6 +1367,9 @@ def write_derivation_pdf(record: dict, path: str) -> str:
         doc.table(["Drift (p95)", "Mean", "Limit", "Result", "Masked pixels", "Duration"],
                   drows, [1.4, 1.2, 1.2, 1.2, 1.6, 1.2],
                   row_fill=[WARN_FILL if dr.get("pass") is False else None])
+        ds = record.get("drift_status") or {}
+        if ds.get("message"):
+            doc.para(str(ds["message"]), 8.5, RED)
         doc.para(f"Cause: {dr.get('cause') or 'n/a'}")
     else:
         doc.para("Source drift was not checked (no repeat with the known optics).",

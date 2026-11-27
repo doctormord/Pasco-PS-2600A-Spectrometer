@@ -263,7 +263,8 @@ def process_frame(
     if peak_detection:
         p = peak_params or {}
         peaks = detect_peaks(
-            np.nan_to_num(arr, nan=0.0) if calibrated else arr, wavelengths,
+            np.nan_to_num(arr, nan=0.0) if (calibrated or np.isnan(arr).any()) else arr,
+            wavelengths,
             savgol_window  = p.get("peak_savgol_window", 11),
             savgol_order   = p.get("peak_savgol_order", 3),
             min_prominence = p.get("peak_prominence", 50.0),

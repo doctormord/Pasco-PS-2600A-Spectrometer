@@ -18,10 +18,7 @@ import reference_sources as rs  # noqa: E402
 BACKEND = "Demo (virtual)"
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication([])
-    yield app
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 class _Combo:

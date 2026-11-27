@@ -209,10 +209,7 @@ pytest.importorskip("PyQt6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    from PyQt6.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
+# qapp: the session-wide QApplication from tests/conftest.py
 
 
 def _run_wizard(qapp, b, answer, monkeypatch, *, ref_id=None, patch_switch=False):

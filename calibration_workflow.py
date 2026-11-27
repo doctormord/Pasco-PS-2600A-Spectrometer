@@ -75,6 +75,10 @@ class WorkflowConfig:
     # saturation warning threshold (fraction of full scale, raw peak) — the
     # same value as the exposure meter (processing.saturation_warn_frac)
     saturation_warn_frac: float = 0.90
+    # tolerance for "dark and light at the same integration time" (%) and the
+    # factor for "dark unusually bright": warn when dark peak > factor · light peak
+    itime_match_tol_pct: float = 0.5
+    dark_bright_frac: float = 0.5
 
     def __post_init__(self):
         # the auto-exposure target band must stay below the saturation warning
@@ -121,6 +125,8 @@ class WorkflowConfig:
             dark_drift_warn_pct=float(C.get("calibration_dark_drift_warn_pct", 0.5)),
             derivation_drift_pct=float(C.get("calibration_derivation_drift_pct", 2.0)),
             saturation_warn_frac=_sat_warn_frac(),
+            itime_match_tol_pct=float(C.get("calibration_itime_match_tol_pct", 0.5)),
+            dark_bright_frac=float(C.get("calibration_dark_bright_frac", 0.5)),
         )
 
 
@@ -334,7 +340,7 @@ class CalibrationWorkflow:
         self.light = cc.capture(self.backend, n, integration_us=self.integration_us,
                                 backend_name=self.backend_name)
         self.rate = cc.count_rate(self.light, self.dark)
-        if self.dark.peak_frac > 0.5 * max(self.light.peak_frac, 1e-9):
+        if self.dark.peak_frac > self.cfg.dark_bright_frac * max(self.light.peak_frac, 1e-9):
             self.warnings.append("The dark spectrum is unusually bright compared to "
                                  "the calibration spectrum — was the light blocked?")
         self.warnings.extend(w for w in self.rate.warnings if w not in self.warnings)
@@ -833,6 +839,26 @@ class DerivationWorkflow:
         return bool(self.plausibility is None or self.plausibility["pass"])
 
     @property
+    def drift_failed(self) -> bool:
+        """True when the source drift check was evaluated and exceeded."""
+        return self.checks.get("drift_pass") is False
+
+    def drift_status(self) -> dict | None:
+        """Unambiguous drift result (None when no drift was evaluated)."""
+        d = self.drift
+        if not d or self.checks.get("drift_pass") is None:
+            return None
+        p95, mean = d.get("p95_pct"), d.get("mean_pct")
+        lim = float(d.get("threshold_pct", self.cfg.derivation_drift_pct))
+        failed = self.drift_failed
+        fmt = lambda v: "n/a" if v is None else f"{float(v):.2f}"
+        msg = (f"Drift check failed: {fmt(p95)} % (limit {lim:.2f} %), mean {fmt(mean)} %"
+               if failed else
+               f"Drift check passed: {fmt(p95)} % (limit {lim:.2f} %), mean {fmt(mean)} %")
+        return {"status": "drift_check_failed" if failed else "drift_check_passed",
+                "p95_pct": p95, "mean_pct": mean, "limit_pct": lim, "message": msg}
+
+    @property
     def checks_passed(self) -> bool:
         """False when the drift check or the per-side consistency checks
         failed (status like a failed stability check: saving needs a
@@ -867,9 +893,8 @@ class DerivationWorkflow:
             raise RuntimeError("The wavelength calibration changed during the run "
                                "— restart the derivation.")
 
-    @staticmethod
-    def _same_t(a: int, b: int) -> bool:
-        return abs(int(a) - int(b)) <= cc.ITIME_REL_TOL * max(int(a), 1)
+    def _same_t(self, a: int, b: int) -> bool:
+        return abs(int(a) - int(b)) <= (self.cfg.itime_match_tol_pct / 100.0) * max(int(a), 1)
 
     # ── integration time (per side) ──────────────────────────────────────
     def set_integration(self, which=None, integration_us: int | None = None, *,
@@ -987,7 +1012,7 @@ class DerivationWorkflow:
         what = {"known": "with the known optics", "new": "with the new optics",
                 "repeat": "of the repeat with the known optics"}[which]
         self._warn(_high_exposure_warning(light, self.cfg.saturation_warn_frac, what))
-        if dark.peak_frac > 0.5 * max(light.peak_frac, 1e-9):
+        if dark.peak_frac > self.cfg.dark_bright_frac * max(light.peak_frac, 1e-9):
             self._warn(f"The dark spectrum ({side} optics) is unusually bright "
                        f"compared to the light spectrum — was the light blocked?")
         self.lights[which] = light
@@ -1344,6 +1369,7 @@ class DerivationWorkflow:
                                 linearity_text=_lin_text(self.backend)),
             "settings": asdict(self.cfg),
             "drift": drift,
+            "drift_status": self.drift_status(),
             "checks": dict(self.checks),
             "dark_drift": list(self.dark_drift),
             "valid_range_nm": res.get("valid_range_nm"),
