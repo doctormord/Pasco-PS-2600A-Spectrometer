@@ -39,9 +39,15 @@ def _luminance_of(engine, ev):
         return None
     c = ev.color if ev.color_fresh and ev.color else None
     try:
-        if c is None:
-            c = engine.color_metrics_for(ev.wavelengths, ev.pixels, ev.unit)
-        return c.get("luminance")
+        if c is not None:
+            return c.get("luminance")
+        # only the photometric integral (no full colour / CRI computation per
+        # request): the same inputs as the engine's colour metrics
+        import color_science as cs
+        spd, cal = processing.photometric_inputs(ev.pixels, ev.unit)
+        v = cs.luminance_cd_m2(np.asarray(ev.wavelengths, float), spd,
+                               1.0 if cal is None else cal)
+        return float(v) if np.isfinite(v) else None
     except Exception:                                            # noqa: BLE001
         return None
 

@@ -203,12 +203,14 @@ def test_full_chain(c):
     prof = cp.get_profile_by_id(rres["activated"])
     assert prof["quantity"] == "radiance" and prof["unit"] == "uW/cm2/sr/nm per count/s"
 
-    # status / spectrum / analysis carry quantity and luminance
-    st = c.get(f"{V1}/status").json()
-    assert st["quantity"] == "radiance" and st["calibration"]["quantity"] == "radiance"
+    # status / spectrum / analysis carry quantity and luminance. The calibration
+    # status switches with the activation; the top-level quantity describes
+    # the displayed frame and follows with the next processed frame.
     assert c.get(f"{V1}/calibration/status").json()["quantity"] == "radiance"
     _wait(lambda: c.engine.last_frame is not None
           and c.engine.last_frame.unit == "uW/cm2/sr/nm", what="radiance frame")
+    st = c.get(f"{V1}/status").json()
+    assert st["quantity"] == "radiance" and st["calibration"]["quantity"] == "radiance"
     sp = c.get(f"{V1}/spectrum/latest").json()
     assert sp["quantity"] == "radiance" and sp["unit"] == "uW/cm2/sr/nm"
     assert sp["luminance_cd_m2"] is None or sp["luminance_cd_m2"] > 0

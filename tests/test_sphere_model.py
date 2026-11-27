@@ -57,13 +57,47 @@ def test_nominal_formula():
 
 
 @pytest.mark.parametrize("p", [0.8, 1.15, 1.3])
-def test_non_lambertian_source_detected(p):
-    """Wrong exponent of the distance dependence → consistency check fails
+def test_wrong_distance_law_detected(p):
+    """Synthetic: wrong exponent of the distance dependence → consistency fails
     (the free offset cannot absorb it plausibly)."""
     d = np.array([11.0, 16.0, 26.0, 41.0])
     res = S.characterize(WL, _E(d, p=p), d, R, consistency_max_pct=2.0, d0_max_mm=1.0)
     assert not res["consistency_pass"]
     assert any("Consistency check failed" in w for w in res["warnings"])
+
+
+def _E_cos_n(d, n, L0=L_TRUE, r=R):
+    """Axial irradiance of a port with L(θ) = L0·cosⁿθ (physical model of a
+    non-Lambertian port; n = 0 is Lambertian):
+    E = 2π L0 (1 − cos^(n+2) θmax) / (n + 2), cos θmax = d / √(r² + d²)."""
+    out = []
+    for di in d:
+        c = di / math.sqrt(r * r + di * di)
+        out.append(2.0 * math.pi * L0 * (1.0 - c ** (n + 2)) / (n + 2))
+    return np.vstack(out)
+
+
+@pytest.mark.parametrize("n", [0.25, 0.5, 1.0])
+def test_slightly_non_lambertian_port_is_covered_by_the_uncertainty(n):
+    """A slightly non-Lambertian port is absorbed by d0 on the axis (it cannot
+    be separated from an offset of the reference planes): the spread stays
+    small, but the fitted offset enters the uncertainty, which covers the
+    bias of L at k = 1, and a warning names both explanations."""
+    d = np.array([11.0, 16.0, 26.0, 41.0])
+    res = S.characterize(WL, _E_cos_n(d, n), d, R, u_d_mm=0.1)
+    bias = abs(float(np.nanmedian(res["L"] / L_TRUE)) - 1.0)
+    u = res["uncertainty"]
+    assert u["u_rel_d0_pct"] > 0
+    assert bias <= u["u_rel_median_pct"] / 100.0
+    assert any("not exactly Lambertian" in w for w in res["warnings"])
+
+
+@pytest.mark.parametrize("n", [2.0, 4.0])
+def test_clearly_non_lambertian_port_fails_consistency(n):
+    d = np.array([11.0, 16.0, 26.0, 41.0])
+    res = S.characterize(WL, _E_cos_n(d, n), d, R, consistency_max_pct=2.0,
+                         d0_max_mm=1.0)
+    assert not res["consistency_pass"]
 
 
 def test_implausible_d0_falls_back_to_mean_with_warning():

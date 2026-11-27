@@ -126,7 +126,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Sphere as a radiance reference (calibration_sphere.py): number of
     # distances (>= 3), band width of the evaluation, consistency limit of L
     # over the distances (%, per band and overall), plausible |d0| of the fit
-    # (mm), drift limit of the repeat of the first distance (p95, %), default
+    # (mm), drift limit of the repeat of the first distance (p95 of the ratio
+    # smoothed over the band width, %), default
     # relative standard uncertainty of the CC calibration (%, k = 1).
     "sphere_min_positions": 3,
     "sphere_band_nm": 50.0,

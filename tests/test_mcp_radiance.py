@@ -210,11 +210,12 @@ def test_sphere_run_and_quantity_fields(harness):
 
     cs_ = harness.ok("calibration_status")
     assert cs_["quantity"] == "radiance"
-    st = harness.ok("status")
-    assert st["quantity"] == "radiance" and st["unit"] == "uW/cm2/sr/nm"
+    # the top-level quantity follows the displayed frame (next processed frame)
     t0 = time.monotonic()
     while time.monotonic() - t0 < 10 and e.last_frame.unit != "uW/cm2/sr/nm":
         time.sleep(0.1)
+    st = harness.ok("status")
+    assert st["quantity"] == "radiance" and st["unit"] == "uW/cm2/sr/nm"
     sp = harness.ok("get_spectrum")
     assert sp["quantity"] == "radiance" and sp["unit"] == "uW/cm2/sr/nm"
     col = harness.ok("analyze_color")

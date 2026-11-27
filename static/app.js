@@ -1336,7 +1336,8 @@ function saveColorReport(fmt) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ format: fmt,
       wavelengths: Array.from(wl), intensities: Array.from(ys),
-      lux_calibration: State.luxCal || 0, quantity: State.quantity || 'irradiance' }),
+      lux_calibration: State.luxCal || 0, quantity: State.quantity || 'irradiance',
+      unit: (State.lastFrame && State.lastFrame.unit) || null }),
   })
     .then(r => r.ok ? r.blob() : Promise.reject(r.status))
     .then(blob => {
@@ -3027,15 +3028,19 @@ const CalMgr = (() => {
     if (note) note.textContent = profiles && profiles.device
       ? `${profiles.device}${profiles.serial ? ' · ' + profiles.serial : ''}` : 'no device';
     fill('cal-table',
-      ['', 'Profile', 'State', 'Type', 'Unit', 'Valid range', 'Created', 'Plausible'],
+      ['', 'Profile', 'State', 'Type', 'Quantity', 'Unit', 'Valid range', 'Created', 'Plausible'],
       items.map((it) => {
         const warn = it.state === 'wl_changed' || it.state === 'nl_changed' || it.state === 'error';
+        const lr = it.legacy_valid_range_nm;
+        const state = (it.state || '') + (it.legacy && lr && lr.length === 2
+          ? ` · legacy, masked outside ${Math.round(lr[0])}–${Math.round(lr[1])} nm` : '');
         const pl = it.type == null ? '—' : (it.plausible === false ? '<span class="warn">⚠ no</span>' : 'yes');
         return `<tr class="${it.value === sel ? 'active' : ''}">` +
           `<td>${it.value === sel ? '●' : ''}</td>` +
           `<td title="${esc(it.message || '')}">${esc(it.label)}</td>` +
-          `<td class="${warn ? 'warn' : ''}">${esc(it.state)}</td>` +
-          `<td>${esc(it.type || '—')}</td><td>${esc(it.unit || '—')}</td>` +
+          `<td class="${warn || it.legacy ? 'warn' : ''}">${esc(state)}</td>` +
+          `<td>${esc(it.type || '—')}</td>` +
+          `<td>${esc(it.type ? (it.quantity || '—') : '—')}</td><td>${esc(it.unit || '—')}</td>` +
           `<td>${esc(rangeText(it.valid_range_nm, it.valid_segments_nm))}</td>` +
           `<td>${esc(fmtDate(it.created))}</td><td>${pl}</td></tr>`;
       }), 'No profiles (connect a device).');

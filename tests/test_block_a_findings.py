@@ -188,3 +188,22 @@ def test_submit_derivation_reports_drift_first(isolated_config):
             assert res["protocol"], res.get("protocol_message")
     finally:
         e.close()
+
+
+def test_cause_model_uses_configured_itime_tolerance(isolated_config):
+    """Finding 22 (review): the cause analysis classifies stability vs. t/2
+    cross check with the configured tolerance, not a fixed 0.5 %."""
+    import numpy as np
+    import calibration_profiles as cp
+    n = 200
+    a = np.linspace(1000.0, 5000.0, n)
+    sig = np.full(n, 5.0)
+    m = np.ones(n, bool)
+    isolated_config._data["calibration_itime_match_tol_pct"] = 0.5
+    r = cp.check_causes(a, a, sig, sig, m, t_ref_us=100_000, t_test_us=101_000,
+                        full_scale=65535.0)
+    assert r["kind"] == "crosscheck"                    # 1 % > 0.5 %
+    isolated_config._data["calibration_itime_match_tol_pct"] = 2.0
+    r = cp.check_causes(a, a, sig, sig, m, t_ref_us=100_000, t_test_us=101_000,
+                        full_scale=65535.0)
+    assert r["kind"] == "stability"                     # 1 % <= 2 %

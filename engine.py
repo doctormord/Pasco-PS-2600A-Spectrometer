@@ -2111,6 +2111,12 @@ class Engine:
             raise NotFound(f"Profile '{profile_id}' not found.")
         if prof.get("apply") != calprof.APPLY_V2:
             raise Unprocessable("Only v2 profiles (wizard) can be verified.")
+        if (prof.get("type") == calprof.TYPE_ABSOLUTE and ref.unit != rs.UNIT_RELATIVE
+                and calprof.profile_quantity(prof) != ref.quantity):
+            raise Unprocessable(
+                f"The profile measures {calprof.profile_quantity(prof)}, the reference "
+                f"source '{ref.name}' is {ref.quantity} — verify against a source of "
+                f"the same measurement quantity.")
         t_us = (int(float(integration_ms) * 1000) if integration_ms
                 else int((prof.get("acquisition") or {}).get("integration_us") or 0))
         mp = {"frames": int(frames or self.cfg.get("calibration_capture_frames", 16)),
@@ -2173,8 +2179,11 @@ class Engine:
         key = (str(reference_id), wl.size, float(wl[0]) if wl.size else 0.0,
                float(wl[-1]) if wl.size else 0.0, display_unit if
                processing.is_absolute_unit(display_unit) else "")
-        e = self._overlay_cache.get(key)
-        if e is None:
+        # cache value: (curve, unscaled) — kept together, so concurrent
+        # callers (desktop + web) never mix the curve of one reference with
+        # the quantity check of another
+        hit = self._overlay_cache.get(key)
+        if hit is None:
             ref = rs.ReferenceLibrary().get(str(reference_id))
             if ref is None:
                 return None
@@ -2182,19 +2191,16 @@ class Engine:
             # reference on an irradiance display, radiance on radiance);
             # otherwise the curve is scaled onto the display like a relative one
             q = processing.unit_quantity(ref.unit)
-            self._overlay_ref_quantity = {str(reference_id): q}
+            unscaled = (processing.is_absolute_unit(display_unit)
+                        and q == processing.unit_quantity(display_unit))
             try:
-                e = (ref.on_axis(wl, unit=display_unit)
-                     if processing.is_absolute_unit(display_unit)
-                     and q == processing.unit_quantity(display_unit) else ref.on_axis(wl))
+                e = ref.on_axis(wl, unit=display_unit) if unscaled else ref.on_axis(wl)
             except Exception:                                    # noqa: BLE001
-                e = ref.on_axis(wl)
-                self._overlay_ref_quantity = {str(reference_id): None}
-            self._overlay_cache = {key: e}
-        e = np.asarray(e, float)
-        ref_q = getattr(self, "_overlay_ref_quantity", {}).get(str(reference_id))
-        if (processing.is_absolute_unit(display_unit)
-                and ref_q == processing.unit_quantity(display_unit)):
+                e, unscaled = ref.on_axis(wl), False
+            hit = (np.asarray(e, float), bool(unscaled))
+            self._overlay_cache = {key: hit}
+        e, unscaled = hit
+        if unscaled:
             return e
         v = np.asarray(display_values, float)
         m = np.isfinite(v) & np.isfinite(e) & (e > 0)

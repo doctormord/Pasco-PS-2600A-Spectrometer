@@ -706,7 +706,10 @@ def check_causes(c_ref, c_test, sigma_ref, sigma_test, mask, *, t_ref_us: int,
          & np.isfinite(sra) & np.isfinite(srb))
     t_test = max(int(t_test_us), 1) / 1e6
     t_ref = max(int(t_ref_us), 1) / 1e6
-    same_t = abs(t_test - t_ref) <= 0.005 * t_ref
+    # "same integration time" with the configured tolerance
+    # (calibration_itime_match_tol_pct, the same rule as the capture)
+    from calibration_capture import itime_rel_tol
+    same_t = abs(t_test - t_ref) <= itime_rel_tol() * t_ref
     if nonlinear is None:
         nonlinear = not same_t
     out = {"kind": "stability" if same_t else "crosscheck", "causes": [],

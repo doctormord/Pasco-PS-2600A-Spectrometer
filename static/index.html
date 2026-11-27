@@ -397,10 +397,12 @@
             <option value="counts">counts</option>
             <option value="counts_per_s">counts/s</option>
           </select></div>
-        <div class="row"><label>Irradiance unit</label>
-          <select id="cfg-irradiance_unit">
+        <div class="row"><label>Absolute unit</label>
+          <select id="cfg-irradiance_unit"
+                  title="Prefix of the absolute unit. A radiance profile uses the same prefix per sr (e.g. µW/(cm²·sr·nm)).">
             <option value="uW/cm2/nm">µW/(cm²·nm)</option>
             <option value="W/m2/nm">W/(m²·nm)</option>
+            <option value="mW/m2/nm">mW/(m²·nm)</option>
           </select></div>
         <div class="row"><label>Radiometric factor</label>
           <input type="number" id="cfg-radiometric_calibration_factor" min="0" step="any" value="0" data-lock="control"

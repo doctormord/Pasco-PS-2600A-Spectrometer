@@ -216,7 +216,9 @@ def build_frame_payload(engine: Engine, ev: FrameEvent | None = None,
     px = np.asarray(px, dtype=float)
     unit = unit or "counts"
     rnd = _round_counts if unit in _COUNT_UNITS else _round_sig
-    if engine.calib.active_v2:
+    if engine.calib.active_v2 or getattr(engine.calib, "legacy_gain", None) is not None:
+        # masked pixels (v2 profile, or a migrated legacy profile outside its
+        # valid range) are gaps (null), never 0
         finite = np.isfinite(px)
         intens = [rnd(float(v)) if f else None for v, f in zip(px, finite)]
     else:
@@ -550,6 +552,18 @@ def _add_legacy_routes(app: FastAPI, engine: Engine, hub: Hub, settings: ServerS
             raise HTTPException(400, "expected numeric wavelengths and intensities arrays")
         lux_cal = float(payload.get("lux_calibration", 0.0) or 0.0)
         quantity = "radiance" if payload.get("quantity") == "radiance" else "irradiance"
+        unit = payload.get("unit")
+        if isinstance(unit, str) and unit:
+            # the same photometric inputs as the engine (desktop CIE tab):
+            # masked pixels → 0, absolute units → SI unit of the quantity
+            # with factor 1 (true lx / cd/m²)
+            spd, cal = processing.photometric_inputs(inten, unit)
+            inten = spd
+            if cal is not None:
+                lux_cal = cal
+                quantity = processing.photometric_quantity(unit)
+        else:
+            inten = np.nan_to_num(inten, nan=0.0, posinf=0.0, neginf=0.0)
         if fmt == "csv":
             return _csv_response(cs.color_report_rows(wl, inten, lux_cal, quantity=quantity),
                                  "color_report.csv")
@@ -848,7 +862,13 @@ def _profile_item(engine: Engine, p: dict, dev, serial, fp) -> dict:
             "valid_range_nm": p.get("valid_range_nm"),
             "valid_segments_nm": p.get("valid_segments_nm"),
             "plausible": not calprof.is_implausible(p),
-            "unit": p.get("unit")}
+            "unit": p.get("unit"),
+            "quantity": calprof.profile_quantity(p),
+            "input": (p.get("optics") or {}).get("input"),
+            "legacy": p.get("apply") == calprof.APPLY_LEGACY_GAIN,
+            "legacy_valid_range_nm": (list(calprof.legacy_valid_range(p) or [])
+                                      or None) if p.get("apply") == calprof.APPLY_LEGACY_GAIN
+            else None}
 
 
 def profiles_payload(engine: Engine, include_old: bool = False, *, raw: bool = False) -> dict:

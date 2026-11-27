@@ -186,7 +186,8 @@ def _status_view(st: dict) -> dict:
 
 
 def _profile_items(payload: dict) -> list[dict]:
-    keys = ("value", "label", "state", "type", "unit", "valid_range_nm", "plausible")
+    keys = ("value", "label", "state", "type", "quantity", "input", "unit", "valid_range_nm",
+            "plausible", "legacy_valid_range_nm")
     return [{k: it.get(k) for k in keys} for it in payload.get("items", [])]
 
 

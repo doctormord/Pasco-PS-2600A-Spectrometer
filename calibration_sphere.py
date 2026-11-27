@@ -74,6 +74,7 @@ class SphereConfig:
     drift_max_pct: float = 1.0            # repeat of the first distance (p95)
     cc_uncertainty_pct: float = 3.0       # default u(CC calibration), relative, k=1
     itime_match_tol_pct: float = 0.5      # dark and light "same integration time"
+    dark_bright_frac: float = 0.5         # "dark unusually bright" warning factor
 
     @classmethod
     def from_config(cls) -> "SphereConfig":
@@ -103,6 +104,7 @@ class SphereConfig:
             drift_max_pct=float(C.get("sphere_drift_max_pct", 1.0)),
             cc_uncertainty_pct=float(C.get("sphere_cc_uncertainty_pct", 3.0)),
             itime_match_tol_pct=float(C.get("calibration_itime_match_tol_pct", 0.5)),
+            dark_bright_frac=float(C.get("calibration_dark_bright_frac", 0.5)),
         )
 
 
@@ -293,7 +295,21 @@ def characterize(wl, E, d_mm, r_mm: float, *, valid=None, band_nm: float = 50.0,
     u_sp[m] = spread[m] / 100.0 / math.sqrt(N)
     u_dr = abs(float(drift_pct)) / 100.0 / math.sqrt(3.0)
     u_cc = float(cc_uncertainty_pct) / 100.0
-    u_rel = np.sqrt(u_r ** 2 + u_d ** 2 + u_sp ** 2 + u_dr ** 2 + u_cc ** 2)
+    # Offset d0: on the axis, a shift of the reference planes and a slightly
+    # non-Lambertian port (L ∝ cosⁿθ) look alike — both are absorbed by d0
+    # without raising the spread. The fitted offset is therefore carried as
+    # an uncertainty (rectangular, half-width c_d·|d0|); for a cosⁿ port this
+    # covers the bias of L at k = 1.
+    u_d0 = cd * abs(float(d0)) / math.sqrt(3.0)
+    d0_note_lim = max(2.0 * float(u_d_mm), 0.1)
+    if abs(d0) > d0_note_lim:
+        warnings.append(
+            f"Fitted offset d0 = {d0:+.3f} mm is larger than "
+            f"{d0_note_lim:.2f} mm (twice the distance uncertainty): either the "
+            f"reference planes are off or the port is not exactly Lambertian — "
+            f"both look alike on the axis. Its effect is included in the "
+            f"uncertainty ({100.0 * u_d0:.2f} %).")
+    u_rel = np.sqrt(u_r ** 2 + u_d ** 2 + u_sp ** 2 + u_dr ** 2 + u_cc ** 2 + u_d0 ** 2)
     for b in bands:
         sel = (wl_m >= b["lo"]) & (wl_m < b["hi"])
         b["u_rel_pct"] = float(100.0 * np.mean(u_rel[m][sel]))
@@ -302,6 +318,7 @@ def characterize(wl, E, d_mm, r_mm: float, *, valid=None, band_nm: float = 50.0,
            "u_rel_r_pct": 100.0 * u_r, "u_rel_d_pct": 100.0 * u_d,
            "u_rel_spread_median_pct": float(100.0 * np.median(u_sp[m])),
            "u_rel_drift_pct": 100.0 * u_dr, "u_rel_cc_pct": 100.0 * u_cc,
+           "u_rel_d0_pct": 100.0 * u_d0,
            "u_rel_median_pct": float(100.0 * np.median(u_rel[m])),
            "u_rel_max_pct": float(100.0 * np.max(u_rel[m])),
            "U_rel_median_pct_k2": float(200.0 * np.median(u_rel[m])),
@@ -511,6 +528,10 @@ class SphereCharacterization:
             raise RuntimeError(f"{light.n_saturated} pixel(s) saturated {what} — start "
                                f"again with the smallest distance first or a shorter "
                                f"integration time.")
+        if self.dark.peak_frac > self.cfg.dark_bright_frac * max(light.peak_frac, 1e-9):
+            self._warn(f"The dark spectrum is unusually bright compared to the light "
+                       f"spectrum {what} (factor {self.cfg.dark_bright_frac:g}) — was "
+                       f"the light blocked during the dark?")
         if light.peak_frac >= self.cfg.saturation_warn_frac:
             self._warn(f"Exposure {what}: raw peak at {light.peak_frac*100:.1f} % of full "
                        f"scale (saturation warning threshold "
@@ -570,7 +591,14 @@ class SphereCharacterization:
             e_rep, _ = self._irradiance(self.repeat)
             self.E_repeat = e_rep
             m = np.isfinite(E[0]) & np.isfinite(e_rep) & (E[0] > 0)
-            st = cp.compare_rates(np.nan_to_num(E[0]), np.nan_to_num(e_rep), m)
+            # Smoothed over the evaluation band (sphere_band_nm): a source drift
+            # is spectrally smooth, while the shot noise of the calibrated
+            # spectrum (amplified where the CC sensitivity is low) is not and
+            # would otherwise dominate the percentile near the limit.
+            pitch = float(np.nanmedian(np.abs(np.diff(wl)))) if wl.size > 1 else 1.0
+            smooth = max(21, int(round(self.cfg.band_nm / pitch)) | 1) if pitch > 0 else 21
+            st = cp.compare_rates(np.nan_to_num(E[0]), np.nan_to_num(e_rep), m,
+                                  smooth_px=smooth)
             drift_mean = (100.0 * (st["mean_ratio"] - 1.0)
                           if np.isfinite(st["mean_ratio"]) else float("nan"))
             p95 = st["p95_pct"]
@@ -582,8 +610,12 @@ class SphereCharacterization:
                           "seconds": float(t2 - t1) if t1 and t2 else None,
                           "n": int(st["n"])}
             self.checks["drift_pass"] = passed
-            if not passed:
-                self._warn(f"Drift check failed: {self.drift['p95_pct'] or float('nan'):.2f} % "
+            if self.drift["p95_pct"] is None:
+                self._warn("Drift could not be evaluated (no common valid pixels of the "
+                           "first distance and its repeat) — drift check failed; the "
+                           "uncertainty contains no drift term.")
+            elif not passed:
+                self._warn(f"Drift check failed: {self.drift['p95_pct']:.2f} % "
                            f"(limit {self.cfg.drift_max_pct:.2f} %) between the first "
                            f"distance and its repeat — keep the sphere lamp stable "
                            f"(warm-up) and repeat the run.")
@@ -667,7 +699,7 @@ class SphereCharacterization:
             name=s["name"], serial=s["serial"], unit=rs.UNIT_UW_CM2_SR_NM,
             quantity=rs.QUANTITY_RADIANCE,
             valid_min_nm=float(wl.min()), valid_max_nm=float(wl.max()),
-            input_optic="objective", source_file="sphere characterisation",
+            input_optic="", source_file="sphere characterisation",
             imported=cc.now_iso(), wl=wl, values=L,
             notes=(f"Radiance of the sphere port (Ø {s['port_diameter_mm']:.2f} mm), "
                    f"characterised with CC profile {k.get('id')} v{k.get('version')}. "

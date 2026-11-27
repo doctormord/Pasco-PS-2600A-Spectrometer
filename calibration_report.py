@@ -1519,7 +1519,8 @@ def _sphere_metadata(record: dict) -> list[tuple[str, str]]:
          ("drift_pass", _yesno(dr.get("pass"), "")),
          ("drift_seconds", _num(dr.get("seconds"), "{:.1f}"))]
     for key in ("u_rel_r_pct", "u_rel_d_pct", "u_rel_spread_median_pct", "u_rel_drift_pct",
-                "u_rel_cc_pct", "u_rel_median_pct", "u_rel_max_pct", "U_rel_median_pct_k2"):
+                "u_rel_cc_pct", "u_rel_d0_pct", "u_rel_median_pct", "u_rel_max_pct",
+                "U_rel_median_pct_k2"):
         m.append((key, _num(un.get(key), "{:.4g}")))
     for i, p in enumerate(r.get("positions") or [], 1):
         m.append((f"position_{i}",
@@ -1622,7 +1623,7 @@ def write_sphere_pdf(record: dict, path: str) -> str:
             ("Port diameter", _num(sph.get("port_diameter_mm"), "{:.4g} mm", "-")),
             ("Knife-edge to housing top", _num(sph.get("edge_depth_mm"), "{:.4g} mm", "-")),
             ("CC reference plane", _num(sph.get("cc_ref_offset_mm"),
-                                        "{:+.4g} mm (rel. housing top)", "-")),
+                                        "{:+.4g} mm (rel. CC support surface)", "-")),
             ("u(r)", _num(sph.get("u_radius_mm"), "{:.4g} mm", "-")),
             ("u(d)", _num(sph.get("u_distance_mm"), "{:.4g} mm", "-")),
             ("u(CC)", _num(sph.get("cc_uncertainty_pct"), "{:.4g} %", "-")),
@@ -1688,6 +1689,8 @@ def write_sphere_pdf(record: dict, path: str) -> str:
               _num(un.get("u_rel_spread_median_pct"), "{:.3f}", "-")],
              ["Source drift", _num(un.get("u_rel_drift_pct"), "{:.3f}", "-")],
              ["CC calibration", _num(un.get("u_rel_cc_pct"), "{:.3f}", "-")],
+             ["Fitted offset d0 (geometry / Lambertian behaviour)",
+              _num(un.get("u_rel_d0_pct"), "{:.3f}", "-")],
              ["Combined, median", _num(un.get("u_rel_median_pct"), "{:.3f}", "-")],
              ["Combined, maximum", _num(un.get("u_rel_max_pct"), "{:.3f}", "-")],
              ["Expanded U, median (k = 2)", _num(un.get("U_rel_median_pct_k2"), "{:.3f}", "-")]]

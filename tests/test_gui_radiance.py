@@ -178,7 +178,7 @@ def test_sphere_run_in_the_wizard(qapp, demo, boxes):
     w.spn_sph_ur.setValue(0.02)
     w.spn_frames.setValue(12)
     w.cmb_itime_sph.setCurrentIndex(1)
-    w.spn_ms_sph.setValue(20.0)
+    w.spn_ms_sph.setValue(60.0)              # realistic signal: drift check above the noise
 
     heights = [0.0, 6.0, 16.0]
     asked: list[float] = []
